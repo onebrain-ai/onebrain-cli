@@ -30,7 +30,7 @@
 //! (never more than one long-poll cycle) and deliberate, not a leak: a
 //! single named, self-terminating thread is easy to reason about and easy
 //! to spot in a process listing, unlike a thread that either never exits or
-//! gets leaked on every call. A per-cycle floor ([`MIN_CYCLE_INTERVAL`])
+//! gets leaked on every call. A per-cycle floor ([`cycle_floor`])
 //! additionally paces any cycle that returns FASTER than that — an
 //! instant-answering `getUpdates` (a misbehaving proxy, or simply a very
 //! chatty chat) must never turn this loop into a hot spin; the floor never
@@ -149,20 +149,65 @@ const POLL_TIMEOUT_SECS: u32 = 25;
 const POLL_ERROR_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Floor on how often a SUCCESSFUL poll cycle may repeat (Task 5 review,
-/// F2): if a cycle's `getUpdates` call plus its update handling together
-/// took less than this, [`poll_loop`] sleeps out the remainder before
-/// starting the next cycle. `getUpdates` is a real long poll in
-/// production, so a genuinely idle chat already paces itself at
-/// [`POLL_TIMEOUT_SECS`]; this floor exists for the case that DOESN'T
-/// pace itself — an instant-answering `getUpdates` (this module's own test
+/// F2), in milliseconds — an `AtomicU64` rather than a plain `const`
+/// specifically so `#[cfg(test)]` callers can dial it down (Task 5 review
+/// round 2, I3b; see [`set_cycle_floor_ms_for_test`]). Defaults to the
+/// production value, 1000ms (1 second): `getUpdates` is a real long poll
+/// in production, so a genuinely idle chat already paces itself at
+/// [`POLL_TIMEOUT_SECS`]; this floor exists for the case that DOESN'T pace
+/// itself — an instant-answering `getUpdates` (this module's own test
 /// mock, before this fix, was exactly that: answering unscripted calls
 /// immediately let a live poller spin as fast as the loopback round trip
 /// allowed, confirmed the hard way as a genuine CPU-melting hang during
-/// this task's own test development). An `Ok` cycle with zero updates is
-/// still a completely ordinary, non-error outcome (see [`poll_loop`]'s own
-/// doc comment on the Task 1 #6 empty-result-streak semantics) — this
-/// floor paces it, it does not flag it as unusual.
-const MIN_CYCLE_INTERVAL: Duration = Duration::from_secs(1);
+/// this task's own test development).
+///
+/// **Applies to EVERY successful cycle, including ones that carried real
+/// updates — not only empty ones** (Task 5 review round 2, M3, written
+/// down explicitly rather than left as an implicit choice): an `Ok` cycle
+/// with zero updates is a completely ordinary, non-error outcome (see
+/// [`poll_loop`]'s own doc comment on the Task 1 #6 empty-result-streak
+/// semantics), so it would have been tempting to pace ONLY that case and
+/// let an update-carrying cycle loop again immediately. That would open a
+/// different hole: an attacker (or a misbehaving peer) who can get
+/// Telegram to hand back exactly one update per `getUpdates` call —
+/// trivial, since nothing stops someone from sending this bot's chat one
+/// message per poll — would defeat an empty-cycle-only floor completely,
+/// reproducing the same hot-loop hazard this floor exists to close, just
+/// dressed up as "legitimate" traffic instead of an idle-but-fast peer.
+/// Pacing every successful cycle uniformly closes both shapes at once. The
+/// cost is bounded and one-sided: at most this floor's worth of ADDED
+/// latency before the poller checks for a SUBSEQUENT press, never any
+/// delay to the press that was JUST handled (`handle_update` — and so
+/// `Approvals::resolve` and the button's own `answerCallbackQuery` — runs
+/// and completes before this sleep, not after).
+static CYCLE_FLOOR_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1000);
+
+/// Test-only override for [`CYCLE_FLOOR_MS`] (Task 5 review round 2, I3b)
+/// — a `#[cfg(test)]` setter on a shared, module-level `static`, same
+/// shape as [`TelegramChannel::is_polling`]'s own test-only accessor.
+/// Deliberately NOT an env var: `crate::test_env`'s `ENV_LOCK` already
+/// serializes every telegram test that touches `HOME`/
+/// `TELEGRAM_API_BASE_ENV`, often for the ENTIRE duration of the test, and
+/// routing this through the same lock would only add contention without
+/// adding safety — the floor is a PACING knob, not a correctness
+/// invariant, so a test that sets it doesn't need exclusive access to do
+/// so safely. Any test-suite run touching multiple telegram tests in
+/// parallel may observe a floor value some OTHER concurrently-running
+/// telegram test set, not necessarily its own — harmless, since every
+/// telegram test that cares sets a small value anyway (this only ever
+/// makes an unrelated test's cycles march faster than its own call would
+/// have asked for, never slower than production's default, and every
+/// affected wait bound in this module's tests is generous enough to
+/// absorb that).
+#[cfg(test)]
+pub(crate) fn set_cycle_floor_ms_for_test(ms: u64) {
+    CYCLE_FLOOR_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The current [`CYCLE_FLOOR_MS`] value as a [`Duration`].
+fn cycle_floor() -> Duration {
+    Duration::from_millis(CYCLE_FLOOR_MS.load(std::sync::atomic::Ordering::SeqCst))
+}
 
 /// `true` iff the Telegram approval channel is CONFIGURED on this running
 /// gateway process: `cfg.bot_token` is non-empty, `cfg.chat_id` is
@@ -201,6 +246,32 @@ pub fn is_available(cfg: &TelegramConfig) -> bool {
     !super::env_switch_on(DISABLE_TELEGRAM_APPROVAL_ENV)
         && !cfg.bot_token.is_empty()
         && cfg.chat_id > 0
+}
+
+/// `true` iff `cfg.bot_token` is set (the operator clearly MEANT to
+/// configure Telegram approvals) but `cfg.chat_id` is not a valid private
+/// chat id (Task 5 review round 2, I2). Split out as its own pure
+/// predicate, separate from [`is_available`] itself, for two reasons:
+/// [`super::server::GatewayState::new`] (the real caller) needs to warn on
+/// exactly this ONE shape and stay silent on every other reason
+/// [`is_available`] can return `false` (an unset `DISABLE_TELEGRAM_APPROVAL_ENV`
+/// switch is an intentional operator choice, not a mistake worth a log
+/// line; a genuinely unconfigured `gateway.yml` — no `bot_token` at all —
+/// is the ordinary default, not a misconfiguration either); and this shape
+/// is directly unit-testable this way without capturing `tracing` output,
+/// which this crate has no existing harness for and one warning line does
+/// not justify building.
+///
+/// F4 (Task 5 review round 1) made [`is_available`] reject `chat_id <= 0`
+/// — correctly, since Telegram gives groups/supergroups/channels NEGATIVE
+/// ids and this channel only works for a private chat (see
+/// [`is_available`]'s own doc comment) — but that traded one silent
+/// failure for another: a group `chat_id` now yields `telegram: false`,
+/// indistinguishable from a vault with no `telegram:` block configured at
+/// all, with no log line anywhere to tell an operator who clearly SET a
+/// bot_token that their chat_id is the reason nothing activated.
+pub(crate) fn chat_id_is_misconfigured(cfg: &TelegramConfig) -> bool {
+    !cfg.bot_token.is_empty() && cfg.chat_id <= 0
 }
 
 /// Telegram Bot API base URL: [`TELEGRAM_API_BASE_ENV`] when set to a
@@ -334,7 +405,12 @@ impl TelegramChannel {
     /// public API.
     #[cfg(test)]
     pub(crate) fn is_polling(&self) -> bool {
-        self.polling.load(Ordering::Acquire)
+        // `SeqCst` for consistency with every other access to `polling` in
+        // this module (Task 5 review round 2, I1) — see `poll_loop`'s own
+        // doc comment, "Why every access to `polling` uses `SeqCst`", for
+        // why the whole flag is reasoned about as one ordering rather than
+        // mixing weaker ones on some accesses.
+        self.polling.load(Ordering::SeqCst)
     }
 
     /// Sends `pending` as a Telegram message with two inline buttons —
@@ -506,15 +582,20 @@ impl TelegramChannel {
     ///    genuinely quiet chat produces — this loop cannot and need not
     ///    tell the two apart, and treats a long streak of empty-but-`Ok`
     ///    cycles as completely normal, never a warning).
-    /// 2. For every update returned (including ones [`handle_update`]
-    ///    ignores or refuses): advances `offset` to `update_id + 1` and
-    ///    persists it via [`persist_offset`] BEFORE handling it — see
+    /// 2. For every update in the returned batch (including ones
+    ///    [`handle_update`] ignores or refuses — see
     ///    [`super::telegram_api::TgUpdate`]'s own doc comment for why every
-    ///    `update_id` must be acknowledged this way regardless of what kind
-    ///    of update it turned out to be, or Telegram would keep re-sending
-    ///    it forever. Then calls [`handle_update`] for the callback
-    ///    validation/resolution flow — see that function's own doc comment
-    ///    for the exact rules.
+    ///    `update_id` must eventually be acknowledged this way regardless
+    ///    of what kind of update it turned out to be, or Telegram would
+    ///    keep re-sending it forever): calls [`handle_update`] for the
+    ///    callback validation/resolution flow (see that function's own doc
+    ///    comment for the exact rules), THEN — once, after the whole
+    ///    batch, not once per update inside it (Task 5 review, F2/M1: an
+    ///    earlier revision of this doc, written before that batching
+    ///    landed, said "before handling it") — advances `offset` past the
+    ///    highest `update_id` the batch contained and persists it via
+    ///    [`persist_offset`]. See [`poll_loop`]'s own doc comment for the
+    ///    batching and crash-safety rationale.
     /// 3. Decides whether to keep going — see [`poll_loop`]'s own doc
     ///    comment for the exact exit/reclaim logic (Task 5 review, F1 and
     ///    F3): no LIVE pending approval left means the loop, and the
@@ -528,11 +609,15 @@ impl TelegramChannel {
     /// no thread actually running to ever flip it back. See [`poll_loop`]'s
     /// own doc comment for how that guard is DISARMED on the one exit path
     /// where storing `false` here would be wrong (handing off to a
-    /// freshly-spawned replacement thread that already owns `true`).
+    /// freshly-spawned replacement thread that already owns `true`), and
+    /// for why `polling` reading `false` does not always mean "the thread
+    /// is completely gone" (Task 5 review round 2, M2).
     pub fn ensure_polling(&self, approvals: Arc<Approvals>) {
+        // `SeqCst` — see `poll_loop`'s own doc comment, "Why every access
+        // to `polling` uses `SeqCst`" (Task 5 review round 2, I1).
         if self
             .polling
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
             return;
@@ -552,7 +637,19 @@ impl TelegramChannel {
             // chance to run at all — reset it directly, or every later
             // approval on this process would find `polling` permanently
             // wedged `true` with no thread behind it.
-            self.polling.store(false, Ordering::Release);
+            //
+            // Residual gap (Task 5 review round 2, M8, documented rather
+            // than fixed — this branch is already about as narrow as it
+            // gets): the `pending` this SPECIFIC `fire`+`ensure_polling`
+            // call was meant to serve stays genuinely unpolled until some
+            // UNRELATED later approval nudges `ensure_polling` again (or
+            // that approval's own request times out). Not fixed here
+            // because retrying a thread spawn immediately after the OS
+            // just refused one is unlikely to help, and this whole branch
+            // only exists for a resource-exhaustion condition that is
+            // already well outside this module's normal operating
+            // envelope.
+            self.polling.store(false, Ordering::SeqCst);
             tracing::warn!(error = %e, "telegram: failed to spawn the approval-poll thread");
         }
     }
@@ -601,8 +698,65 @@ impl TelegramChannel {
 /// reproduction of the exact race window would need a test-only
 /// synchronization hook inside this loop (to pause it mid-decision on
 /// command); that was judged out of proportion to this fix and was not
-/// added — the Task 5 review-round report states this explicitly rather
-/// than leaving it implicit.
+/// added. `tests::ensure_polling_survives_a_burst_of_concurrent_reclaim_attempts`
+/// (Task 5 review round 2, I1b) is a PROBABILISTIC soak instead: it hammers
+/// register→resolve→`ensure_polling` a few hundred times from the test's
+/// own thread while a real poller thread runs concurrently, then proves
+/// the poller is still genuinely alive and answering by routing one FINAL
+/// approval through a real scripted callback. It cannot deterministically
+/// force the exact race window, but it exercises real cross-thread timing
+/// non-determinism many times over, and fails loudly (a bounded `timeout`,
+/// not a hang) if the invariant below is ever wrong.
+///
+/// ## Why every access to `polling` uses `SeqCst` (Task 5 review round 2, I1)
+///
+/// The exit-path `store` and the reclaim `compare_exchange` above were
+/// originally `Release`/`AcqRel`/`Acquire` — correct-looking, since each
+/// individually pairs the way those orderings are meant to. But the
+/// SOUNDNESS of the whole scheme depends on a FOUR-operation relationship,
+/// not a two-operation one: this thread's `store(polling, false)` and its
+/// own SUBSEQUENT read of [`Approvals::list`] (via
+/// [`no_live_approvals`]'s second call) race against a DIFFERENT thread's
+/// `Approvals::register` (a mutex-guarded write) and ITS subsequent
+/// `compare_exchange` on `polling`. That is the textbook "store
+/// buffering" / Dekker's-algorithm shape: two threads each write to their
+/// OWN variable, then read the OTHER's — and per-pair `Release`/`Acquire`
+/// does NOT guarantee that at least one of them observes the other's
+/// write, because `Release`/`Acquire` only orders relative to the SAME
+/// atomic's paired counterpart, not across two independently-ordered
+/// synchronization primitives (an atomic here, a `std::sync::Mutex`
+/// there) unless something ties them into one global order.
+///
+/// With the ORIGINAL (weaker) orderings, this was sound ONLY because of an
+/// invariant nothing in the type signatures enforced: `Approvals::pending`
+/// happens to be guarded by a `std::sync::Mutex`, and on most real
+/// implementations a mutex's own lock/unlock behave close enough to
+/// `SeqCst` that, WHEN the recheck's critical section happens to precede
+/// `register`'s in the mutex's own total order, the recheck's unlock
+/// synchronizes-with `register`'s lock, which is what forced the later
+/// `ensure_polling` call's `compare_exchange` to observe `false`. That is
+/// a real guarantee TODAY, but it is borrowed from `Approvals`'s internals
+/// — nothing about `poll_loop`'s own code documents or enforces it, so a
+/// future change that replaced the mutex-guarded count with, say, a
+/// cached `AtomicUsize`, or that read a stale snapshot instead of calling
+/// `Approvals::list` directly, would silently reopen this exact race with
+/// no compiler warning and no test failure until it actually happened in
+/// production.
+///
+/// `SeqCst` on the exit-path `store`, the reclaim `compare_exchange`, the
+/// INITIAL `compare_exchange` in [`TelegramChannel::ensure_polling`], the
+/// `Drop` guard's own `store`, and [`TelegramChannel::is_polling`]'s `load`
+/// removes the dependency on the mutex's ordering behavior entirely:
+/// every `SeqCst` operation across every thread is placed into ONE global
+/// total order, which is exactly the guarantee Dekker's-algorithm-style
+/// mutual exclusion needs and which weaker orderings do not provide on
+/// their own. This path runs at most once per ~[`POLL_TIMEOUT_SECS`]-second
+/// cycle (the exit check) or once per `ensure_polling` call (bounded by
+/// real approval traffic, never a hot loop) — `SeqCst`'s modest extra cost
+/// relative to `AcqRel` is irrelevant at that call frequency. Every access
+/// to `polling` in this module now uses `SeqCst`, deliberately, so a
+/// reader never has to work out which subset of operations the
+/// correctness argument actually depends on.
 fn poll_loop(
     api: &BotApi,
     chat_id: i64,
@@ -629,7 +783,9 @@ fn poll_loop(
     impl Drop for ReleaseOnDrop {
         fn drop(&mut self) {
             if self.armed {
-                self.flag.store(false, Ordering::Release);
+                // `SeqCst` — see this function's own doc comment, "Why
+                // every access to `polling` uses `SeqCst`".
+                self.flag.store(false, Ordering::SeqCst);
             }
         }
     }
@@ -666,29 +822,39 @@ fn poll_loop(
                 // resolved twice" or "an offset write races a decision
                 // that depends on it" — so batching the write is a pure
                 // efficiency win with no new crash-window hazard.
-                let new_offset = updates.last().map(|u| u.update_id + 1);
+                //
+                // The new offset is the HIGHEST `update_id` in the batch
+                // (Task 5 review round 2, M4 — an earlier revision took
+                // only the LAST entry's id, trusting the batch to already
+                // be sorted ascending; a single malformed entry whose
+                // `update_id` field is missing parses as `0` per
+                // `telegram_api::parse_update`'s own documented fallback,
+                // and if THAT happened to be the last, or only, entry in a
+                // batch, the offset would have collapsed to `1` — a full
+                // replay of every update this bot has ever seen), clamped
+                // against the offset already on record so a malformed
+                // batch can never drive it BACKWARD even in the
+                // batch-entirely-malformed case.
+                let batch_max = updates.iter().map(|u| u.update_id).max();
                 for update in updates {
                     handle_update(api, chat_id, approvals, update);
                 }
-                if let Some(o) = new_offset {
-                    persist_offset(token_key, o);
-                    offset = Some(o);
+                if let Some(max_id) = batch_max {
+                    let candidate = max_id.saturating_add(1);
+                    let new_offset = offset.map_or(candidate, |cur| candidate.max(cur));
+                    persist_offset(token_key, new_offset);
+                    offset = Some(new_offset);
                 }
 
-                // Cycle floor (Task 5 review, F2): a cycle that came back
-                // in under a second didn't really long-poll — pace it so
-                // an instant-answering `getUpdates` can never turn this
-                // into a hot loop (this module's own test mock, before
-                // this fix, was exactly that kind of instant-answering
-                // peer, and reproduced the hazard for real: a poller
-                // spinning as fast as the loopback round trip allowed).
-                // Never fires on a genuine ~25s long poll (elapsed already
-                // exceeds the floor by then), so this can only ever ADD
-                // delay to a cycle that was already fast, never lengthen
-                // one that was already slow — the worst-case linger this
-                // module's own docs promise stays bounded at
-                // `POLL_TIMEOUT_SECS`.
-                if let Some(remaining) = MIN_CYCLE_INTERVAL.checked_sub(cycle_start.elapsed()) {
+                // Cycle floor — see `cycle_floor`'s own doc comment for
+                // the full rationale, including why it paces EVERY
+                // successful cycle, not only empty ones. Never fires on a
+                // genuine ~25s long poll (elapsed already exceeds the
+                // floor by then), so this can only ever ADD delay to a
+                // cycle that was already fast, never lengthen one that was
+                // already slow — the worst-case linger this module's own
+                // docs promise stays bounded at `POLL_TIMEOUT_SECS`.
+                if let Some(remaining) = cycle_floor().checked_sub(cycle_start.elapsed()) {
                     std::thread::sleep(remaining);
                 }
             }
@@ -706,14 +872,15 @@ fn poll_loop(
             // race": relinquish `polling` BEFORE the final recheck, not
             // after, so a concurrent `ensure_polling` racing this exact
             // moment can correctly tell whether it actually needs to spawn
-            // a replacement.
-            polling.store(false, Ordering::Release);
+            // a replacement. `SeqCst` throughout — see "Why every access
+            // to `polling` uses `SeqCst`", above.
+            polling.store(false, Ordering::SeqCst);
             if no_live_approvals(approvals) {
                 release.disarm();
                 return;
             }
             if polling
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
                 .is_err()
             {
                 // Someone else's `ensure_polling` call already reclaimed
@@ -801,21 +968,43 @@ fn handle_update(api: &BotApi, chat_id: i64, approvals: &Approvals, update: TgUp
     // Task 5 review, F4: `from_id` (checked above) is the real, sufficient
     // authorization boundary — a legitimate button press's OWN sender
     // matching the configured `chat_id` (this channel is a private,
-    // one-human chat; see `TelegramChannel`'s own doc comment). This
-    // `debug_assert!` is not a second security check on top of that — it's
-    // a defensive internal-consistency check that forecloses a future
-    // regression where this channel's messages start getting fired to the
-    // wrong chat (a bug that would otherwise surface only as confused
-    // operators, not a loud failure). Deliberately tolerant of `None`:
-    // `TgCallback::chat_id` is `Option` because Telegram itself omits the
-    // originating message (and so its chat id) when that message has
-    // become too old or otherwise inaccessible — a legitimate, if stale,
-    // button press can carry `chat_id: None`, and asserting equality
-    // against it unconditionally would panic on that entirely normal case.
-    debug_assert!(
-        callback.chat_id.is_none_or(|c| c == chat_id),
-        "telegram callback's own chat_id disagreed with the configured chat_id"
-    );
+    // one-human chat; see `TelegramChannel`'s own doc comment). This check
+    // is a SEPARATE, defensive internal-consistency check that forecloses
+    // a future regression where this channel's messages start getting
+    // fired to the wrong chat (a bug that would otherwise surface only as
+    // confused operators, not a loud failure) — it is NOT a second
+    // security gate `from_id` depends on.
+    //
+    // Task 5 review round 2, M5: an earlier revision of this check was a
+    // `debug_assert!`, which is wrong for input that can arrive over the
+    // network from a REMOTE party — `callback.chat_id` reflects
+    // Telegram's own reporting of which chat this callback's message
+    // lives in, driven by ordinary client/protocol behavior, not by
+    // anything this crate controls. A `debug_assert!` here would let the
+    // OPERATOR THEMSELVES panic this whole poller thread — in any
+    // debug-build deployment, which is not a developer-only environment,
+    // this code path runs live — merely by tapping a button under some
+    // benign chat-context edge case (the review's own example: the
+    // message forwarded into, or otherwise visible from, another chat).
+    // Refusing gracefully — same shape as the `from_id` mismatch above,
+    // including leaving the registry untouched — is the only response
+    // that can't itself become a denial-of-service triggered by a
+    // legitimate user. Deliberately tolerant of `None`: `TgCallback::chat_id`
+    // is `Option` because Telegram itself omits the originating message
+    // (and so its chat id) when that message has become too old or
+    // otherwise inaccessible — a legitimate, if stale, button press can
+    // carry `chat_id: None`, which this treats as "nothing to check
+    // against," not as a mismatch.
+    if let Some(cb_chat_id) = callback.chat_id {
+        if cb_chat_id != chat_id {
+            tracing::warn!(
+                approval_id = %short_id(&callback.data),
+                "telegram: callback's own chat_id disagreed with the configured chat_id; refusing"
+            );
+            let _ = api.answer_callback_query(&callback.id, "not authorized");
+            return;
+        }
+    }
 
     let Some((decision, id)) = parse_callback_data(&callback.data) else {
         tracing::warn!(
@@ -872,6 +1061,12 @@ fn parse_callback_data(data: &str) -> Option<(Decision, &str)> {
 // doc comment) — duplicated here rather than imported, per this crate's
 // established "one private copy per module" convention (this module's own
 // docs already do the same for its mock-server test fixture).
+//
+// An orphaned `telegram.offset` (the un-keyed, pre-F9 filename — Task 5
+// review round 2, M6) left over from a build predating the token-keying
+// fix in F9 is simply never read or written by this code again: nothing
+// here globs the directory or migrates an old file forward, so it sits
+// there unreferenced and harmless until an operator cleans it up by hand.
 
 /// A short (8-character), non-reversible digest of a Telegram bot token —
 /// the first 6 bytes of `SHA-256(token)`, base64url-encoded (reusing
@@ -1093,6 +1288,50 @@ mod tests {
         );
     }
 
+    /// Task 5 review round 2, I2: [`chat_id_is_misconfigured`]'s own truth
+    /// table — the shape `GatewayState::new`'s warn line gates on. Only
+    /// "a token IS set, but the chat_id is not a positive private-chat id"
+    /// must warn; "nothing configured at all" (the ordinary unconfigured
+    /// default) must not, even though its `chat_id` is also invalid.
+    #[test]
+    fn chat_id_is_misconfigured_warns_only_when_a_token_is_set_and_the_chat_id_is_invalid() {
+        assert!(
+            !chat_id_is_misconfigured(&TelegramConfig::default()),
+            "nothing configured at all must not warn"
+        );
+        assert!(
+            !chat_id_is_misconfigured(&configured()),
+            "a fully valid config must not warn"
+        );
+
+        let group_chat = TelegramConfig {
+            bot_token: "T".to_string(),
+            chat_id: -1_001_234_567_890,
+        };
+        assert!(
+            chat_id_is_misconfigured(&group_chat),
+            "a token with a negative (group) chat_id must warn"
+        );
+
+        let zero_chat = TelegramConfig {
+            bot_token: "T".to_string(),
+            chat_id: 0,
+        };
+        assert!(
+            chat_id_is_misconfigured(&zero_chat),
+            "a token with a zero chat_id must warn"
+        );
+
+        let no_token = TelegramConfig {
+            bot_token: String::new(),
+            chat_id: -1_001_234_567_890,
+        };
+        assert!(
+            !chat_id_is_misconfigured(&no_token),
+            "an invalid chat_id with NO token set must not warn — nothing was configured"
+        );
+    }
+
     /// [`api_base`]'s own env-override contract, independent of
     /// [`is_available`]'s. Holds the `test_env` lock since it mutates
     /// [`TELEGRAM_API_BASE_ENV`] twice.
@@ -1219,7 +1458,7 @@ mod tests {
         // Telegram long-poll pacing (this mock never actually waits for a
         // new update to exist, so nothing else paced it). That sleep is
         // now REDUNDANT: production's own `poll_loop` paces every
-        // successful cycle to `MIN_CYCLE_INTERVAL` regardless of how fast
+        // successful cycle to `cycle_floor()` regardless of how fast
         // the peer answers, so a mock that answers instantly can no longer
         // turn a live poller into a hot loop — the production fix
         // subsumes the workaround. Removed rather than kept "for realism"
@@ -1298,10 +1537,12 @@ mod tests {
 
     /// Bound every wait helper below against, in real elapsed time rather
     /// than a fixed iteration count — Task 5 review, F2 gave `poll_loop` a
-    /// 1-second-per-cycle floor (`MIN_CYCLE_INTERVAL`), so a wait that
-    /// needs to observe a SECOND poll cycle (not just the first) can take
-    /// several real seconds even in the ordinary, non-flaky case. 20s is
-    /// generous enough to comfortably cover a handful of floored cycles
+    /// 1-second-per-cycle floor (`cycle_floor`, production default; tests
+    /// generally dial it down via `set_cycle_floor_ms_for_test` — Task 5
+    /// review round 2, I3b), so a wait that needs to observe a SECOND poll
+    /// cycle (not just the first) can take real time proportional to
+    /// whatever floor is active. 20s is generous enough to comfortably
+    /// cover a handful of floored cycles
     /// plus scheduling jitter on a loaded CI runner, while still failing a
     /// genuinely broken test in well under a minute.
     const WAIT_BOUND: Duration = Duration::from_secs(20);
@@ -1358,13 +1599,32 @@ mod tests {
     /// there IS no handle to join: `ensure_polling` deliberately drops it
     /// (see that method's own doc comment — the thread is fire-and-forget
     /// by design, matching `fire`/`note_outcome`'s own dropped
-    /// `spawn_blocking` handles). Polling `is_polling()` is still a
-    /// faithful stand-in for "the thread is completely done," not merely
-    /// "about to be": `polling`'s `false` store is the VERY LAST thing
-    /// `poll_loop`'s `Drop` guard (or, on the reclaim path, the loop body
-    /// itself) does before the thread function returns — nothing in this
-    /// module ever observes `false` and then has more work left to do
-    /// beyond an already-armed guard's own drop. Uses
+    /// `spawn_blocking` handles).
+    ///
+    /// `polling == false` does NOT always mean "the thread is completely
+    /// done" (Task 5 review round 2, M2 — an earlier revision of this doc
+    /// overclaimed that it does). On the exit/reclaim RECLAIM-WIN path
+    /// (`poll_loop`'s own doc comment, "The exit/reclaim race"), the
+    /// thread stores `false`, observes new work in its own immediate
+    /// recheck, and `compare_exchange`s the flag back to `true` — the
+    /// thread is still alive and looping the whole time, so a read landing
+    /// in that exact window would see a TRANSIENT `false` with the thread
+    /// very much still running.
+    ///
+    /// This helper tolerates that without extra debouncing because the
+    /// window is vanishingly narrow (a handful of atomic operations plus
+    /// one `Approvals::list` call — microseconds) against this loop's own
+    /// 10ms poll granularity, AND because none of this module's tests
+    /// actually race a NEW registration against an in-flight
+    /// `wait_for_polling_false` call: each test either resolves everything
+    /// it registered before calling this helper (nothing left to trigger a
+    /// reclaim) or, in the one test that deliberately hammers
+    /// register→resolve→`ensure_polling` concurrently with a live poller
+    /// (`ensure_polling_survives_a_burst_of_concurrent_reclaim_attempts`,
+    /// Task 5 review round 2, I1b), calls this helper only once, at the
+    /// very end, after its own final approval has already resolved via a
+    /// real callback — by which point nothing is racing a fresh
+    /// registration against the exit check any more. Uses
     /// `TelegramChannel::is_polling` — a `#[cfg(test)]`-only accessor,
     /// since `polling` itself is a private field this module happens to
     /// share visibility into (being `mod tests`, a child module) but
@@ -1570,7 +1830,9 @@ mod tests {
     // fixture uses) BEFORE ever calling `ensure_polling` — that method's
     // poller persists the `getUpdates` offset via `crate::home::home_dir`,
     // so without this every one of these tests would touch the developer's
-    // or CI runner's REAL `~/.onebrain/gateway/telegram.offset`. Every test
+    // or CI runner's REAL `~/.onebrain/gateway/telegram-<token_key>.offset`
+    // (Task 5 review round 2, M6: an earlier revision of this comment
+    // named the pre-F9, un-keyed filename). Every test
     // also drives its pending approval to resolution before returning (via
     // the scripted callback itself, or an out-of-band `resolve` call) and
     // `.await`s [`wait_for_polling_false`] — the "no test may leave the
@@ -1584,6 +1846,7 @@ mod tests {
     /// advances the persisted offset past the update it consumed.
     #[tokio::test]
     async fn a_valid_approve_callback_resolves_the_pending_and_answers_the_button() {
+        set_cycle_floor_ms_for_test(20);
         let state = MockState::default();
         let server = MockServer::start(state.clone());
         // ONE combined `set_vars` call — `crate::test_env`'s `ENV_LOCK` is a
@@ -1661,6 +1924,7 @@ mod tests {
     /// `Approvals::list`, not just "the wrong answer wasn't sent").
     #[tokio::test]
     async fn a_callback_from_the_wrong_chat_is_refused_and_resolves_nothing() {
+        set_cycle_floor_ms_for_test(20);
         let state = MockState::default();
         let server = MockServer::start(state.clone());
         // ONE combined `set_vars` call — `crate::test_env`'s `ENV_LOCK` is a
@@ -1725,6 +1989,7 @@ mod tests {
     /// mis-reported as a fresh decision.
     #[tokio::test]
     async fn a_stale_callback_gets_too_late() {
+        set_cycle_floor_ms_for_test(20);
         let state = MockState::default();
         let server = MockServer::start(state.clone());
         // ONE combined `set_vars` call — `crate::test_env`'s `ENV_LOCK` is a
@@ -1782,6 +2047,7 @@ mod tests {
     /// reads `false` for one instant before something re-flips it.
     #[tokio::test]
     async fn the_poller_exits_when_no_approvals_remain() {
+        set_cycle_floor_ms_for_test(20);
         let state = MockState::default();
         let server = MockServer::start(state.clone());
         // ONE combined `set_vars` call — `crate::test_env`'s `ENV_LOCK` is a
@@ -1837,6 +2103,11 @@ mod tests {
     /// were buggy in some other way).
     #[tokio::test]
     async fn ensure_polling_never_double_spawns() {
+        // Task 5 review round 2, I3b: a small test-only floor so the
+        // several cycles this test wants to observe don't each pay the
+        // full 1-second production pace for no reason.
+        set_cycle_floor_ms_for_test(20);
+
         let state = MockState::default();
         // Widens the window a hypothetical double-spawn bug would need to
         // land a second, genuinely concurrent `getUpdates` inside.
@@ -1867,12 +2138,13 @@ mod tests {
         // immediately without spawning a second thread.
         channel.ensure_polling(approvals.clone());
 
-        wait_for_requests(&state, 1).await;
-        // Long enough to span a few of `poll_loop`'s own `MIN_CYCLE_INTERVAL`
-        // (1s)-floored cycles, not just the first — the double-spawn
-        // hazard this test guards against would show up on ANY cycle, not
-        // only the first one.
-        tokio::time::sleep(Duration::from_millis(3_500)).await;
+        // Task 5 review round 2, I3a: event-driven instead of a fixed
+        // sleep — wait for a HANDFUL of cycles' worth of requests to have
+        // actually landed (each `set_delay`-slowed to 80ms, so 3 of them
+        // already span several real `getUpdates` round trips) rather than
+        // guessing how long that takes. Strictly more robust than a fixed
+        // sleep AND faster in the common case.
+        wait_for_requests(&state, 3).await;
 
         assert_eq!(
             state.max_in_flight(),
@@ -1890,6 +2162,7 @@ mod tests {
     /// actually get the value they need from this process.
     #[tokio::test]
     async fn offset_survives_restart_and_prevents_replay() {
+        set_cycle_floor_ms_for_test(20);
         let state = MockState::default();
         let server = MockServer::start(state.clone());
         // ONE combined `set_vars` call — `crate::test_env`'s `ENV_LOCK` is a
@@ -1945,6 +2218,7 @@ mod tests {
     /// one stale entry forever and never exited.
     #[tokio::test]
     async fn an_expired_unpruned_entry_does_not_keep_the_poller_alive() {
+        set_cycle_floor_ms_for_test(20);
         let state = MockState::default();
         let server = MockServer::start(state.clone());
         let home = tempfile::tempdir().unwrap();
@@ -1996,15 +2270,112 @@ mod tests {
 
         // Wait past the stale entry's own TTL WITHOUT ever calling
         // `register` again, so nothing but this fix could ever notice it's
-        // gone. The poller's own first cycle or two will have already
-        // observed it as still-live (its `expires` genuinely hadn't
-        // passed yet) and looped instead of exiting — proving the fix
-        // isn't a fluke of the entry never being checked at all.
+        // gone. What's actually GUARANTEED here (Task 5 review round 2,
+        // M7 — an earlier revision of this comment overclaimed a specific
+        // cycle count, which depends on runtime timing this test does not
+        // control): `ensure_polling` starts before `stale`'s TTL has
+        // elapsed, so its exit check MUST run at least once while the
+        // entry is still genuinely live and correctly decide not to exit
+        // — this test cannot pass merely because the poller happened to
+        // check only after everything was already gone. Exactly how many
+        // cycles that takes is not something this test asserts on.
         tokio::time::sleep(Duration::from_millis(1_500)).await;
 
         // Despite `list()` still reporting the stale entry, the poller
         // must exit: `no_live_approvals` filters it out by its own past
         // `expires`, not by `list()` being empty.
+        wait_for_polling_false(&channel).await;
+    }
+
+    /// Probabilistic soak for the F1 exit/reclaim race (Task 5 review
+    /// round 2, I1b) — see `poll_loop`'s own doc comment, "The
+    /// exit/reclaim race" and "Why every access to `polling` uses
+    /// `SeqCst`", for the bug this guards against and why a fully
+    /// DETERMINISTIC reproduction was judged not worth a test-only
+    /// synchronization hook inside the production loop.
+    ///
+    /// Hammers register→resolve→`ensure_polling` a few hundred times from
+    /// THIS test's own thread while a real poller thread runs
+    /// concurrently — the tight, register-then-immediately-resolve shape
+    /// gives the poller thread MANY chances to observe `Approvals::list`
+    /// transiently empty (between one iteration's `resolve` and the NEXT
+    /// iteration's `register`) and enter its exit/reclaim decision right
+    /// as new work shows up, exactly the interleaving F1 fixes. It cannot
+    /// force the exact race window the way a synchronization hook could,
+    /// but real OS thread scheduling gives it genuine, unpredictable
+    /// timing across a few hundred iterations — enough for the race to
+    /// have a real chance of firing if the fix ever regresses.
+    ///
+    /// The proof is at the END, not throughout the loop: after the soak,
+    /// ONE MORE approval is registered and routed through a REAL scripted
+    /// Telegram callback (`ensure_polling` called again — reclaiming an
+    /// already-live thread, or spawning a fresh one, either is fine).
+    /// `final_rx.await` resolving to the expected decision is the actual
+    /// assertion — if the burst above ever left the poller silently
+    /// wedged (the exact failure mode F1 closes), this callback would
+    /// never be answered. Wrapped in a bounded `tokio::time::timeout`
+    /// rather than a bare `.await`, so a real regression fails LOUDLY
+    /// (a panic with a clear message) instead of hanging the test suite.
+    #[tokio::test]
+    async fn ensure_polling_survives_a_burst_of_concurrent_reclaim_attempts() {
+        set_cycle_floor_ms_for_test(5);
+
+        let state = MockState::default();
+        let server = MockServer::start(state.clone());
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            (TELEGRAM_API_BASE_ENV, server.base.as_str().as_ref()),
+            ("HOME", home.path().as_os_str()),
+            ("USERPROFILE", home.path().as_os_str()),
+        ]);
+
+        let channel = TelegramChannel::new(&configured());
+        let approvals = Arc::new(Approvals::new());
+
+        for i in 0..300 {
+            let pending = sample_pending(&format!("soak-{i}"));
+            let rx = approvals.register(pending.clone()).unwrap();
+            channel.ensure_polling(approvals.clone());
+            assert!(approvals.resolve(&pending.id, Decision::Approve, ResolvedVia::Http));
+            assert_eq!(
+                rx.await.unwrap(),
+                (Decision::Approve, ResolvedVia::Http),
+                "iteration {i} of the soak must still resolve correctly"
+            );
+        }
+
+        // The real proof: one final approval, routed through an ACTUAL
+        // scripted Telegram callback rather than the out-of-band HTTP
+        // resolve the soak loop used above — proving the poller is still
+        // genuinely alive and able to answer a real button press, not
+        // merely that `Approvals` itself survived the burst.
+        let final_pending = sample_pending("soak-final");
+        let final_rx = approvals.register(final_pending.clone()).unwrap();
+        state.queue_response(
+            "getUpdates",
+            serde_json::json!({
+                "ok": true,
+                "result": [{
+                    "update_id": 90_000,
+                    "callback_query": {
+                        "id": "cbq-soak-final",
+                        "from": { "id": 5 },
+                        "message": { "chat": { "id": 5 } },
+                        "data": "a:soak-final"
+                    }
+                }]
+            }),
+        );
+        channel.ensure_polling(approvals.clone());
+
+        let final_outcome = tokio::time::timeout(Duration::from_secs(20), final_rx)
+            .await
+            .expect(
+                "the poller never answered the final callback — it is wedged,                  which is exactly the F1 lost-wakeup failure mode this soak guards against",
+            )
+            .unwrap();
+        assert_eq!(final_outcome, (Decision::Approve, ResolvedVia::Telegram));
+
         wait_for_polling_false(&channel).await;
     }
 }

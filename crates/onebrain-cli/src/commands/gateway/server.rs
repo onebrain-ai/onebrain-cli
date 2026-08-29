@@ -134,6 +134,23 @@ impl GatewayState {
     pub fn new(config: GatewayConfig, audit: AuditLog) -> Self {
         let telegram = telegram::is_available(&config.telegram)
             .then(|| Arc::new(telegram::TelegramChannel::new(&config.telegram)));
+
+        // Gateway PR 5, Task 5 review round 2, I2: F4 (round 1) made an
+        // invalid (group/channel) `chat_id` collapse to the SAME
+        // `telegram: false` a vault with no `telegram:` block at all
+        // reports — trading a silently DEAD channel for a silently
+        // ABSENT one, with no log line either way to tell an operator who
+        // set a `bot_token` (so clearly MEANT to configure this) that
+        // their `chat_id` is the reason it never activated. Deliberately
+        // NOT inside `telegram::is_available` itself: `capabilities`
+        // calls that per request, and this warning belongs at STARTUP,
+        // once, not on every client request.
+        if telegram::chat_id_is_misconfigured(&config.telegram) {
+            tracing::warn!(
+                "telegram.bot_token is set but telegram.chat_id is not a positive                  private-chat id — Telegram approvals disabled"
+            );
+        }
+
         Self {
             config,
             grants: Grants::new(),
@@ -5143,7 +5160,7 @@ mod tests {
         // background poller's request rate sane (this mock never
         // implements genuine long-poll pacing on its own). That sleep is
         // now REDUNDANT: production's own `poll_loop` paces every
-        // successful cycle to `telegram::MIN_CYCLE_INTERVAL` regardless of
+        // successful cycle to `telegram::cycle_floor()` regardless of
         // how fast the peer answers, so a mock that answers instantly can
         // no longer turn a live poller into a hot loop — removed rather
         // than kept "for realism," to avoid two independent knobs claiming
@@ -5253,9 +5270,11 @@ mod tests {
     ) -> serde_json::Value {
         // Widened from ~2s (Task 5 review, F2): `TelegramChannel::ensure_polling`'s
         // `poll_loop` now paces every successful cycle to at least
-        // `telegram::MIN_CYCLE_INTERVAL` (1s), so a request that only shows
-        // up on a SECOND poll cycle can take a couple of real seconds to
-        // arrive even in the ordinary, non-flaky case.
+        // `telegram::cycle_floor()` (production default 1s; these three
+        // tests dial it down via `telegram::set_cycle_floor_ms_for_test` —
+        // Task 5 review round 2, I3b), so a request that only shows up on
+        // a SECOND poll cycle can still take real time proportional to
+        // whatever floor is active.
         for _ in 0..2000 {
             if let Some((_, body)) = state.requests().into_iter().find(|(m, _)| m == method) {
                 return body;
@@ -5283,6 +5302,13 @@ mod tests {
     /// function returns) — harmless only by luck (the mock server is also
     /// gone by then, so the thread's `getUpdates` calls just fail and
     /// eventually give up), not by design.
+    ///
+    /// `is_polling() == false` does not ALWAYS mean the thread is
+    /// completely done — see `telegram.rs`'s own `wait_for_polling_false`
+    /// doc comment for the transient-`false`-during-reclaim window (Task 5
+    /// review round 2, M2) and why it's safe to ignore here too: none of
+    /// the three tests below register anything new while this helper is
+    /// polling, so the reclaim path this caveat is about is never reached.
     async fn wait_for_telegram_poller_to_exit(state: &Arc<GatewayState>) {
         let Some(channel) = state.telegram.as_ref() else {
             return;
@@ -5318,7 +5344,9 @@ mod tests {
     /// `crate::home::home_dir`, never `dirs::`), so a real approval flow
     /// driven through this fixture needs BOTH pointed at a tempdir — or it
     /// would spawn a background thread touching the developer's or CI
-    /// runner's ACTUAL `~/.onebrain/gateway/telegram.offset`. This fixture
+    /// runner's ACTUAL `~/.onebrain/gateway/telegram-<token_key>.offset`
+    /// (Task 5 review round 2, M6: an earlier revision of this comment
+    /// named the pre-F9, un-keyed filename). This fixture
     /// deliberately does NOT set that env itself, though: `crate::test_env`'s
     /// `ENV_LOCK` is a plain, NON-reentrant `std::sync::Mutex`, and every
     /// caller below already holds it (via their own
@@ -5404,6 +5432,9 @@ mod tests {
     /// answered (`"via http"`), not Telegram itself.
     #[tokio::test]
     async fn an_approval_resolved_by_http_still_edits_the_telegram_message() {
+        // Task 5 review round 2, I3b: small test-only floor — see
+        // `telegram::set_cycle_floor_ms_for_test`'s own doc comment.
+        crate::commands::gateway::telegram::set_cycle_floor_ms_for_test(20);
         let tg_state = TelegramMockState::default();
         tg_state.set_response(
             "sendMessage",
@@ -5479,6 +5510,9 @@ mod tests {
     /// `Approve` test above, resolved `Deny` instead.
     #[tokio::test]
     async fn an_approval_denied_over_http_edits_the_telegram_message_with_denied_wording() {
+        // Task 5 review round 2, I3b: small test-only floor — see
+        // `telegram::set_cycle_floor_ms_for_test`'s own doc comment.
+        crate::commands::gateway::telegram::set_cycle_floor_ms_for_test(20);
         let tg_state = TelegramMockState::default();
         tg_state.set_response(
             "sendMessage",
@@ -5551,6 +5585,9 @@ mod tests {
     /// `note_outcome` to edit.
     #[tokio::test]
     async fn an_approval_that_times_out_edits_the_telegram_message_with_expired_wording() {
+        // Task 5 review round 2, I3b: small test-only floor — see
+        // `telegram::set_cycle_floor_ms_for_test`'s own doc comment.
+        crate::commands::gateway::telegram::set_cycle_floor_ms_for_test(20);
         let tg_state = TelegramMockState::default();
         tg_state.set_response(
             "sendMessage",
