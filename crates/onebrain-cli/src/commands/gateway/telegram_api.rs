@@ -10,8 +10,11 @@
 //! the `# HTTP client` comment above the `ureq` dependency).
 //!
 //! ## The scrub chokepoint
-//! [`TgError`] wraps a private, ALREADY-SCRUBBED `String` and has exactly
-//! ONE constructor: the private [`scrub`] function. Every failure this
+//! [`TgError`] wraps a private, ALREADY-SCRUBBED `String` (plus a
+//! `transport: bool` classification exposed via [`TgError::is_transport`],
+//! added Gateway PR 5 Task 6 review round 2 — see `scrub`'s own doc
+//! comment) and has exactly ONE constructor: the private [`scrub`]
+//! function. Every failure this
 //! module can produce — a genuine transport failure from `ureq` (DNS,
 //! connection refused, timeout, a non-2xx status when `ureq` itself
 //! classifies one), a well-formed Telegram `{"ok":false,"description":…}`
@@ -95,17 +98,25 @@ pub struct BotIdentity {
 }
 
 /// One Telegram `Update`. Only two shapes are surfaced — a button press
-/// ([`TgCallback`]) or a plain incoming message's `chat_id`/`from_id` —
-/// because that's all the approval flow needs. Every other update kind
-/// (edited messages, channel posts, chat-member changes, …) still comes
-/// back as an entry with both fields `None`: its `update_id` must still be
-/// SEEN by the caller to advance `getUpdates`' offset past it, so dropping
-/// it here would make the poller re-fetch it forever.
+/// ([`TgCallback`]) or a plain incoming message's `chat_id`/`from_id`/text —
+/// because that's all the approval flow (and, since Gateway PR 5 Task 6's
+/// setup wizard, `message_text`) needs. Every other update kind (edited
+/// messages, channel posts, chat-member changes, …) still comes back as an
+/// entry with every field `None`: its `update_id` must still be SEEN by the
+/// caller to advance `getUpdates`' offset past it, so dropping it here
+/// would make the poller re-fetch it forever.
 pub struct TgUpdate {
     pub update_id: i64,
     pub callback: Option<TgCallback>,
     pub message_chat_id: Option<i64>,
     pub message_from_id: Option<i64>,
+    /// The message's raw text, when present. `None` for a callback-query
+    /// update, for any message with no text (a sticker/photo/document with
+    /// no caption), or for any other update kind. Added for
+    /// `commands::gateway::telegram_setup`'s wizard, which validates a
+    /// captured chat by a shared setup code rather than trusting arrival
+    /// order alone — see that module's own doc comments.
+    pub message_text: Option<String>,
 }
 
 /// An inline-keyboard button press (`callback_query`). `chat_id` is
@@ -121,17 +132,43 @@ pub struct TgCallback {
 
 /// An already-scrubbed Telegram API error. See the module docs for the
 /// single-constructor guarantee: this can only ever be built by [`scrub`].
-pub struct TgError(String);
+pub struct TgError {
+    message: String,
+    /// See [`TgError::is_transport`].
+    transport: bool,
+}
+
+impl TgError {
+    /// `true` iff this failure was a TRANSPORT-layer problem (DNS,
+    /// connection refused, timeout, a raw non-2xx status `ureq` itself
+    /// classified, an I/O error, …) as opposed to a Telegram API-level
+    /// failure (a well-formed `ok:false` response with a `description`, or
+    /// a malformed/missing-field response) — both of which this module
+    /// ALSO routes through `scrub`, via [`synthetic`]. See `scrub`'s own
+    /// doc comment for exactly which `ureq::Error` variants land in each
+    /// bucket.
+    ///
+    /// Added Gateway PR 5 Task 6 review round 2 (finding I1):
+    /// `commands::gateway::telegram_setup::get_updates_with_retry` retries
+    /// only a transport failure — a genuine network blip is often
+    /// productive to retry, but a revoked token or a `409 Conflict` (a
+    /// second gateway process's poller already holding the long-poll) is a
+    /// business-level outcome that retrying can't fix and would only delay
+    /// surfacing.
+    pub fn is_transport(&self) -> bool {
+        self.transport
+    }
+}
 
 impl fmt::Display for TgError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
 impl fmt::Debug for TgError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
@@ -143,6 +180,14 @@ impl std::error::Error for TgError {}
 /// variants like `BadUri`/`RequireHttpsOnly` embeds the offending URI
 /// verbatim, and which is effectively open-ended anyway: a future `ureq`
 /// upgrade could add a variant whose `Display` isn't safe to forward.
+///
+/// Also classifies [`TgError::is_transport`]: every REAL `ureq::Error`
+/// variant reaching this function (every arm above except `Other`) is a
+/// transport-layer failure by construction. `Other` is the one variant
+/// THIS MODULE manufactures itself, via [`synthetic`] — either a Telegram
+/// API-level `description` or a fixed "malformed response" string — which
+/// is a business-level outcome, never a transport one, regardless of what
+/// text it carries.
 fn scrub(method: &str, e: &ureq::Error) -> TgError {
     let kind = match e {
         ureq::Error::StatusCode(code) => format!("status {code}"),
@@ -157,7 +202,11 @@ fn scrub(method: &str, e: &ureq::Error) -> TgError {
         ureq::Error::Other(inner) => inner.to_string(),
         _ => "request failed".to_string(),
     };
-    TgError(format!("telegram {method} failed: {kind}"))
+    let transport = !matches!(e, ureq::Error::Other(_));
+    TgError {
+        message: format!("telegram {method} failed: {kind}"),
+        transport,
+    }
 }
 
 /// Builds a synthetic `ureq::Error::Other` around a message this module
@@ -398,6 +447,7 @@ fn parse_update(raw: &Value) -> TgUpdate {
             }),
             message_chat_id: None,
             message_from_id: None,
+            message_text: None,
         };
     }
 
@@ -410,11 +460,16 @@ fn parse_update(raw: &Value) -> TgUpdate {
             .get("from")
             .and_then(|f| f.get("id"))
             .and_then(Value::as_i64);
+        let text = msg
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|s| s.to_string());
         return TgUpdate {
             update_id,
             callback: None,
             message_chat_id: chat_id,
             message_from_id: from_id,
+            message_text: text,
         };
     }
 
@@ -423,6 +478,7 @@ fn parse_update(raw: &Value) -> TgUpdate {
         callback: None,
         message_chat_id: None,
         message_from_id: None,
+        message_text: None,
     }
 }
 
@@ -590,6 +646,38 @@ mod tests {
             );
             assert!(rendered.contains("sendMessage"), "{rendered}");
         }
+    }
+
+    /// Gateway PR 5 Task 6 review round 2, finding I1:
+    /// `commands::gateway::telegram_setup::get_updates_with_retry` needs to
+    /// retry ONLY a genuine transport blip, never a business-level failure
+    /// (a revoked token, a `409 Conflict` from a concurrently running
+    /// poller) — retrying the latter just burns time before surfacing the
+    /// same answer. Pins `scrub`'s classification rule directly, with no
+    /// mock server and no network: every REAL `ureq::Error` variant is
+    /// transport; the `Other` variant this module manufactures itself (via
+    /// `synthetic`, for an API-level `description` or a malformed-response
+    /// message) never is, regardless of what text it carries.
+    #[test]
+    fn scrub_classifies_real_ureq_errors_as_transport_and_synthetic_ones_as_not() {
+        let transport_cases: [ureq::Error; 4] = [
+            ureq::Error::ConnectionFailed,
+            ureq::Error::HostNotFound,
+            ureq::Error::StatusCode(500),
+            ureq::Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionReset)),
+        ];
+        for e in &transport_cases {
+            assert!(
+                scrub("getUpdates", e).is_transport(),
+                "{e:?} must classify as transport"
+            );
+        }
+
+        // An API-level `ok:false` description, and a malformed-response
+        // message — both go through `synthetic` (`Other`), neither is a
+        // transport failure.
+        assert!(!scrub("getUpdates", &synthetic("Unauthorized")).is_transport());
+        assert!(!scrub("getUpdates", &synthetic("malformed response body")).is_transport());
     }
 
     #[test]
