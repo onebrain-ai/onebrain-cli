@@ -864,16 +864,23 @@ fn spawn_and_authenticate(mock_base: &str, bot_token: &str) -> Harness {
 
 /// The `sendMessage` request's inline-keyboard `callback_data` for both
 /// buttons, and the approval id embedded in each (`"a:<id>"`/`"d:<id>"`,
-/// [`super::telegram::TelegramChannel::fire`]'s own wire shape — restated
-/// here since this test binary has no library target to import it from).
+/// `TelegramChannel::fire`'s own wire shape, `commands/gateway/telegram.rs`
+/// — restated here since this test binary has no library target to import
+/// it from, and left as plain text rather than an intra-doc link: this
+/// integration-test binary has no `super::telegram` module for
+/// `[...]`-style linking to ever resolve against).
 struct Buttons {
     approve_data: String,
     deny_data: String,
 }
 
-/// Asserts the `sendMessage` body's shape (Client/Tool framing, exactly two
-/// buttons, callback_data carrying a shared approval id) and that the raw
-/// capture BODY never reached it, then returns the parsed buttons.
+/// Asserts the `sendMessage` body's shape (names the tool and carries the
+/// bounded `args_summary`, exactly two buttons, callback_data carrying a
+/// shared approval id) and that the raw capture BODY never reached it, then
+/// returns the parsed buttons. Does NOT check the `Client: <id>` line —
+/// that framing is pinned by `telegram.rs`'s own
+/// `fire_sends_one_bounded_message_with_approve_and_deny_buttons` unit
+/// test, not by this e2e.
 fn assert_prompt_and_extract_buttons(send_body: &Value) -> Buttons {
     assert_eq!(send_body["chat_id"], CHAT_ID, "{send_body}");
     let text = send_body["text"]

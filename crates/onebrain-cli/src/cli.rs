@@ -356,9 +356,12 @@ pub struct TelegramCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum TelegramVerb {
-    /// Interactive wizard: paste a BotFather token, press START on the bot
-    /// in Telegram, and this captures the resulting chat id and writes it
-    /// (with the token) into `~/.onebrain/gateway.yml`'s `telegram:` block.
+    /// Interactive wizard: paste a BotFather token, then send the
+    /// one-time code this wizard prints back to the bot in a private
+    /// Telegram message (pressing START alone is never enough — identity
+    /// is proven by that code, not by message order) — this captures the
+    /// resulting chat id and writes it (with the token) into
+    /// `~/.onebrain/gateway.yml`'s `telegram:` block.
     Setup,
 }
 // ─────────────────────────────────────────────────────────────────────────
