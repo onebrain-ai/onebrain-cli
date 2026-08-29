@@ -181,9 +181,10 @@ pub struct ApprovalChannels {
     pub http: bool,
     pub telegram: bool,
     /// Human-readable caveats a caller needs to correctly interpret
-    /// `native`/`http`/`telegram` above — e.g. why `telegram` is always
-    /// `false` today. Never a raw host detail (matches every other
-    /// client-facing field in this struct/file).
+    /// `native`/`http`/`telegram` above — e.g. why `native`/`telegram` can
+    /// each be `false` depending on this process's config/platform, unlike
+    /// `http`, which is unconditionally `true`. Never a raw host detail
+    /// (matches every other client-facing field in this struct/file).
     pub note: String,
 }
 

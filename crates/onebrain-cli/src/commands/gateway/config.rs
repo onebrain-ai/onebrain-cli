@@ -30,18 +30,50 @@ pub const DEFAULT_GATEWAY_PORT: u16 = 7717;
 /// never assigns a bot an empty token or a chat the id `0`, so the plain
 /// default doubles as an unambiguous "unset" sentinel — no `Option`
 /// wrapper needed on either field.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+///
+/// `Debug` is hand-written (not derived) — see the impl below: a bare
+/// `#[derive(Debug)]` here would print the raw `bot_token` secret
+/// verbatim, and this type is exactly the kind of thing that ends up in a
+/// `tracing::debug!(?config, ...)` somewhere down the line — the same
+/// rationale `auth/store.rs`'s `TokenRecord`/`AuthCode`/`PairingState`
+/// spell out for their own hand-written `Debug` impls (review finding,
+/// Gateway PR 5 Task 2 fix wave). `Serialize` also skips `bot_token`
+/// (`#[serde(skip_serializing)]` on the field below) for the same reason:
+/// nothing in this crate serializes `GatewayConfig` today, but a future
+/// `to_string(&config)` (a debug dump, a `gateway.yml` round-trip, …)
+/// should be safe by construction rather than safe only because nobody
+/// happens to call it on this type yet. `Deserialize` is unaffected —
+/// `gateway.yml` still reads `bot_token` in normally; only the OUTPUT
+/// direction is redacted.
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct TelegramConfig {
     /// Bot token minted by `@BotFather` (`/newbot`). Never logged or
-    /// echoed back to a client — see `telegram_api.rs`'s "scrub
+    /// echoed back to a client — redacted by the hand-written `Debug` impl
+    /// below and dropped entirely from `Serialize` output
+    /// (`#[serde(skip_serializing)]`); see `telegram_api.rs`'s "scrub
     /// chokepoint" module docs for how every Telegram API error this
-    /// crate can produce is scrubbed of it.
-    #[serde(default)]
+    /// crate can produce is separately scrubbed of it too.
+    #[serde(default, skip_serializing)]
     pub bot_token: String,
     /// Telegram chat id the approval bot sends prompts to and reads
-    /// button-press callbacks from.
+    /// button-press callbacks from. Not a secret — stays visible in both
+    /// `Debug` and `Serialize` output; an operator debugging delivery
+    /// needs it.
     #[serde(default)]
     pub chat_id: i64,
+}
+
+/// Redacts `bot_token` — the live Telegram bot credential; `chat_id` stays
+/// visible (see its own field doc comment above). Mirrors
+/// `auth/store.rs`'s `TokenRecord`/`AuthCode`/`PairingState` `Debug` impls
+/// exactly: same one-secret-field-redacted shape, same rationale.
+impl std::fmt::Debug for TelegramConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelegramConfig")
+            .field("bot_token", &"<redacted>")
+            .field("chat_id", &self.chat_id)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +287,47 @@ mod tests {
         assert_eq!(
             sparse.telegram.chat_id, 0,
             "missing telegram block must default to a zero chat_id"
+        );
+    }
+
+    // ── Redacting Debug / Serialize (review finding, Gateway PR 5 Task 2
+    // fix wave) ────────────────────────────────────────────────────────
+
+    /// Mirrors `auth/store.rs`'s `token_record_debug_redacts_token_and_rotated_to_but_keeps_other_fields`
+    /// convention exactly, extended to also cover `Serialize` (this type's
+    /// `Serialize` impl is genuinely reachable — `GatewayConfig` derives it
+    /// — even though nothing calls it today; both output paths must be
+    /// checked, not just `Debug`).
+    #[test]
+    fn telegram_config_redacts_bot_token_in_debug_and_serialize_but_keeps_chat_id() {
+        let cfg = TelegramConfig {
+            bot_token: "SUPER-SECRET-BOT-TOKEN".to_string(),
+            chat_id: 123456789,
+        };
+
+        let debug = format!("{cfg:?}");
+        assert!(
+            !debug.contains("SUPER-SECRET-BOT-TOKEN"),
+            "bot_token leaked into Debug output: {debug}"
+        );
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(
+            debug.contains("123456789"),
+            "chat_id is not a secret and must stay visible: {debug}"
+        );
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            !json.contains("SUPER-SECRET-BOT-TOKEN"),
+            "bot_token leaked into Serialize output: {json}"
+        );
+        assert!(
+            !json.contains("bot_token"),
+            "bot_token must be dropped from Serialize output entirely, not just blanked: {json}"
+        );
+        assert!(
+            json.contains("123456789"),
+            "chat_id is not a secret and must stay visible: {json}"
         );
     }
 
