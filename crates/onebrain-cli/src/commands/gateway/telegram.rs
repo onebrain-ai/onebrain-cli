@@ -52,6 +52,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::approval::PendingApproval;
+use super::auth::core::now_epoch_secs;
 use super::config::TelegramConfig;
 use super::telegram_api::BotApi;
 
@@ -77,6 +78,11 @@ pub const TELEGRAM_API_BASE_ENV: &str = "ONEBRAIN_TELEGRAM_API_BASE";
 /// Default Telegram Bot API host. Appears in code EXACTLY here — see the
 /// module docs' "the one place the default host lives" section.
 const DEFAULT_API_BASE: &str = "https://api.telegram.org";
+
+/// Telegram's own hard limit on `callback_data`: 1–64 bytes. Referenced by
+/// [`TelegramChannel::fire`]'s `debug_assert!` (Task 4 review, F3) — see
+/// that call site for why this needs enforcing at all, not just documenting.
+const CALLBACK_DATA_MAX_BYTES: usize = 64;
 
 /// `true` iff the Telegram approval channel is CONFIGURED on this running
 /// gateway process: `cfg.bot_token` is non-empty, `cfg.chat_id` is
@@ -122,12 +128,19 @@ pub fn api_base() -> String {
 /// One sent-and-not-yet-resolved Telegram approval prompt: the message
 /// [`TelegramChannel::fire`] sent, remembered so
 /// [`TelegramChannel::note_outcome`] can both find it (`message_id`, to
-/// edit) and reconstruct its body (`text`, the SAME bounded summary
-/// `fire` sent — `editMessageText` replaces the whole message text, so the
-/// edit has to re-supply it, not just prepend the outcome).
+/// edit) and reconstruct its body (`text`, the SAME text `fire` sent —
+/// `editMessageText` replaces the whole message text, so the edit has to
+/// re-supply it, not just prepend the outcome). `expires` is
+/// [`super::approval::PendingApproval::expires`] carried along verbatim —
+/// the SAME TTL [`super::approval::Approvals::register`] used for this id
+/// — purely so [`TelegramChannel::fire`]'s own sweep (see
+/// [`TelegramChannel::sent`]'s doc comment) can tell a genuinely orphaned
+/// entry from a live one without a second, independently-drifting source
+/// of truth for when an approval expires.
 struct Sent {
     message_id: i64,
     text: String,
+    expires: u64,
 }
 
 /// The Telegram approval channel (Gateway PR 5, Task 4): sends an approval
@@ -149,14 +162,34 @@ struct Sent {
 pub struct TelegramChannel {
     chat_id: i64,
     api: Arc<BotApi>,
-    /// Keyed by [`super::approval::PendingApproval::id`]. Never grows
-    /// unbounded in practice: [`Self::fire`] inserts at most one entry per
-    /// pending approval, and every entry this channel itself ever fires for
-    /// is removed by exactly one later [`Self::note_outcome`] call — the
-    /// SAME "one channel resolves it, `Approvals::resolve` is
-    /// first-response-wins" invariant `server::await_approval` already
-    /// relies on for `Approvals`'s own registry (this map just mirrors it
-    /// for the message ids Telegram needs).
+    /// Keyed by [`super::approval::PendingApproval::id`].
+    ///
+    /// This is a SWEEP-bounded guarantee, not a one-to-one one — an
+    /// earlier revision of this doc claimed every entry is always removed
+    /// by exactly one later [`Self::note_outcome`] call, which is false:
+    /// `note_outcome` is reachable only from `server::await_approval`'s
+    /// three `WaitOutcome` arms, and a CANCELLED tool-call future (a
+    /// client disconnecting mid-wait) runs none of them — the exact path
+    /// [`super::approval::Approvals::register`]'s own doc comment already
+    /// names and defends against for `Approvals`'s own registry (it prunes
+    /// expired entries before counting, for the identical reason). Without
+    /// an equivalent sweep here, that cancelled call's entry — and the
+    /// live Telegram buttons its `message_id` points at — would live for
+    /// the rest of the process.
+    ///
+    /// [`Self::fire`] closes that gap: every successful insert first
+    /// `retain`s out any entry whose OWN [`Sent::expires`] has already
+    /// passed (mirroring `Approvals::register`'s identical precedent).
+    /// That bounds this map at roughly
+    /// [`super::approval::MAX_PENDING_APPROVALS`] concurrently pending
+    /// entries plus one TTL window of not-yet-swept stragglers — never
+    /// unbounded — at the cost of an orphan surviving up to one more
+    /// `fire` call's worth of time past its own approval resolving. The
+    /// SAME sweep also closes the send/resolve race for free: if `fire`'s
+    /// `spawn_blocking` insert lands AFTER `note_outcome` already ran for
+    /// the same id (found nothing, since the insert hadn't happened yet),
+    /// the resulting orphan carries the SAME `expires` stamp and is swept
+    /// on the next `fire` call, at no extra cost.
     sent: Arc<Mutex<HashMap<String, Sent>>>,
 }
 
@@ -179,12 +212,20 @@ impl TelegramChannel {
     /// remembers the returned `message_id` (plus the exact text sent) in
     /// `sent` so [`Self::note_outcome`] can find and edit it later.
     ///
-    /// `pending.summary` is used VERBATIM as the message text: it is
+    /// The message text matches [`super::approval_native::build_dialog_script`]'s
+    /// own framing (Task 4 review, F8): a `Client: {client_id}` line, a
+    /// `Tool: {tool}` line, then a blank line, then `pending.summary`
+    /// verbatim. A Telegram approver is very often the PRIMARY approver
+    /// specifically because they're away from the machine the native
+    /// dialog would pop on — they cannot see which connected client is
+    /// asking unless this message says so, arguably the most
+    /// security-relevant field on the whole prompt. `summary` alone is
     /// already bounded at registration
     /// ([`super::server::bounded_summary`], applied once in
-    /// `server::await_approval` before `pending` is ever constructed) — see
-    /// that function's own doc comment for why re-bounding here would be
-    /// redundant, not just unnecessary.
+    /// `server::await_approval` before `pending` is ever constructed — see
+    /// that function's own doc comment for why re-bounding it here would be
+    /// redundant); `client_id`/`tool` add only a small, fixed amount on top
+    /// of that bound, nowhere near Telegram's 4096-character message limit.
     ///
     /// Never blocks the caller and never returns a `Result` — see the
     /// module docs' "fire-and-forget by construction" section. A send
@@ -197,10 +238,31 @@ impl TelegramChannel {
         let sent = Arc::clone(&self.sent);
         let chat_id = self.chat_id;
         let id = pending.id.clone();
-        let text = pending.summary.clone();
+        let expires = pending.expires;
+        let text = format!(
+            "Client: {}\nTool: {}\n\n{}",
+            pending.client_id, pending.tool, pending.summary
+        );
         tokio::task::spawn_blocking(move || {
             let approve_data = format!("a:{id}");
             let deny_data = format!("d:{id}");
+            // Task 4 review, F3: Telegram hard-caps `callback_data` at 64
+            // bytes. `mint_secret_32` ids keep today's payload (`"a:"` + 43
+            // chars = 45 bytes) comfortably under that, but nothing else
+            // enforces the relationship — a future id-generator change
+            // could silently blow past it and take this whole channel
+            // offline in production while `capabilities` keeps reporting
+            // `telegram: true`. Same shape as `telegram_api.rs`'s own
+            // `LONG_POLL_CEILING_SECS` `debug_assert!` precedent: fails
+            // loudly in tests/debug builds instead of silently in release.
+            debug_assert!(
+                approve_data.len() <= CALLBACK_DATA_MAX_BYTES
+                    && deny_data.len() <= CALLBACK_DATA_MAX_BYTES,
+                "telegram callback_data exceeded the {CALLBACK_DATA_MAX_BYTES}-byte limit \
+                 ({} / {} bytes)",
+                approve_data.len(),
+                deny_data.len()
+            );
             let keyboard = [
                 ("✅ Approve", approve_data.as_str()),
                 ("⛔ Deny", deny_data.as_str()),
@@ -208,12 +270,27 @@ impl TelegramChannel {
             match api.send_message(chat_id, &text, Some(&keyboard)) {
                 Ok(message_id) => {
                     let mut sent = sent.lock().unwrap_or_else(|e| e.into_inner());
-                    sent.insert(id, Sent { message_id, text });
+                    // Task 4 review, F1: sweep out anything already past
+                    // its own TTL before inserting — see `Self::sent`'s own
+                    // doc comment for why (a cancelled tool-call future
+                    // runs none of `await_approval`'s `WaitOutcome` arms,
+                    // so `note_outcome` would otherwise never run for that
+                    // id) and for the bound this gives the map.
+                    let now = now_epoch_secs();
+                    sent.retain(|_, s| s.expires > now);
+                    sent.insert(
+                        id,
+                        Sent {
+                            message_id,
+                            text,
+                            expires,
+                        },
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
-                        approval_id = %id,
+                        approval_id = %short_id(&id),
                         "telegram: failed to send an approval prompt"
                     );
                 }
@@ -224,13 +301,14 @@ impl TelegramChannel {
     /// Edits the Telegram message [`Self::fire`] sent for `approval_id`
     /// (if any) to show `outcome` — the exact caller-supplied string,
     /// followed by a blank line, followed by the ORIGINAL message text
-    /// (`pending.summary` as `fire` sent it), since `editMessageText`
-    /// replaces the whole text rather than appending to it. Removes the
-    /// entry from `sent` FIRST, so at most one edit is ever attempted per
-    /// approval — a second call for the same `approval_id` (however that
-    /// could happen; nothing in this crate calls it twice for one id today)
-    /// finds nothing and is a silent no-op, same as a `fire` that never
-    /// succeeded.
+    /// (client/tool/summary framing, as `fire` sent it), since
+    /// `editMessageText` replaces the whole text rather than appending to
+    /// it. Removes the entry from `sent` FIRST, so at most one edit is
+    /// ever attempted per approval — a second call for the same
+    /// `approval_id` (however that could happen; nothing in this crate
+    /// calls it twice for one id today) finds nothing and is a silent
+    /// no-op, same as a `fire` that never succeeded (or one whose entry
+    /// [`Self::fire`]'s own sweep already reclaimed as an orphan).
     ///
     /// `outcome` is composed entirely by the caller
     /// (`server::await_approval`) — this method has no opinion on wording,
@@ -246,7 +324,10 @@ impl TelegramChannel {
             let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
             sent.remove(approval_id)
         };
-        let Some(Sent { message_id, text }) = removed else {
+        let Some(Sent {
+            message_id, text, ..
+        }) = removed
+        else {
             return;
         };
         let api = Arc::clone(&self.api);
@@ -257,12 +338,24 @@ impl TelegramChannel {
             if let Err(e) = api.edit_message_text(chat_id, message_id, &edited_text) {
                 tracing::warn!(
                     error = %e,
-                    approval_id = %id,
+                    approval_id = %short_id(&id),
                     "telegram: failed to edit an approval outcome message"
                 );
             }
         });
     }
+}
+
+/// First 8 characters of an approval id — enough for an operator to
+/// correlate a log line with `GET /approvals`'s own listing (matching a
+/// prefix) without ever logging the WHOLE minted secret. Approval ids come
+/// from `mint_secret_32` (Base64url, ASCII-only, so a byte-index slice
+/// never lands mid-character) — the same value this crate's own CodeQL
+/// guard already documents as never safe to interpolate whole into a log
+/// line or assertion message (`auth/core.rs`'s `mint_secret_32` tests, Task
+/// 4 review F6).
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
 }
 
 #[cfg(test)]
@@ -502,10 +595,17 @@ mod tests {
         let (method, body) = &requests[0];
         assert_eq!(method, "sendMessage");
         assert_eq!(body["chat_id"], 5, "{body}");
-        assert_eq!(
-            body["text"], pending.summary,
-            "the message text must be the pending approval's own bounded summary: {body}"
+        let text = body["text"].as_str().unwrap_or_default();
+        // Task 4 review, F8: matches the native dialog's own framing —
+        // client and tool lines above the summary — so a Telegram approver
+        // (very often the one AWAY from the machine the native dialog
+        // would pop on) can see which connected client is asking.
+        assert!(
+            text.contains(&format!("Client: {}", pending.client_id)),
+            "{body}"
         );
+        assert!(text.contains(&format!("Tool: {}", pending.tool)), "{body}");
+        assert!(text.contains(&pending.summary), "{body}");
         let buttons = body["reply_markup"]["inline_keyboard"][0]
             .as_array()
             .unwrap_or_else(|| panic!("no inline keyboard row: {body}"));
@@ -514,6 +614,11 @@ mod tests {
         assert_eq!(buttons[0]["callback_data"], "a:appr-1", "{body}");
         assert_eq!(buttons[1]["text"], "⛔ Deny", "{body}");
         assert_eq!(buttons[1]["callback_data"], "d:appr-1", "{body}");
+
+        // The "one" in this test's own name: settle, then confirm `fire`
+        // never sent a second message (nit, Task 4 review).
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(state.requests().len(), 1, "{:?}", state.requests());
     }
 
     /// Fires, then resolves twice — proves both the edit CONTENT (the

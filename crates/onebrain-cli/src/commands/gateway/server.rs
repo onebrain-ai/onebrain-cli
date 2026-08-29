@@ -106,11 +106,27 @@ pub struct GatewayState {
     /// to live for the whole process, not one tool call. `await_approval`
     /// reads this directly off `&Arc<GatewayState>`, firing
     /// [`telegram::TelegramChannel::fire`]/[`telegram::TelegramChannel::note_outcome`]
-    /// with the exact same `if let Some(..) = &state.telegram` guard shape
-    /// `approval_native::is_available()` already uses for the native
-    /// channel — `None` here (the default, unconfigured `gateway.yml`)
-    /// makes both calls unconditionally no-ops, never a special case the
-    /// caller has to think about.
+    /// behind an `if let Some(..) = &state.telegram` guard — the same
+    /// unconditional-no-op-when-absent SHAPE `approval_native::is_available()`
+    /// gives the native channel, but resolved differently (Task 4 review,
+    /// F5 — an earlier revision of this doc overclaimed "the exact same
+    /// shape" here, which conflated the two): `approval_native::is_available()`
+    /// is re-evaluated LIVE on every single `await_approval` call (cheap —
+    /// a `$PATH` scan, no I/O), while THIS field is resolved exactly ONCE,
+    /// here, and frozen for the rest of the process's lifetime. That
+    /// difference is deliberate, not an oversight it happens to get away
+    /// with: `telegram` availability depends only on `gateway.yml`'s
+    /// `telegram:` block and [`telegram::DISABLE_TELEGRAM_APPROVAL_ENV`],
+    /// neither of which this running process can observe changing —
+    /// `gateway.yml` is read once at startup, never re-read, and an
+    /// operator's own env is fixed at spawn for a daemon process. Re-
+    /// evaluating on every call would therefore always reproduce the SAME
+    /// answer this field already holds, at the cost of rebuilding a
+    /// `TelegramChannel` (and its `ureq` agent) per call for no
+    /// behavioral difference — so freezing it once is a pure optimization,
+    /// not a narrower guarantee. `None` here (the default, unconfigured
+    /// `gateway.yml`) makes both calls unconditionally no-ops, never a
+    /// special case the caller has to think about.
     pub telegram: Option<Arc<telegram::TelegramChannel>>,
 }
 
@@ -5193,27 +5209,18 @@ mod tests {
         panic!("fewer than {n} telegram request(s) arrived within the poll window");
     }
 
-    /// End-to-end proof that `await_approval`'s `note_outcome` calls are
-    /// unconditional on every `WaitOutcome::Decided` arm — not just the arm
-    /// whose `ResolvedVia` happens to be `Telegram` (which has no caller
-    /// until Task 5's poller exists at all). An approval resolved over the
-    /// operator `/approvals` HTTP surface must still edit away the
-    /// Telegram prompt `state.telegram`'s `fire` sent for the SAME pending
-    /// approval, with the wording naming the channel that actually
-    /// answered (`"via http"`), not Telegram itself.
-    #[tokio::test]
-    async fn an_approval_resolved_by_http_still_edits_the_telegram_message() {
-        let tg_state = TelegramMockState::default();
-        tg_state.set_response(
-            "sendMessage",
-            serde_json::json!({ "ok": true, "result": { "message_id": 99 } }),
-        );
-        let tg_server = TelegramMockServer::start(tg_state.clone());
-        let _env = crate::test_env::set_var(
-            crate::commands::gateway::telegram::TELEGRAM_API_BASE_ENV,
-            tg_server.base.as_str(),
-        );
-
+    /// Shared setup for the three Telegram outcome-wording tests below:
+    /// mirrors [`fixture_router_with_mutating_policy`]'s shape
+    /// (`policy.mutating: ask_once`, so `brain_capture` reaches
+    /// `await_approval`) plus a `telegram:` block, so `GatewayState::new`
+    /// builds a real `state.telegram`. Callers must start their OWN
+    /// `TelegramMockServer` and set
+    /// `crate::commands::gateway::telegram::TELEGRAM_API_BASE_ENV` at it
+    /// BEFORE calling this — `TelegramChannel::new` resolves the API base
+    /// at construction time, inside this function.
+    fn fixture_router_with_mutating_policy_and_telegram(
+        approval_wait_seconds: u64,
+    ) -> (tempfile::TempDir, axum::Router, Arc<GatewayState>, String) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("onebrain.yml"), "folders: {}\n").unwrap();
@@ -5225,7 +5232,7 @@ mod tests {
             vaults,
             policy: policy::PolicyConfig {
                 mutating: policy::PolicyMode::AskOnce,
-                approval_wait_seconds: 300,
+                approval_wait_seconds,
                 ..policy::PolicyConfig::default()
             },
             telegram: TelegramConfig {
@@ -5242,6 +5249,36 @@ mod tests {
         );
         let (auth_ctx, token) = test_auth_ctx(root);
         let router = build_gateway_router(state.clone(), auth_ctx);
+        (dir, router, state, token)
+    }
+
+    /// End-to-end proof that `await_approval`'s `note_outcome` calls are
+    /// unconditional on every `WaitOutcome::Decided` arm — not just the arm
+    /// whose `ResolvedVia` happens to be `Telegram` (which has no caller
+    /// until Task 5's poller exists at all). An approval resolved via the
+    /// (simulated, out-of-band) HTTP channel — `state.approvals.resolve(..,
+    /// ResolvedVia::Http)`, the SAME established pattern
+    /// `brain_get_approved_over_http_is_audited_with_the_http_channel` and
+    /// every other Step-3 approval test in this file already use, not a
+    /// literal `POST /approvals` call (Task 4 review, F7 — an earlier
+    /// revision of this doc overclaimed the latter) — must still edit away
+    /// the Telegram prompt `state.telegram`'s `fire` sent for the SAME
+    /// pending approval, with the wording naming the channel that actually
+    /// answered (`"via http"`), not Telegram itself.
+    #[tokio::test]
+    async fn an_approval_resolved_by_http_still_edits_the_telegram_message() {
+        let tg_state = TelegramMockState::default();
+        tg_state.set_response(
+            "sendMessage",
+            serde_json::json!({ "ok": true, "result": { "message_id": 99 } }),
+        );
+        let tg_server = TelegramMockServer::start(tg_state.clone());
+        let _env = crate::test_env::set_var(
+            crate::commands::gateway::telegram::TELEGRAM_API_BASE_ENV,
+            tg_server.base.as_str(),
+        );
+
+        let (_dir, router, state, token) = fixture_router_with_mutating_policy_and_telegram(300);
 
         let call_router = router.clone();
         let call_token = token.clone();
@@ -5282,8 +5319,121 @@ mod tests {
             body["text"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("via http"),
+                .contains("Approved via http"),
             "the edit must name the channel that actually answered: {body}"
+        );
+    }
+
+    /// Task 4 review, F4: pins the SECOND of the three exact outcome
+    /// strings `await_approval` passes to `note_outcome` — only the
+    /// `Approve` wording had coverage before this. Same shape as the
+    /// `Approve` test above, resolved `Deny` instead.
+    #[tokio::test]
+    async fn an_approval_denied_over_http_edits_the_telegram_message_with_denied_wording() {
+        let tg_state = TelegramMockState::default();
+        tg_state.set_response(
+            "sendMessage",
+            serde_json::json!({ "ok": true, "result": { "message_id": 100 } }),
+        );
+        let tg_server = TelegramMockServer::start(tg_state.clone());
+        let _env = crate::test_env::set_var(
+            crate::commands::gateway::telegram::TELEGRAM_API_BASE_ENV,
+            tg_server.base.as_str(),
+        );
+
+        let (_dir, router, state, token) = fixture_router_with_mutating_policy_and_telegram(300);
+
+        let call_router = router.clone();
+        let call_token = token.clone();
+        let handle = tokio::spawn(async move {
+            let body = call_body(
+                1,
+                "brain_capture",
+                serde_json::json!({"title": "Deny Me Telegram", "text": "note body"}),
+            );
+            post(
+                &call_router,
+                body,
+                &call_token,
+                &standard_headers("tools/call", Some("brain_capture")),
+            )
+            .await
+        });
+
+        let pending = wait_for_one_pending(&state).await;
+        wait_for_telegram_requests(&tg_state, 1).await;
+
+        assert!(state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Deny,
+            approval::ResolvedVia::Http
+        ));
+
+        let resp = handle.await.unwrap();
+        assert!(resp.get("error").is_some(), "{resp}");
+
+        let requests = wait_for_telegram_requests(&tg_state, 2).await;
+        let (method, body) = &requests[1];
+        assert_eq!(method, "editMessageText");
+        assert_eq!(body["message_id"], 100, "{body}");
+        assert!(
+            body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Denied via http"),
+            "{body}"
+        );
+    }
+
+    /// Task 4 review, F4: pins the THIRD exact outcome string — the
+    /// timeout wording, reached when nothing answers before
+    /// `approval_wait_seconds` elapses. A short-but-nonzero wait (unlike
+    /// `capabilities_times_out_when_policy_needs_approval_and_nothing_answers`'s
+    /// `0`): this test needs `fire`'s own blocking `sendMessage` call to
+    /// actually land before the timeout fires, or there is nothing for
+    /// `note_outcome` to edit.
+    #[tokio::test]
+    async fn an_approval_that_times_out_edits_the_telegram_message_with_expired_wording() {
+        let tg_state = TelegramMockState::default();
+        tg_state.set_response(
+            "sendMessage",
+            serde_json::json!({ "ok": true, "result": { "message_id": 101 } }),
+        );
+        let tg_server = TelegramMockServer::start(tg_state.clone());
+        let _env = crate::test_env::set_var(
+            crate::commands::gateway::telegram::TELEGRAM_API_BASE_ENV,
+            tg_server.base.as_str(),
+        );
+
+        let (_dir, router, _state, token) = fixture_router_with_mutating_policy_and_telegram(1);
+
+        let body = call_body(
+            1,
+            "brain_capture",
+            serde_json::json!({"title": "Timeout Telegram", "text": "note body"}),
+        );
+        let resp = post(
+            &router,
+            body,
+            &token,
+            &standard_headers("tools/call", Some("brain_capture")),
+        )
+        .await;
+        let message = resp["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a JSON-RPC error: {resp}"));
+        assert!(message.contains("timed out"), "{message}");
+
+        let requests = wait_for_telegram_requests(&tg_state, 2).await;
+        let (method, body) = &requests[1];
+        assert_eq!(method, "editMessageText");
+        assert_eq!(body["message_id"], 101, "{body}");
+        assert!(
+            body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("⏰ Expired — no one answered in time"),
+            "{body}"
         );
     }
 }
