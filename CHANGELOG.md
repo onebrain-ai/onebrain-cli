@@ -70,9 +70,41 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   (`native`/`http`/`telegram`) naming which approval channels can actually
   deliver a prompt on this machine right now — a caller is never told a
   write can be approved through a channel that cannot carry the prompt to a
-  human. Telegram is not implemented yet (planned for Gateway PR 5) and
-  always reports `false`. See
+  human. See
   [`docs/gateway.md#capabilities-truthfulness`](docs/gateway.md#capabilities-truthfulness).
+- **Telegram approval channel (Gateway PR 5).** `onebrain gateway telegram
+  setup` walks through wiring up a dedicated bot — paste a `@BotFather`
+  token, send a one-time code back to the bot to prove identity (never
+  arrival order or a plain "press START"), and the wizard writes
+  `gateway.yml`'s new `telegram.bot_token`/`telegram.chat_id` keys and sends
+  a confirmation message. A blocked call now also fires an inline-keyboard
+  prompt (✅ Approve / ⛔ Deny) to that chat, carrying the same
+  Client/Tool/bounded-summary framing the native dialog shows — never the
+  raw tool-call body — and edits the message to show the outcome (clearing
+  the keyboard) once ANY channel resolves it. A demand-driven background
+  poller (one thread per process, spawned on first need) watches for the
+  button press via `getUpdates`, persists its cursor to a bot-token-keyed
+  offset file after every batch — so a clean restart resumes from where it
+  left off, a crash between a batch and its persisted cursor at worst
+  re-fetches and re-handles a few already-seen updates on the next start
+  (harmless: approvals are in-memory and per-process, so a stale resolve
+  is just a no-op), and rotating the bot token starts that new bot with a
+  clean cursor instead of inheriting a stale one — and exits again once
+  nothing is left pending (bounded by one ≤25s long-poll cycle past the
+  last pending approval). Authorization has no pairing code at all — a
+  button press is accepted iff its sender's
+  Telegram id matches the configured `chat_id`, which must be a private
+  (positive-id) chat; a dedicated bot is required, since Telegram allows
+  only one `getUpdates` consumer per token and the OneBrain Claude Code
+  plugin's own bot already holds that slot for its own, unrelated,
+  vault-level `notifications.telegram_chat_id` integration.
+  `capabilities.approval_channels.telegram` reports whether a bot is
+  configured, not whether it's currently reachable, and an audit-log
+  line's `channel` field can now name `"telegram"` alongside its existing
+  `"native"`/`"http"` values whenever a human resolved the call through
+  it — still `null` for `auto`, a policy `denied` with no human involved,
+  or a `timedout` call, exactly as before. See
+  [`docs/gateway.md#telegram-approval-channel`](docs/gateway.md#telegram-approval-channel).
 
 ### Changed
 - `onebrain gateway run` now installs a `tracing` subscriber (stderr, honouring

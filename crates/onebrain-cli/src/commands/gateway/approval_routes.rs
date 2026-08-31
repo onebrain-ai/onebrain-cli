@@ -176,7 +176,14 @@ async fn resolve_approval(
 ) -> Response {
     let snapshot = state.approvals.list().into_iter().find(|p| p.id == id);
 
-    let resolved = state.approvals.resolve(&id, body.decision);
+    // This IS the operator HTTP surface — see the module docs' "Design
+    // decision" section — so every resolution through here is, by
+    // definition, `ResolvedVia::Http`. `server::record_audit` reads this
+    // straight off `approval::WaitOutcome::Decided` on the waiter side
+    // (Gateway PR 5, Task 3), so the audit log names this exact channel.
+    let resolved = state
+        .approvals
+        .resolve(&id, body.decision, approval::ResolvedVia::Http);
     if !resolved {
         return (
             StatusCode::NOT_FOUND,
@@ -428,7 +435,11 @@ mod tests {
         let body = json_body(resp).await;
         assert_eq!(body["resolved"], true, "{body}");
 
-        assert_eq!(rx.await.unwrap(), approval::Decision::Approve);
+        assert_eq!(
+            rx.await.unwrap(),
+            (approval::Decision::Approve, approval::ResolvedVia::Http),
+            "the /approvals HTTP surface must resolve as ResolvedVia::Http"
+        );
         assert!(
             state.approvals.list().is_empty(),
             "a resolved approval must no longer be pending"

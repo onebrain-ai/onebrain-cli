@@ -31,6 +31,9 @@ pub mod config;
 pub mod oauth_routes;
 pub mod policy;
 pub mod server;
+pub mod telegram;
+pub mod telegram_api;
+pub mod telegram_setup;
 
 // `gateway_config_path` / `DEFAULT_GATEWAY_PORT` stay module-internal to
 // `config.rs` (used there by `load_gateway_config` + its own tests) — no
@@ -38,6 +41,7 @@ pub mod server;
 // Task 4's dead-code-allow removal).
 pub use config::{load_gateway_config, GatewayConfig};
 pub use server::{build_gateway_router, GatewayState};
+pub use telegram_setup::telegram_setup;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -86,6 +90,26 @@ fn log_filter() -> tracing_subscriber::EnvFilter {
     log_filter_from(std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).ok())
 }
 
+/// Hard floor appended to every resolved `RUST_LOG` filter, regardless of
+/// where it lands in the rendered string — security review finding
+/// (Gateway PR 5, Task 1 fix wave): `telegram_api`'s request URL embeds the
+/// live bot token (`{base}/bot<TOKEN>/<method>`), and `ureq`'s own
+/// `debug`/`trace` logging (via the `log` crate, bridged into this
+/// subscriber by `tracing-subscriber`'s `tracing-log` default feature)
+/// prints that full request path verbatim. An operator setting
+/// `RUST_LOG=trace` to debug something UNRELATED must not be able to
+/// accidentally print the token to the gateway's log file.
+/// `tracing_subscriber::EnvFilter` resolves a target's effective level
+/// from its most specific matching directive — a target-qualified
+/// directive (`ureq=info`) always outranks a bare global level (`trace`)
+/// for the `ureq` target specifically, which is what actually holds `ureq`
+/// at `info` here. (`EnvFilter`'s `Display` sorts directives by
+/// specificity rather than preserving input order, so the floor can print
+/// FIRST in `to_string()` output — position in the string is cosmetic;
+/// specificity is what enforces the floor. See
+/// `log_filter_floors_ureq_logging_even_under_rust_log_trace` below.)
+const UREQ_LOG_FLOOR: &str = "ureq=info";
+
 /// [`log_filter`]'s decision, as a pure function of the raw `RUST_LOG` value
 /// — so the RUST_LOG-honouring behavior is directly unit-testable without
 /// mutating the process environment (and without [`init_tracing`], which any
@@ -97,12 +121,22 @@ fn log_filter() -> tracing_subscriber::EnvFilter {
 /// silently filter everything out; it follows this crate's own
 /// [`env_switch_on`] convention instead, where blanking a variable is how a
 /// hook-managed env block neutralizes it rather than a request for silence.
+///
+/// Every resolved filter also carries [`UREQ_LOG_FLOOR`], appended after
+/// whichever base directives win below — see that constant's doc comment.
 fn log_filter_from(raw: Option<String>) -> tracing_subscriber::EnvFilter {
-    match raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        Some(directives) => tracing_subscriber::EnvFilter::try_new(directives)
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER)),
-        None => tracing_subscriber::EnvFilter::new(DEFAULT_LOG_FILTER),
-    }
+    let base = match raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(directives) => directives,
+        None => DEFAULT_LOG_FILTER,
+    };
+    let floored = format!("{base},{UREQ_LOG_FLOOR}");
+    // `floored` fails to parse only when `base` itself was invalid (the
+    // hardcoded `UREQ_LOG_FLOOR` suffix always parses) — fall back to the
+    // default filter, ALSO with the floor appended, rather than ever
+    // constructing an EnvFilter without it.
+    tracing_subscriber::EnvFilter::try_new(&floored).unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(format!("{DEFAULT_LOG_FILTER},{UREQ_LOG_FLOOR}"))
+    })
 }
 
 /// Install a `tracing` subscriber for the foreground `gateway run` process.
@@ -391,36 +425,96 @@ mod tests {
     // ── tracing subscriber (round-2 finding D) ────────────────────────────
 
     /// `RUST_LOG` wins when set — an operator debugging a gateway must be
-    /// able to turn the level up the same way they do for the daemon.
+    /// able to turn the level up the same way they do for the daemon. Every
+    /// resolved filter also carries [`UREQ_LOG_FLOOR`] (see that constant's
+    /// doc comment) — pinned here alongside the RUST_LOG-honouring
+    /// behavior, and again on its own below. Checked via `contains` rather
+    /// than exact equality: `EnvFilter`'s `Display` sorts directives by
+    /// specificity rather than preserving append order (the floor prints
+    /// FIRST, not last — confirmed empirically), which is an
+    /// implementation detail these tests shouldn't couple to.
     #[test]
     fn log_filter_honours_rust_log_when_set() {
-        assert_eq!(
-            log_filter_from(Some("debug".to_string())).to_string(),
-            "debug"
+        let debug = log_filter_from(Some("debug".to_string())).to_string();
+        assert!(debug.contains("debug"), "{debug}");
+        assert!(debug.contains(UREQ_LOG_FLOOR), "{debug}");
+
+        let onebrain_trace = log_filter_from(Some("onebrain=trace".to_string())).to_string();
+        assert!(
+            onebrain_trace.contains("onebrain=trace"),
+            "{onebrain_trace}"
         );
-        assert_eq!(
-            log_filter_from(Some("onebrain=trace".to_string())).to_string(),
-            "onebrain=trace"
-        );
+        assert!(onebrain_trace.contains(UREQ_LOG_FLOOR), "{onebrain_trace}");
     }
 
     /// …and falls back to a sensible foreground default when it is unset,
     /// blank, or unparseable, rather than silently filtering everything out.
     #[test]
     fn log_filter_falls_back_to_the_default_level() {
-        assert_eq!(log_filter_from(None).to_string(), DEFAULT_LOG_FILTER);
-        assert_eq!(
-            log_filter_from(Some("   ".to_string())).to_string(),
-            DEFAULT_LOG_FILTER,
-            "a blanked RUST_LOG must not mute the gateway entirely"
+        let none = log_filter_from(None).to_string();
+        assert!(none.contains(DEFAULT_LOG_FILTER), "{none}");
+        assert!(none.contains(UREQ_LOG_FLOOR), "{none}");
+
+        let blank = log_filter_from(Some("   ".to_string())).to_string();
+        assert!(
+            blank.contains(DEFAULT_LOG_FILTER),
+            "a blanked RUST_LOG must not mute the gateway entirely: {blank}"
         );
+        assert!(blank.contains(UREQ_LOG_FLOOR), "{blank}");
+
         // `EnvFilter` accepts almost any bare word as a target directive, so
         // an unparseable value has to name an invalid LEVEL to actually
         // fail — which is exactly the typo an operator makes.
-        assert_eq!(
-            log_filter_from(Some("onebrain=verbose".to_string())).to_string(),
-            DEFAULT_LOG_FILTER,
-            "a mistyped level must fall back to the default, not silence the gateway"
+        let mistyped = log_filter_from(Some("onebrain=verbose".to_string())).to_string();
+        assert!(
+            mistyped.contains(DEFAULT_LOG_FILTER),
+            "a mistyped level must fall back to the default, not silence the gateway: {mistyped}"
+        );
+        assert!(mistyped.contains(UREQ_LOG_FLOOR), "{mistyped}");
+    }
+
+    /// Security review finding (Gateway PR 5, Task 1 fix wave): an operator
+    /// setting `RUST_LOG=trace` for an UNRELATED reason must never turn up
+    /// `ureq`'s own logging — `telegram_api`'s request URL embeds the live
+    /// bot token, and `ureq` prints the full request path at `debug`/
+    /// `trace`. This pins that [`UREQ_LOG_FLOOR`] is present in the
+    /// resolved filter even under the broadest possible operator
+    /// directive. What actually holds `ureq` at `info` is `EnvFilter`'s
+    /// specificity resolution (a target-qualified directive always
+    /// outranks a bare global level for that target) — NOT the floor's
+    /// position in the rendered string, which `EnvFilter`'s `Display`
+    /// sorts by specificity rather than append order (it renders the
+    /// floor FIRST here, not last).
+    #[test]
+    fn log_filter_floors_ureq_logging_even_under_rust_log_trace() {
+        let filter = log_filter_from(Some("trace".to_string())).to_string();
+        assert!(
+            filter.contains(UREQ_LOG_FLOOR),
+            "ureq must be floored to info even when the rest of the filter is trace: {filter}"
+        );
+    }
+
+    /// The ADVERSARIAL case the blanket-`trace` test above does not cover
+    /// (Task 1 fix wave, minor deferred; discharged as the whole-branch
+    /// review's Minor 3 ride-along): an operator naming `ureq` EXPLICITLY,
+    /// at the same specificity as the floor itself. The floor is appended
+    /// LAST and `EnvFilter` resolves same-specificity directives
+    /// last-parsed-wins, so `ureq=info` still governs the `ureq` target.
+    /// That mechanism was verified empirically against the pinned
+    /// `tracing-subscriber` during Task 1 but was never pinned by a test —
+    /// and it is the DIRECT guard for this branch's most consequential
+    /// leak vector: at `trace`, `ureq` logs the full request path, and
+    /// `telegram_api`'s paths embed the live bot token.
+    ///
+    /// Asserted on the resolved filter's own `Display`: the floor is
+    /// present, and no `ureq=trace` survives anywhere in it.
+    #[test]
+    fn log_filter_floors_an_explicit_ureq_trace_override() {
+        let filter = log_filter_from(Some("ureq=trace".to_string())).to_string();
+        assert!(filter.contains(UREQ_LOG_FLOOR), "{filter}");
+        assert!(
+            !filter.contains("ureq=trace"),
+            "an explicitly requested ureq=trace must not survive the floor: {filter}"
         );
     }
 

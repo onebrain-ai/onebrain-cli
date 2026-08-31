@@ -344,6 +344,25 @@ pub enum GatewayVerb {
         #[arg(long)]
         rotate: bool,
     },
+    /// Manage the Telegram approval channel (`gateway.yml`'s `telegram:` block).
+    Telegram(TelegramCmd),
+}
+
+#[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
+pub struct TelegramCmd {
+    #[command(subcommand)]
+    pub verb: TelegramVerb,
+}
+#[derive(Subcommand, Debug)]
+pub enum TelegramVerb {
+    /// Interactive wizard: paste a BotFather token, then send the
+    /// one-time code this wizard prints back to the bot in a private
+    /// Telegram message (pressing START alone is never enough — identity
+    /// is proven by that code, not by message order) — this captures the
+    /// resulting chat id and writes it (with the token) into
+    /// `~/.onebrain/gateway.yml`'s `telegram:` block.
+    Setup,
 }
 // ─────────────────────────────────────────────────────────────────────────
 // harness (1-verb · documented exception · wired to legacy)

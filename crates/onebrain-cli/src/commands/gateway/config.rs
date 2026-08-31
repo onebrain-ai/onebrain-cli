@@ -19,6 +19,63 @@ use super::policy::PolicyConfig;
 
 pub const DEFAULT_GATEWAY_PORT: u16 = 7717;
 
+/// Telegram bot credentials for the approval-prompt channel (Gateway PR 5).
+/// This task (Task 2) only adds the config shape and the
+/// [`super::telegram::is_available`] gate that reads it — a setup wizard
+/// (a later Gateway PR 5 task) is what actually populates these fields and
+/// validates the token against the live Telegram API.
+///
+/// Both fields default to the empty/zero value, which
+/// [`super::telegram::is_available`] treats as "not configured": Telegram
+/// never assigns a bot an empty token or a chat the id `0`, so the plain
+/// default doubles as an unambiguous "unset" sentinel — no `Option`
+/// wrapper needed on either field.
+///
+/// `Debug` is hand-written (not derived) — see the impl below: a bare
+/// `#[derive(Debug)]` here would print the raw `bot_token` secret
+/// verbatim, and this type is exactly the kind of thing that ends up in a
+/// `tracing::debug!(?config, ...)` somewhere down the line — the same
+/// rationale `auth/store.rs`'s `TokenRecord`/`AuthCode`/`PairingState`
+/// spell out for their own hand-written `Debug` impls (review finding,
+/// Gateway PR 5 Task 2 fix wave). `Serialize` also skips `bot_token`
+/// (`#[serde(skip_serializing)]` on the field below) for the same reason:
+/// nothing in this crate serializes `GatewayConfig` today, but a future
+/// `to_string(&config)` (a debug dump, a `gateway.yml` round-trip, …)
+/// should be safe by construction rather than safe only because nobody
+/// happens to call it on this type yet. `Deserialize` is unaffected —
+/// `gateway.yml` still reads `bot_token` in normally; only the OUTPUT
+/// direction is redacted.
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub struct TelegramConfig {
+    /// Bot token minted by `@BotFather` (`/newbot`). Never logged or
+    /// echoed back to a client — redacted by the hand-written `Debug` impl
+    /// below and dropped entirely from `Serialize` output
+    /// (`#[serde(skip_serializing)]`); see `telegram_api.rs`'s "scrub
+    /// chokepoint" module docs for how every Telegram API error this
+    /// crate can produce is separately scrubbed of it too.
+    #[serde(default, skip_serializing)]
+    pub bot_token: String,
+    /// Telegram chat id the approval bot sends prompts to and reads
+    /// button-press callbacks from. Not a secret — stays visible in both
+    /// `Debug` and `Serialize` output; an operator debugging delivery
+    /// needs it.
+    #[serde(default)]
+    pub chat_id: i64,
+}
+
+/// Redacts `bot_token` — the live Telegram bot credential; `chat_id` stays
+/// visible (see its own field doc comment above). Mirrors
+/// `auth/store.rs`'s `TokenRecord`/`AuthCode`/`PairingState` `Debug` impls
+/// exactly: same one-secret-field-redacted shape, same rationale.
+impl std::fmt::Debug for TelegramConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelegramConfig")
+            .field("bot_token", &"<redacted>")
+            .field("chat_id", &self.chat_id)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
     /// Loopback port to serve on. 0 = OS-assigned ephemeral port.
@@ -50,6 +107,14 @@ pub struct GatewayConfig {
     /// independently).
     #[serde(default)]
     pub policy: PolicyConfig,
+    /// Telegram approval-channel credentials (Gateway PR 5, Task 2) — see
+    /// [`TelegramConfig`]'s own doc comment for the field meanings and the
+    /// "not configured" default. `#[serde(default)]` so an existing
+    /// `gateway.yml` written before this field existed keeps parsing (and
+    /// gets the "not configured" default) instead of failing to
+    /// deserialize.
+    #[serde(default)]
+    pub telegram: TelegramConfig,
 }
 
 fn default_gateway_port() -> u16 {
@@ -64,6 +129,7 @@ impl Default for GatewayConfig {
             vaults: BTreeMap::new(),
             public_url: None,
             policy: PolicyConfig::default(),
+            telegram: TelegramConfig::default(),
         }
     }
 }
@@ -113,6 +179,14 @@ mod tests {
         assert_eq!(cfg.policy.destructive, PolicyMode::AskAlways);
         assert_eq!(cfg.policy.grant_ttl_minutes, 30);
         assert_eq!(cfg.policy.approval_wait_seconds, 300);
+        assert!(
+            cfg.telegram.bot_token.is_empty(),
+            "default telegram.bot_token must be empty (== not configured)"
+        );
+        assert_eq!(
+            cfg.telegram.chat_id, 0,
+            "default telegram.chat_id must be zero (== not configured)"
+        );
     }
 
     /// `GatewayConfig`'s `Default` impl is hand-written (it does not
@@ -192,6 +266,69 @@ mod tests {
             "field omitted from the policy block must still default"
         );
         assert_eq!(cfg.policy.destructive, PolicyMode::AskAlways);
+    }
+
+    /// A `telegram:` block parses into `GatewayConfig.telegram`, and a
+    /// missing block still yields the "not configured" default — same shape
+    /// as `gateway_config_parses_a_policy_block_and_fills_its_missing_fields`
+    /// above, for the field this task (Gateway PR 5, Task 2) adds.
+    #[test]
+    fn gateway_config_parses_a_telegram_block_and_defaults_when_absent() {
+        let cfg: GatewayConfig =
+            serde_yaml::from_str("telegram:\n  bot_token: T\n  chat_id: 5\n").unwrap();
+        assert_eq!(cfg.telegram.bot_token, "T");
+        assert_eq!(cfg.telegram.chat_id, 5);
+
+        let sparse: GatewayConfig = serde_yaml::from_str("vaults:\n  ob-1: /tmp/v1\n").unwrap();
+        assert!(
+            sparse.telegram.bot_token.is_empty(),
+            "missing telegram block must default to an empty bot_token"
+        );
+        assert_eq!(
+            sparse.telegram.chat_id, 0,
+            "missing telegram block must default to a zero chat_id"
+        );
+    }
+
+    // ── Redacting Debug / Serialize (review finding, Gateway PR 5 Task 2
+    // fix wave) ────────────────────────────────────────────────────────
+
+    /// Mirrors `auth/store.rs`'s `token_record_debug_redacts_token_and_rotated_to_but_keeps_other_fields`
+    /// convention exactly, extended to also cover `Serialize` (this type's
+    /// `Serialize` impl is genuinely reachable — `GatewayConfig` derives it
+    /// — even though nothing calls it today; both output paths must be
+    /// checked, not just `Debug`).
+    #[test]
+    fn telegram_config_redacts_bot_token_in_debug_and_serialize_but_keeps_chat_id() {
+        let cfg = TelegramConfig {
+            bot_token: "SUPER-SECRET-BOT-TOKEN".to_string(),
+            chat_id: 123456789,
+        };
+
+        let debug = format!("{cfg:?}");
+        assert!(
+            !debug.contains("SUPER-SECRET-BOT-TOKEN"),
+            "bot_token leaked into Debug output: {debug}"
+        );
+        assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(
+            debug.contains("123456789"),
+            "chat_id is not a secret and must stay visible: {debug}"
+        );
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            !json.contains("SUPER-SECRET-BOT-TOKEN"),
+            "bot_token leaked into Serialize output: {json}"
+        );
+        assert!(
+            !json.contains("bot_token"),
+            "bot_token must be dropped from Serialize output entirely, not just blanked: {json}"
+        );
+        assert!(
+            json.contains("123456789"),
+            "chat_id is not a secret and must stay visible: {json}"
+        );
     }
 
     /// Windows-CI regression guard (`gateway_http.rs`'s happy path failed

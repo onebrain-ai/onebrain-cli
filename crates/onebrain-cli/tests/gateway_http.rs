@@ -122,8 +122,9 @@ fn spawn_gateway(
 /// code is ever shown), and stderr goes through
 /// [`support::redacted_capture_tail`], which collapses every path-shaped and
 /// pairing-code-shaped token to a placeholder and bounds the result. The
-/// sibling harnesses in `gateway_oauth_e2e.rs` and `gateway_approval_e2e.rs`
-/// do exactly the same, through the same helper.
+/// sibling harnesses in `gateway_oauth_e2e.rs`, `gateway_approval_e2e.rs`,
+/// and `gateway_telegram_e2e.rs` do exactly the same, through the same
+/// helper.
 /// `gateway_startup_failure_panic_carries_a_redacted_stderr_tail` below pins
 /// the behavior against a REAL constructed startup failure, not a
 /// hand-written string.

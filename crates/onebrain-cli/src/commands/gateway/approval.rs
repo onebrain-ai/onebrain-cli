@@ -172,8 +172,49 @@ pub enum Decision {
     Deny,
 }
 
-/// Outcome of [`Approvals::wait`]: either a human [`Decision`], or the TTL
-/// elapsed with no response.
+/// Which resolution channel actually answered a [`PendingApproval`] —
+/// threaded alongside [`Decision`] from [`Approvals::resolve`] through
+/// [`Approvals::wait`] to `server::record_audit`'s `channel` field
+/// (Gateway PR 5, Task 3), so the audit log names WHICH channel a human used
+/// to answer, for every channel, not just whichever one happened to be
+/// wired first. [`Self::as_str`] gives the exact lowercase wire value
+/// `audit::AuditEntry::channel` records.
+///
+/// Gateway PR 5, Task 5 gave `Telegram` its own production caller:
+/// [`super::telegram::TelegramChannel::ensure_polling`]'s long-poll handler
+/// calls [`Approvals::resolve`] with `via: ResolvedVia::Telegram` once a
+/// human taps an inline Approve/Deny button and the callback passes its
+/// `from_id` check — see that method's own doc comment for the full
+/// validation flow. The per-variant `#[allow(dead_code)]` this variant used
+/// to carry (the same "later task" shape `telegram.rs::api_base`'s own doc
+/// comment still uses for a different not-yet-wired piece of this PR) is
+/// gone now that a real caller exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedVia {
+    /// The operator `/approvals` HTTP surface (`approval_routes::resolve_approval`).
+    Http,
+    /// The native macOS `display dialog` channel (`approval_native::prompt`).
+    Native,
+    /// The Telegram approval channel (`telegram::TelegramChannel::ensure_polling`,
+    /// Gateway PR 5, Task 5).
+    Telegram,
+}
+
+impl ResolvedVia {
+    /// The exact lowercase string `audit::AuditEntry::channel` records —
+    /// `"http"`, `"native"`, or `"telegram"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ResolvedVia::Http => "http",
+            ResolvedVia::Native => "native",
+            ResolvedVia::Telegram => "telegram",
+        }
+    }
+}
+
+/// Outcome of [`Approvals::wait`]: either a human [`Decision`] plus WHICH
+/// channel delivered it ([`ResolvedVia`]), or the TTL elapsed with no
+/// response — a timeout has no channel to name, since nothing answered.
 ///
 /// Gateway PR 4, Task 5 gave both variants a real production caller:
 /// `server::await_approval` constructs this by `.await`ing [`Approvals::wait`]
@@ -181,17 +222,30 @@ pub enum Decision {
 /// or `Denied`, `TimedOut` becomes `audit::Decision::TimedOut` — so the
 /// blanket dead-code allow this type used to carry is gone, exactly like
 /// the ones on `register`/`wait`/`audit::Decision::{Approved,TimedOut}`.
+/// Gateway PR 5, Task 3 widened `Decided` to also carry [`ResolvedVia`], so
+/// that same match can tell `server::record_audit` which channel answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitOutcome {
-    Decided(Decision),
+    Decided(Decision, ResolvedVia),
     TimedOut,
 }
+
+/// One human answer to a pending approval: the [`Decision`] plus WHICH
+/// [`ResolvedVia`] channel delivered it — the exact payload the `oneshot`
+/// channel between [`Approvals::register`] and [`Approvals::wait`] carries.
+/// Named purely to keep `Approvals::pending`'s field type under clippy's
+/// `type_complexity` threshold, and reused in [`Approvals::register`]'s
+/// `Receiver` and [`Approvals::wait`]'s `Receiver` parameter for the same
+/// reason — an internal spelling for the tuple `(Decision, ResolvedVia)`,
+/// not a new type this module adds to its own public surface (both
+/// [`Decision`] and [`ResolvedVia`] stay the real, `pub`, importable types).
+type Resolution = (Decision, ResolvedVia);
 
 /// In-memory, per-process registry of pending approvals, keyed by
 /// [`PendingApproval::id`]. See the module docs for the full lifecycle and
 /// locking discipline.
 pub struct Approvals {
-    pending: Mutex<HashMap<String, (PendingApproval, oneshot::Sender<Decision>)>>,
+    pending: Mutex<HashMap<String, (PendingApproval, oneshot::Sender<Resolution>)>>,
 }
 
 impl Approvals {
@@ -238,7 +292,7 @@ impl Approvals {
     pub fn register(
         &self,
         p: PendingApproval,
-    ) -> Result<oneshot::Receiver<Decision>, RegisterRejected> {
+    ) -> Result<oneshot::Receiver<Resolution>, RegisterRejected> {
         let (tx, rx) = oneshot::channel();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -270,34 +324,41 @@ impl Approvals {
         pending.values().map(|(p, _)| p.clone()).collect()
     }
 
-    /// Resolve `id` with decision `d`. `true` iff `id` was pending AND the
-    /// waiting receiver was still live to accept it.
+    /// Resolve `id` with decision `d`, answered via channel `via`. `true`
+    /// iff `id` was pending AND the waiting receiver was still live to
+    /// accept it.
     ///
     /// First responder wins: resolving removes the entry from `pending`
     /// immediately, so a second `resolve` call for the same `id` — whether
     /// it raced concurrently or arrives after — always finds nothing left
-    /// and returns `false`; the decision the first call sent stands,
-    /// untouched by the second. An `id` that was never registered, was
-    /// already resolved, or already timed out and was cleaned up by
+    /// and returns `false`; the decision (and channel) the first call sent
+    /// stands, untouched by the second. An `id` that was never registered,
+    /// was already resolved, or already timed out and was cleaned up by
     /// [`Self::wait`] all collapse to the same "nothing to resolve" `false`
     /// — there is no different recovery action a caller could safely take
     /// for any of those, so distinguishing them isn't worth the extra
     /// surface.
     ///
-    /// Called from BOTH resolution channels (Gateway PR 4, Task 4) —
-    /// `approval_routes::resolve_approval` (the operator HTTP surface) and
-    /// [`super::approval_native::prompt`] (the native macOS dialog) — with
-    /// no coordination between them beyond this method's own
-    /// first-response-wins removal-before-send behavior: whichever channel
-    /// answers first wins, and a later answer from the other channel for
-    /// the same `id` simply finds nothing left to resolve.
-    pub fn resolve(&self, id: &str, d: Decision) -> bool {
+    /// Called from every resolution channel (Gateway PR 4, Task 4; Gateway
+    /// PR 5, Task 3) — `approval_routes::resolve_approval` (the operator
+    /// HTTP surface, `via: ResolvedVia::Http`) and
+    /// [`super::approval_native::prompt`] (the native macOS dialog, `via:
+    /// ResolvedVia::Native`) today, Telegram (`ResolvedVia::Telegram`) from
+    /// Gateway PR 5, Task 5 — with no coordination between them beyond this
+    /// method's own first-response-wins removal-before-send behavior:
+    /// whichever channel answers first wins, and a later answer from
+    /// another channel for the same `id` simply finds nothing left to
+    /// resolve. `via` is carried through untouched to
+    /// [`Self::wait`]'s [`WaitOutcome::Decided`] and from there to
+    /// `server::record_audit`'s `channel` field — this is the ONLY place
+    /// that value originates.
+    pub fn resolve(&self, id: &str, d: Decision, via: ResolvedVia) -> bool {
         let removed = {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             pending.remove(id)
         };
         match removed {
-            Some((_, tx)) => tx.send(d).is_ok(),
+            Some((_, tx)) => tx.send((d, via)).is_ok(),
             None => false,
         }
     }
@@ -319,11 +380,11 @@ impl Approvals {
     pub async fn wait(
         &self,
         id: &str,
-        rx: oneshot::Receiver<Decision>,
+        rx: oneshot::Receiver<Resolution>,
         ttl: Duration,
     ) -> WaitOutcome {
         match tokio::time::timeout(ttl, rx).await {
-            Ok(Ok(decision)) => WaitOutcome::Decided(decision),
+            Ok(Ok((decision, via))) => WaitOutcome::Decided(decision, via),
             Ok(Err(_)) | Err(_) => {
                 let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
                 pending.remove(id);
@@ -372,8 +433,8 @@ mod tests {
     async fn register_then_resolve_delivers_the_decision() {
         let approvals = Approvals::new();
         let rx = approvals.register(sample("a1")).unwrap();
-        assert!(approvals.resolve("a1", Decision::Approve));
-        assert_eq!(rx.await.unwrap(), Decision::Approve);
+        assert!(approvals.resolve("a1", Decision::Approve, ResolvedVia::Http));
+        assert_eq!(rx.await.unwrap(), (Decision::Approve, ResolvedVia::Http));
     }
 
     // ── resolve of an unknown id -> false ───────────────────────────────
@@ -381,7 +442,7 @@ mod tests {
     #[test]
     fn resolve_of_an_unknown_id_returns_false() {
         let approvals = Approvals::new();
-        assert!(!approvals.resolve("nope", Decision::Approve));
+        assert!(!approvals.resolve("nope", Decision::Approve, ResolvedVia::Http));
     }
 
     // ── double resolve: second returns false, first decision stands ────
@@ -390,16 +451,47 @@ mod tests {
     async fn double_resolve_second_call_returns_false_first_decision_stands() {
         let approvals = Approvals::new();
         let rx = approvals.register(sample("a1")).unwrap();
-        assert!(approvals.resolve("a1", Decision::Approve));
+        assert!(approvals.resolve("a1", Decision::Approve, ResolvedVia::Http));
         assert!(
-            !approvals.resolve("a1", Decision::Deny),
+            !approvals.resolve("a1", Decision::Deny, ResolvedVia::Native),
             "a second resolve of an already-resolved id must return false"
         );
         assert_eq!(
             rx.await.unwrap(),
-            Decision::Approve,
-            "the FIRST decision must stand, unaffected by the second call"
+            (Decision::Approve, ResolvedVia::Http),
+            "the FIRST decision (and channel) must stand, unaffected by the second call"
         );
+    }
+
+    // ── the channel is carried through resolve -> wait untouched ────────
+
+    /// [`ResolvedVia`] isn't just stored — it round-trips through the exact
+    /// same oneshot payload the decision does, for every variant, proving
+    /// `wait` never substitutes or drops it.
+    #[tokio::test]
+    async fn resolve_carries_the_channel_through_to_wait_outcome() {
+        for via in [
+            ResolvedVia::Http,
+            ResolvedVia::Native,
+            ResolvedVia::Telegram,
+        ] {
+            let approvals = Approvals::new();
+            let rx = approvals.register(sample("a1")).unwrap();
+            assert!(approvals.resolve("a1", Decision::Approve, via));
+            let outcome = approvals.wait("a1", rx, Duration::from_secs(5)).await;
+            assert_eq!(
+                outcome,
+                WaitOutcome::Decided(Decision::Approve, via),
+                "wait() must report exactly the channel resolve() was given: {via:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolved_via_as_str_matches_the_documented_wire_values() {
+        assert_eq!(ResolvedVia::Http.as_str(), "http");
+        assert_eq!(ResolvedVia::Native.as_str(), "native");
+        assert_eq!(ResolvedVia::Telegram.as_str(), "telegram");
     }
 
     // ── timeout path: TimedOut + entry dropped from pending ─────────────
@@ -408,9 +500,12 @@ mod tests {
     async fn wait_returns_the_decision_when_resolved_before_the_ttl() {
         let approvals = Approvals::new();
         let rx = approvals.register(sample("a1")).unwrap();
-        assert!(approvals.resolve("a1", Decision::Deny));
+        assert!(approvals.resolve("a1", Decision::Deny, ResolvedVia::Native));
         let outcome = approvals.wait("a1", rx, Duration::from_secs(5)).await;
-        assert_eq!(outcome, WaitOutcome::Decided(Decision::Deny));
+        assert_eq!(
+            outcome,
+            WaitOutcome::Decided(Decision::Deny, ResolvedVia::Native)
+        );
     }
 
     #[tokio::test]
@@ -428,7 +523,7 @@ mod tests {
 
         // Genuinely gone, not just invisible to `list` — a later resolve for
         // the same id also fails.
-        assert!(!approvals.resolve("a1", Decision::Approve));
+        assert!(!approvals.resolve("a1", Decision::Approve, ResolvedVia::Http));
     }
 
     // ── list never exposes anything beyond PendingApproval's own fields ─
@@ -485,12 +580,12 @@ mod tests {
         let rx2 = approvals.register(second).unwrap();
 
         assert_eq!(approvals.list().len(), 2);
-        assert!(approvals.resolve("a2", Decision::Deny));
+        assert!(approvals.resolve("a2", Decision::Deny, ResolvedVia::Http));
         assert_eq!(approvals.list().len(), 1, "resolving a2 must not touch a1");
-        assert_eq!(rx2.await.unwrap(), Decision::Deny);
+        assert_eq!(rx2.await.unwrap(), (Decision::Deny, ResolvedVia::Http));
 
-        assert!(approvals.resolve("a1", Decision::Approve));
-        assert_eq!(rx1.await.unwrap(), Decision::Approve);
+        assert!(approvals.resolve("a1", Decision::Approve, ResolvedVia::Native));
+        assert_eq!(rx1.await.unwrap(), (Decision::Approve, ResolvedVia::Native));
         assert!(approvals.list().is_empty());
     }
 
@@ -640,8 +735,11 @@ mod tests {
         .expect("spawn_blocking task panicked");
         assert_eq!(listed.len(), 1, "the entry is still pending mid-wait");
 
-        assert!(approvals.resolve("a1", Decision::Approve));
+        assert!(approvals.resolve("a1", Decision::Approve, ResolvedVia::Http));
         let outcome = waiter.await.unwrap();
-        assert_eq!(outcome, WaitOutcome::Decided(Decision::Approve));
+        assert_eq!(
+            outcome,
+            WaitOutcome::Decided(Decision::Approve, ResolvedVia::Http)
+        );
     }
 }

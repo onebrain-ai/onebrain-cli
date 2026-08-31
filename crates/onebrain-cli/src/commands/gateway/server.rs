@@ -48,7 +48,9 @@ use onebrain_core::{
 use onebrain_fs::task::{visit_tasks, TaskHit, TaskScanOptions};
 
 use crate::commands::daemon_client;
-use crate::commands::gateway::approval::{self, Approvals, PendingApproval, WaitOutcome};
+use crate::commands::gateway::approval::{
+    self, Approvals, PendingApproval, ResolvedVia, WaitOutcome,
+};
 use crate::commands::gateway::approval_native;
 use crate::commands::gateway::approval_routes::approval_router;
 use crate::commands::gateway::audit::{AuditEntry, AuditLog, Decision, Outcome};
@@ -61,6 +63,7 @@ use crate::commands::gateway::oauth_routes::{
 use crate::commands::gateway::policy::{
     self, GrantKey, Grants, PolicyMode, PolicyOutcome, RiskClass,
 };
+use crate::commands::gateway::telegram;
 use crate::commands::gateway::GatewayConfig;
 use crate::commands::task_list::{resolve_due_by, resolve_prefixes, TaskCollector};
 
@@ -95,15 +98,65 @@ pub struct GatewayState {
     /// every OTHER caller (`Approvals`'s own methods all take `&self`) keeps
     /// working unchanged through `Deref`.
     pub approvals: Arc<Approvals>,
+    /// The Telegram approval channel (Gateway PR 5, Task 4) — `Some` iff
+    /// [`telegram::is_available`] found `config.telegram` configured (and
+    /// not disabled) at construction time, built exactly once here rather
+    /// than per-call: [`telegram::TelegramChannel`] holds a reusable
+    /// `ureq` agent and its own `sent`-message-id map, both of which need
+    /// to live for the whole process, not one tool call. `await_approval`
+    /// reads this directly off `&Arc<GatewayState>`, firing
+    /// [`telegram::TelegramChannel::fire`]/[`telegram::TelegramChannel::note_outcome`]
+    /// behind an `if let Some(..) = &state.telegram` guard — the same
+    /// unconditional-no-op-when-absent SHAPE `approval_native::is_available()`
+    /// gives the native channel, but resolved differently (Task 4 review,
+    /// F5 — an earlier revision of this doc overclaimed "the exact same
+    /// shape" here, which conflated the two): `approval_native::is_available()`
+    /// is re-evaluated LIVE on every single `await_approval` call (cheap —
+    /// a `$PATH` scan, no I/O), while THIS field is resolved exactly ONCE,
+    /// here, and frozen for the rest of the process's lifetime. That
+    /// difference is deliberate, not an oversight it happens to get away
+    /// with: `telegram` availability depends only on `gateway.yml`'s
+    /// `telegram:` block and [`telegram::DISABLE_TELEGRAM_APPROVAL_ENV`],
+    /// neither of which this running process can observe changing —
+    /// `gateway.yml` is read once at startup, never re-read, and an
+    /// operator's own env is fixed at spawn for a daemon process. Re-
+    /// evaluating on every call would therefore always reproduce the SAME
+    /// answer this field already holds, at the cost of rebuilding a
+    /// `TelegramChannel` (and its `ureq` agent) per call for no
+    /// behavioral difference — so freezing it once is a pure optimization,
+    /// not a narrower guarantee. `None` here (the default, unconfigured
+    /// `gateway.yml`) makes both calls unconditionally no-ops, never a
+    /// special case the caller has to think about.
+    pub telegram: Option<Arc<telegram::TelegramChannel>>,
 }
 
 impl GatewayState {
     pub fn new(config: GatewayConfig, audit: AuditLog) -> Self {
+        let telegram = telegram::is_available(&config.telegram)
+            .then(|| Arc::new(telegram::TelegramChannel::new(&config.telegram)));
+
+        // Gateway PR 5, Task 5 review round 2, I2: F4 (round 1) made an
+        // invalid (group/channel) `chat_id` collapse to the SAME
+        // `telegram: false` a vault with no `telegram:` block at all
+        // reports — trading a silently DEAD channel for a silently
+        // ABSENT one, with no log line either way to tell an operator who
+        // set a `bot_token` (so clearly MEANT to configure this) that
+        // their `chat_id` is the reason it never activated. Deliberately
+        // NOT inside `telegram::is_available` itself: `capabilities`
+        // calls that per request, and this warning belongs at STARTUP,
+        // once, not on every client request.
+        if telegram::chat_id_is_misconfigured(&config.telegram) {
+            tracing::warn!(
+                "telegram.bot_token is set but telegram.chat_id is not a positive private-chat id — Telegram approvals disabled"
+            );
+        }
+
         Self {
             config,
             grants: Grants::new(),
             audit,
             approvals: Arc::new(Approvals::new()),
+            telegram,
         }
     }
 }
@@ -180,9 +233,10 @@ pub struct ApprovalChannels {
     pub http: bool,
     pub telegram: bool,
     /// Human-readable caveats a caller needs to correctly interpret
-    /// `native`/`http`/`telegram` above — e.g. why `telegram` is always
-    /// `false` today. Never a raw host detail (matches every other
-    /// client-facing field in this struct/file).
+    /// `native`/`http`/`telegram` above — e.g. why `native`/`telegram` can
+    /// each be `false` depending on this process's config/platform, unlike
+    /// `http`, which is unconditionally `true`. Never a raw host detail
+    /// (matches every other client-facing field in this struct/file).
     pub note: String,
 }
 
@@ -845,17 +899,30 @@ fn capability_packs(policy: &policy::PolicyConfig) -> Vec<PackInfo> {
 ///   assumes; `capabilities` reporting `true` here is not a claim that a
 ///   human is actively watching, only that the channel exists and is
 ///   reachable.
-/// - `telegram`: not implemented yet — deferred to Gateway PR 5. Always
-///   `false` today; see `note` below and `docs/gateway.md`.
-fn approval_channels() -> ApprovalChannels {
+/// - `telegram`: [`telegram::is_available`] — `true` iff `gateway.yml`
+///   carries a non-empty `telegram.bot_token` and a non-zero
+///   `telegram.chat_id`, AND the channel has not been explicitly disabled
+///   via `ONEBRAIN_GATEWAY_DISABLE_TELEGRAM_APPROVAL`. Like `native` above,
+///   this reports CONFIGURED-ness, not liveness: it never makes a network
+///   call to Telegram. Validating that the token is actually good (a live
+///   `getMe` call) is a setup-time concern for a later Gateway PR 5 task's
+///   pairing wizard — a human is already watching then and can act on a
+///   bad-token error immediately. Re-probing Telegram on every
+///   `capabilities` call would add real latency, and a real failure mode (a
+///   transient Telegram outage), to a field every other channel here
+///   answers from purely local state, so that probe is deliberately NOT
+///   done per call. See [`telegram::is_available`]'s own doc comment for
+///   the identical rationale spelled out at the source.
+fn approval_channels(config: &GatewayConfig) -> ApprovalChannels {
     ApprovalChannels {
         native: approval_native::is_available(),
         http: true,
-        telegram: false,
+        telegram: telegram::is_available(&config.telegram),
         note: "http is always available given the gateway's pairing code (printed once to \
                stdout at `gateway run` startup); native requires macOS with osascript on \
-               PATH and is unavailable when explicitly disabled; telegram is not \
-               implemented yet — planned for Gateway PR 5."
+               PATH and is unavailable when explicitly disabled; telegram reports whether \
+               gateway.yml has bot_token/chat_id configured, not whether Telegram is \
+               currently reachable."
             .to_string(),
     }
 }
@@ -934,6 +1001,9 @@ async fn extract_principal_audited(
                     args_summary: format!("{tool}: (no Principal in request extensions)"),
                 },
                 Decision::Denied,
+                // No approval flow was ever reached here — there is no
+                // channel to name.
+                None,
                 started,
                 Outcome::Error,
             )
@@ -944,16 +1014,26 @@ async fn extract_principal_audited(
 }
 
 /// Runs the policy check ([`policy::decide`]) for one tool call of risk
-/// class `class`. `Ok(Decision::Auto)` or `Ok(Decision::Approved)` means the
-/// call may proceed; `Err` carries BOTH the [`Decision`] to record in the
-/// audit log and the client-facing [`ErrorData`] to return, for the three
-/// ways a call may not proceed:
+/// class `class`. `Ok((Decision::Auto | Decision::Approved, channel))` means
+/// the call may proceed; `Err((Decision, channel, ErrorData))` carries the
+/// [`Decision`] to record in the audit log, the SAME `channel`, and the
+/// client-facing [`ErrorData`] to return, for the three ways a call may not
+/// proceed:
 ///
 /// - `PolicyOutcome::Deny` (policy `deny`, or a scope/pack mismatch) →
 ///   `Decision::Denied`, immediately, no waiting.
 /// - `PolicyOutcome::NeedApproval` → delegates to [`await_approval`], which
 ///   registers a [`PendingApproval`] and blocks on a human decision (or a
 ///   timeout) — see that function's own doc comment for the full flow.
+///
+/// `channel` (`Option<`[`ResolvedVia`]`>`) names WHICH approval channel
+/// answered — `Some` iff a human actually did, `None` otherwise. It
+/// originates in exactly one place: [`WaitOutcome::Decided`]'s second field,
+/// read inside [`await_approval`]'s own match on [`Approvals::wait`]. Every
+/// other arm — `Allow` and `Deny` here, plus `await_approval`'s own
+/// `TimedOut` and registry-full arms — produces `None` directly, because
+/// none of those ever reach a channel to name. This function never
+/// constructs a `Some` itself; it only ever forwards `await_approval`'s.
 ///
 /// Every read-only tool (`capabilities`/`brain_tasks`/`brain_get`/
 /// `brain_search`) is `RiskClass::ReadOnly`, which defaults to
@@ -983,11 +1063,14 @@ async fn policy_gate(
     class: RiskClass,
     vault: Option<&str>,
     args_summary: &str,
-) -> Result<Decision, (Decision, ErrorData)> {
+) -> Result<(Decision, Option<ResolvedVia>), (Decision, Option<ResolvedVia>, ErrorData)> {
     match policy::decide(&state.config.policy, &state.grants, principal, class, vault) {
-        PolicyOutcome::Allow => Ok(Decision::Auto),
+        // Neither `Allow` nor `Deny` ever reaches an approval channel — no
+        // human answered, so there is no channel to record.
+        PolicyOutcome::Allow => Ok((Decision::Auto, None)),
         PolicyOutcome::Deny => Err((
             Decision::Denied,
+            None,
             ErrorData::invalid_request(format!("gateway policy denies this call [{tool}]"), None),
         )),
         PolicyOutcome::NeedApproval => {
@@ -1019,7 +1102,12 @@ async fn policy_gate(
 ///    `spawn_blocking` and returns immediately); a late or absent answer
 ///    from this channel is harmless by construction, since
 ///    [`Approvals::resolve`] is first-response-wins (see that method's own
-///    doc comment).
+///    doc comment). Gateway PR 5, Task 4 adds a second, symmetric fire
+///    right after it: [`telegram::TelegramChannel::fire`] whenever
+///    `state.telegram` is `Some` (built once at startup — see
+///    [`GatewayState`]'s own doc comment) — equally non-blocking, equally
+///    harmless if late or never answered, no `cfg!(test)` guard needed
+///    since no unit-test fixture configures `telegram` unless it means to.
 /// 3. `.await` [`Approvals::wait`] for up to `approval_wait_seconds`. Per
 ///    that method's own doc comment, it never holds the `pending` lock
 ///    across this `.await` — the lock is only taken (inside `register`,
@@ -1049,10 +1137,24 @@ async fn policy_gate(
 ///    channel produced the decision, is the only way both channels reliably
 ///    honor "ask once". A second write to the same `(client, class)` key
 ///    from the HTTP channel (when that IS how it was resolved) is
-///    idempotent — `Grants::record` replaces, never accumulates.
-/// 5. On `Decision::Deny` or a timeout: no grant, no side effect beyond the
-///    audit trail `policy_gate`'s caller records — a denied or timed-out
-///    call never reaches the tool's own logic.
+///    idempotent — `Grants::record` replaces, never accumulates. Gateway PR
+///    5, Task 3: this is also where `Ok`'s `channel` is born — the SAME
+///    `ResolvedVia` [`WaitOutcome::Decided`] carried, reported back to
+///    `policy_gate`'s caller for `record_audit`. Task 4: also where
+///    [`telegram::TelegramChannel::note_outcome`] fires, closing the loop
+///    for Telegram regardless of WHICH channel actually answered — an
+///    approval resolved over `/approvals` or the native dialog still gets
+///    its Telegram message edited so a stale Approve button can't linger.
+/// 5. On `Decision::Deny`: no grant, no side effect beyond the audit trail
+///    `policy_gate`'s caller records — a denied call never reaches the
+///    tool's own logic. Which channel delivered the denial is still
+///    reported (`Err`'s `channel`, the same `ResolvedVia` as step 4's) — a
+///    human answered either way. On a timeout: same "no side effect", but
+///    `channel` is `None` — nothing answered, so there is no channel to
+///    name. Both arms call `note_outcome` too, same as step 4 — a Deny or a
+///    timeout still closes the Telegram message's loop, just with a
+///    different outcome string (see the call sites below for the three
+///    exact strings).
 async fn await_approval(
     state: &Arc<GatewayState>,
     principal: &Principal,
@@ -1060,7 +1162,7 @@ async fn await_approval(
     class: RiskClass,
     vault: Option<&str>,
     args_summary: &str,
-) -> Result<Decision, (Decision, ErrorData)> {
+) -> Result<(Decision, Option<ResolvedVia>), (Decision, Option<ResolvedVia>, ErrorData)> {
     let wait_secs = state.config.policy.approval_wait_seconds;
     let now = now_epoch_secs();
     let pending = PendingApproval {
@@ -1093,6 +1195,8 @@ async fn await_approval(
             );
             return Err((
                 Decision::Denied,
+                // Refused before any channel could ever be reached.
+                None,
                 ErrorData::invalid_request(
                     format!("too many approval requests are already pending [{tool}]"),
                     None,
@@ -1134,12 +1238,33 @@ async fn await_approval(
         approval_native::prompt(&pending, state.approvals.clone());
     }
 
+    // Gateway PR 5, Task 4: the Telegram sibling of the native fire above,
+    // symmetric guard (`Option::is_some`, not `cfg!(test)` — no unit-test
+    // fixture configures `telegram` unless it explicitly means to, and
+    // `TelegramChannel::fire` itself never blocks or panics regardless, so
+    // there is no real-GUI-dialog-style hazard to guard against here).
+    //
+    // Gateway PR 5, Task 5: `ensure_polling` right after `fire` is the nudge
+    // that gives the receive side (the `getUpdates` long-poll thread that
+    // watches for this prompt's button press) its first production caller —
+    // see `TelegramChannel::ensure_polling`'s own doc comment for the full
+    // one-thread-per-process lifecycle. Cheap and idempotent to call on
+    // every `NeedApproval` reaching this point: the first caller (per
+    // process) actually spawns the thread, every later one is a
+    // `compare_exchange` no-op, so there is no cost to calling it
+    // unconditionally alongside `fire` rather than trying to track whether a
+    // poller is already known to be up.
+    if let Some(t) = &state.telegram {
+        t.fire(&pending);
+        t.ensure_polling(state.approvals.clone());
+    }
+
     match state
         .approvals
         .wait(&id, rx, Duration::from_secs(wait_secs))
         .await
     {
-        WaitOutcome::Decided(approval::Decision::Approve) => {
+        WaitOutcome::Decided(approval::Decision::Approve, via) => {
             // "Always ask" never leaves standing consent behind — see this
             // function's doc comment, step 4, and the identical guard in
             // `approval_routes::resolve_approval`.
@@ -1154,22 +1279,44 @@ async fn await_approval(
                     ttl_secs,
                 );
             }
-            Ok(Decision::Approved)
+            // Closes the loop for Telegram regardless of which channel
+            // actually answered — an operator who approved over `/approvals`
+            // or the native dialog still gets the Telegram message edited so
+            // its buttons stop being live (see
+            // `telegram_api::BotApi::edit_message_text`'s own doc comment
+            // for why that requires an explicit empty keyboard).
+            if let Some(t) = &state.telegram {
+                t.note_outcome(&id, &format!("✅ Approved via {}", via.as_str()));
+            }
+            Ok((Decision::Approved, Some(via)))
         }
-        WaitOutcome::Decided(approval::Decision::Deny) => Err((
-            Decision::Denied,
-            ErrorData::invalid_request(
-                format!("this call was denied by the gateway operator [{tool}]"),
+        WaitOutcome::Decided(approval::Decision::Deny, via) => {
+            if let Some(t) = &state.telegram {
+                t.note_outcome(&id, &format!("⛔ Denied via {}", via.as_str()));
+            }
+            Err((
+                Decision::Denied,
+                Some(via),
+                ErrorData::invalid_request(
+                    format!("this call was denied by the gateway operator [{tool}]"),
+                    None,
+                ),
+            ))
+        }
+        WaitOutcome::TimedOut => {
+            if let Some(t) = &state.telegram {
+                t.note_outcome(&id, "⏰ Expired — no one answered in time");
+            }
+            Err((
+                Decision::TimedOut,
+                // Nothing answered, so there is no channel to name.
                 None,
-            ),
-        )),
-        WaitOutcome::TimedOut => Err((
-            Decision::TimedOut,
-            ErrorData::invalid_request(
-                format!("approval request timed out with no response [{tool}]"),
-                None,
-            ),
-        )),
+                ErrorData::invalid_request(
+                    format!("approval request timed out with no response [{tool}]"),
+                    None,
+                ),
+            ))
+        }
     }
 }
 
@@ -1249,6 +1396,14 @@ struct CallMeta {
 /// site instead of this function needing a type parameter just to call
 /// `.is_ok()`.
 ///
+/// `channel` is [`super::approval::ResolvedVia::as_str`]'s output, or
+/// `None` — the caller's own `policy_gate`/`await_approval` match already
+/// knows which case it's in (`Auto`/policy `Deny`/`TimedOut` never reached a
+/// channel; `Approved`/a human `Deny` always did), so this function just
+/// records whatever it's handed rather than re-deriving it (Gateway PR 5,
+/// Task 3 — this hardcoded `channel: None` before every call site named a
+/// channel explicitly).
+///
 /// Off-loads the actual blocking file write to
 /// [`tokio::task::spawn_blocking`] (Task 3 review, binding requirement C —
 /// `AuditLog::append` does synchronous filesystem I/O, and every other
@@ -1272,6 +1427,7 @@ async fn record_audit(
     client_id: &str,
     meta: CallMeta,
     decision: Decision,
+    channel: Option<&'static str>,
     started: Instant,
     outcome: Outcome,
 ) {
@@ -1286,7 +1442,13 @@ async fn record_audit(
         // [`bounded_summary`].
         args_summary: bounded_summary(meta.args_summary),
         decision,
-        channel: None,
+        // `Some` only when a human actually answered through a channel
+        // (`ResolvedVia::as_str`, via `await_approval`'s `WaitOutcome::
+        // Decided` arm) — `None` for `Auto` (no gate reached), a policy
+        // `Deny` (no gate reached either), and `TimedOut` (nothing
+        // answered). Gateway PR 5, Task 3 — every caller below now decides
+        // this explicitly instead of this function hardcoding `None`.
+        channel: channel.map(str::to_string),
         duration_ms,
         outcome,
     };
@@ -1321,7 +1483,7 @@ impl GatewayServer {
         let principal =
             extract_principal_audited(&self.state, "capabilities", started, &parts).await?;
         let args_summary = "capabilities: (no arguments)".to_string();
-        let (decision, result) = match policy_gate(
+        let (decision, channel, result) = match policy_gate(
             &self.state,
             &principal,
             "capabilities",
@@ -1331,7 +1493,7 @@ impl GatewayServer {
         )
         .await
         {
-            Ok(decision) => {
+            Ok((decision, channel)) => {
                 let config = &self.state.config;
                 let out = CapabilitiesOut {
                     gateway_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -1339,11 +1501,11 @@ impl GatewayServer {
                     packs: capability_packs(&config.policy),
                     vaults: config.vaults.keys().cloned().collect(),
                     default_vault: default_vault_display(config),
-                    approval_channels: approval_channels(),
+                    approval_channels: approval_channels(config),
                 };
-                (decision, Ok(Json(out)))
+                (decision, channel, Ok(Json(out)))
             }
-            Err((decision, err)) => (decision, Err(err)),
+            Err((decision, channel, err)) => (decision, channel, Err(err)),
         };
         record_audit(
             &self.state,
@@ -1354,6 +1516,7 @@ impl GatewayServer {
                 args_summary,
             },
             decision,
+            channel.map(ResolvedVia::as_str),
             started,
             if result.is_ok() {
                 Outcome::Ok
@@ -1384,7 +1547,7 @@ impl GatewayServer {
             params.due_by, params.limit, params.vault
         );
 
-        let (decision, result) = match policy_gate(
+        let (decision, channel, result) = match policy_gate(
             &self.state,
             &principal,
             "brain_tasks",
@@ -1394,7 +1557,7 @@ impl GatewayServer {
         )
         .await
         {
-            Ok(decision) => {
+            Ok((decision, channel)) => {
                 let result: Result<Json<BrainTasksOut>, ErrorData> = async {
                     let resolved = resolve_vault_arg(&self.state, params.vault.as_deref())?;
                     let vault_name = resolved.root.name();
@@ -1435,9 +1598,9 @@ impl GatewayServer {
                     }))
                 }
                 .await;
-                (decision, result)
+                (decision, channel, result)
             }
-            Err((decision, err)) => (decision, Err(err)),
+            Err((decision, channel, err)) => (decision, channel, Err(err)),
         };
 
         record_audit(
@@ -1449,6 +1612,7 @@ impl GatewayServer {
                 args_summary,
             },
             decision,
+            channel.map(ResolvedVia::as_str),
             started,
             if result.is_ok() {
                 Outcome::Ok
@@ -1476,7 +1640,7 @@ impl GatewayServer {
         let vault = params.vault.clone();
         let args_summary = format!("get: {} vault={:?}", params.file, params.vault);
 
-        let (decision, result) = match policy_gate(
+        let (decision, channel, result) = match policy_gate(
             &self.state,
             &principal,
             "brain_get",
@@ -1486,7 +1650,7 @@ impl GatewayServer {
         )
         .await
         {
-            Ok(decision) => {
+            Ok((decision, channel)) => {
                 let result: Result<CallToolResult, ErrorData> = async {
                     let resolved = resolve_vault_arg(&self.state, params.vault.as_deref())?;
                     let vault_root = resolved.root.as_path().to_path_buf();
@@ -1523,9 +1687,9 @@ impl GatewayServer {
                         .map_err(|e| ErrorData::invalid_params(format!("reading {rel}: {e}"), None))
                 }
                 .await;
-                (decision, result)
+                (decision, channel, result)
             }
-            Err((decision, err)) => (decision, Err(err)),
+            Err((decision, channel, err)) => (decision, channel, Err(err)),
         };
 
         record_audit(
@@ -1537,6 +1701,7 @@ impl GatewayServer {
                 args_summary,
             },
             decision,
+            channel.map(ResolvedVia::as_str),
             started,
             if result.is_ok() {
                 Outcome::Ok
@@ -1567,7 +1732,7 @@ impl GatewayServer {
             params.query, params.top_k, params.vault
         );
 
-        let (decision, result) = match policy_gate(
+        let (decision, channel, result) = match policy_gate(
             &self.state,
             &principal,
             "brain_search",
@@ -1577,7 +1742,7 @@ impl GatewayServer {
         )
         .await
         {
-            Ok(decision) => {
+            Ok((decision, channel)) => {
                 let result: Result<CallToolResult, ErrorData> = async {
                     let resolved = resolve_vault_arg(&self.state, params.vault.as_deref())?;
                     let vault_path = resolved.root.as_path().to_path_buf();
@@ -1611,9 +1776,9 @@ impl GatewayServer {
                     Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
                 }
                 .await;
-                (decision, result)
+                (decision, channel, result)
             }
-            Err((decision, err)) => (decision, Err(err)),
+            Err((decision, channel, err)) => (decision, channel, Err(err)),
         };
 
         record_audit(
@@ -1625,6 +1790,7 @@ impl GatewayServer {
                 args_summary,
             },
             decision,
+            channel.map(ResolvedVia::as_str),
             started,
             if result.is_ok() {
                 Outcome::Ok
@@ -1661,7 +1827,7 @@ impl GatewayServer {
             params.text.chars().count()
         );
 
-        let (decision, result) = match policy_gate(
+        let (decision, channel, result) = match policy_gate(
             &self.state,
             &principal,
             "brain_capture",
@@ -1671,8 +1837,10 @@ impl GatewayServer {
         )
         .await
         {
-            Ok(decision) => (decision, capture_note(&self.state, &params).await),
-            Err((decision, err)) => (decision, Err(err)),
+            Ok((decision, channel)) => {
+                (decision, channel, capture_note(&self.state, &params).await)
+            }
+            Err((decision, channel, err)) => (decision, channel, Err(err)),
         };
 
         record_audit(
@@ -1684,6 +1852,7 @@ impl GatewayServer {
                 args_summary,
             },
             decision,
+            channel.map(ResolvedVia::as_str),
             started,
             if result.is_ok() {
                 Outcome::Ok
@@ -1968,10 +2137,11 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use http_body_util::BodyExt;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use tower::ServiceExt;
 
     use crate::commands::gateway::auth::AuthStore;
+    use crate::commands::gateway::config::TelegramConfig;
 
     const PROTOCOL: &str = "2026-07-28";
 
@@ -2089,6 +2259,31 @@ mod tests {
         let config = GatewayConfig {
             default_vault: Some(root.to_path_buf()),
             vaults,
+            ..GatewayConfig::default()
+        };
+        let audit = AuditLog::open_at(audit_log_path(root)).unwrap();
+        let state = Arc::new(GatewayState::new(config, audit));
+        let (auth_ctx, token) = test_auth_ctx(root);
+        (dir, build_gateway_router(state, auth_ctx), token)
+    }
+
+    /// Same fixture shape as [`fixture_router`], but with `telegram`
+    /// carrying the given [`TelegramConfig`] instead of the default
+    /// "not configured" one — for tests that need `capabilities` to see a
+    /// configured Telegram channel.
+    fn fixture_router_with_telegram(
+        telegram: TelegramConfig,
+    ) -> (tempfile::TempDir, axum::Router, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("onebrain.yml"), "folders: {}\n").unwrap();
+
+        let mut vaults = BTreeMap::new();
+        vaults.insert("t1".to_string(), root.to_path_buf());
+        let config = GatewayConfig {
+            default_vault: Some(root.to_path_buf()),
+            vaults,
+            telegram,
             ..GatewayConfig::default()
         };
         let audit = AuditLog::open_at(audit_log_path(root)).unwrap();
@@ -2329,9 +2524,12 @@ mod tests {
     }
 
     /// `http` is unconditionally `true` (the `/approvals` surface is always
-    /// mounted by `build_gateway_router` in this build) and `telegram` is
-    /// unconditionally `false` (not implemented yet — Gateway PR 5),
-    /// regardless of policy configuration or platform.
+    /// mounted by `build_gateway_router` in this build); `telegram` is
+    /// `false` here because `fixture_router`'s config carries no
+    /// `telegram:` block, so `telegram::is_available` sees an empty
+    /// `bot_token` and a zero `chat_id` — see
+    /// `capabilities_reports_telegram_true_only_when_configured` below for
+    /// the case where it's configured.
     #[tokio::test]
     async fn capabilities_reports_http_channel_true_and_telegram_false() {
         let (_dir, router, token) = fixture_router();
@@ -2350,8 +2548,50 @@ mod tests {
             channels["note"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("PR 5"),
-            "the note must explain telegram's deferral: {resp}"
+                .contains("telegram"),
+            "the note must mention the telegram channel: {resp}"
+        );
+    }
+
+    /// The Task 2 truthfulness contract for `telegram`, proven end to end
+    /// through the real router (not just `telegram::is_available` directly
+    /// — `telegram.rs`'s own unit tests already cover the pure function):
+    /// a `gateway.yml` carrying both `telegram.bot_token` and
+    /// `telegram.chat_id` makes `capabilities` report `telegram: true`; the
+    /// default config (neither field set) reports `false`. Mirrors
+    /// `capabilities_native_channel_matches_approval_native_is_available`'s
+    /// own "drive the real router" shape.
+    #[tokio::test]
+    async fn capabilities_reports_telegram_true_only_when_configured() {
+        let (_dir, router, token) = fixture_router_with_telegram(TelegramConfig {
+            bot_token: "T".to_string(),
+            chat_id: 5,
+        });
+        let body = call_body(1, "capabilities", serde_json::json!({}));
+        let resp = post(
+            &router,
+            body,
+            &token,
+            &standard_headers("tools/call", Some("capabilities")),
+        )
+        .await;
+        assert_eq!(
+            resp["result"]["structuredContent"]["approval_channels"]["telegram"], true,
+            "{resp}"
+        );
+
+        let (_dir2, router2, token2) = fixture_router();
+        let body2 = call_body(1, "capabilities", serde_json::json!({}));
+        let resp2 = post(
+            &router2,
+            body2,
+            &token2,
+            &standard_headers("tools/call", Some("capabilities")),
+        )
+        .await;
+        assert_eq!(
+            resp2["result"]["structuredContent"]["approval_channels"]["telegram"], false,
+            "{resp2}"
         );
     }
 
@@ -2893,14 +3133,22 @@ mod tests {
     /// is also overridable — a `NeedApproval` test with nothing resolving it
     /// needs a SHORT one (e.g. `0`, an instant timeout), while a `Deny` test
     /// never reaches `await_approval` at all, so the value is irrelevant
-    /// there.
+    /// there. Also writes `hello.md` into the vault root (same content
+    /// `fixture_with_outside_file` uses), so a `brain_get` test can round
+    /// trip a real file through this same read-only-policy fixture rather
+    /// than needing a THIRD near-duplicate fixture just to combine "a
+    /// read-only tool other than `capabilities`" with "a policy override".
+    /// Returns the `Arc<GatewayState>` too (unlike an earlier revision) —
+    /// `state.approvals` is how a `NeedApproval` test resolves out of band,
+    /// the same shape [`fixture_router_with_mutating_policy`] already uses.
     fn fixture_router_with_read_only_policy(
         read_only: policy::PolicyMode,
         approval_wait_seconds: u64,
-    ) -> (tempfile::TempDir, axum::Router, String) {
+    ) -> (tempfile::TempDir, axum::Router, Arc<GatewayState>, String) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::write(root.join("onebrain.yml"), "folders: {}\n").unwrap();
+        std::fs::write(root.join("hello.md"), "hello from inside the vault\n").unwrap();
 
         let mut vaults = BTreeMap::new();
         vaults.insert("t1".to_string(), root.to_path_buf());
@@ -2917,7 +3165,8 @@ mod tests {
         let audit = AuditLog::open_at(audit_log_path(root)).unwrap();
         let state = Arc::new(GatewayState::new(config, audit));
         let (auth_ctx, token) = test_auth_ctx(root);
-        (dir, build_gateway_router(state, auth_ctx), token)
+        let router = build_gateway_router(state.clone(), auth_ctx);
+        (dir, router, state, token)
     }
 
     /// Reads every JSONL line back out of the audit log opened at
@@ -3039,6 +3288,10 @@ mod tests {
         assert_eq!(entries[0]["tool"], "brain_tasks");
         assert_eq!(entries[0]["client_id"], "test-client");
         assert_eq!(entries[0]["decision"], "auto");
+        assert!(
+            entries[0]["channel"].is_null(),
+            "an Auto decision never reached an approval channel: {entries:?}"
+        );
         assert_eq!(entries[0]["outcome"], "ok");
         assert!(
             entries[0]["args_summary"]
@@ -3054,7 +3307,7 @@ mod tests {
     /// audit entry must record `decision: "denied"` / `outcome: "error"`.
     #[tokio::test]
     async fn capabilities_is_denied_when_policy_read_only_is_deny() {
-        let (dir, router, token) =
+        let (dir, router, _state, token) =
             fixture_router_with_read_only_policy(policy::PolicyMode::Deny, 300);
         let body = call_body(1, "capabilities", serde_json::json!({}));
         let resp = post(
@@ -3085,7 +3338,7 @@ mod tests {
     /// and never hang forever regardless.
     #[tokio::test]
     async fn capabilities_times_out_when_policy_needs_approval_and_nothing_answers() {
-        let (dir, router, token) =
+        let (dir, router, _state, token) =
             fixture_router_with_read_only_policy(policy::PolicyMode::AskOnce, 0);
         let body = call_body(1, "capabilities", serde_json::json!({}));
         let resp = post(
@@ -3103,7 +3356,65 @@ mod tests {
         let entries = read_audit_entries(dir.path());
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["decision"], "timedout");
+        assert!(
+            entries[0]["channel"].is_null(),
+            "nothing answered, so there is no channel to record: {entries:?}"
+        );
         assert_eq!(entries[0]["outcome"], "error");
+    }
+
+    /// Task 3 review, F3: every read-only tool reaches `await_approval`
+    /// exactly the same way `capabilities` does above — this fixture's
+    /// `policy.read_only: ask_once` proves it for `brain_get` too, not just
+    /// the one tool the other read-only approval tests happen to use.
+    /// Resolving the pending entry over the (simulated, out-of-band) HTTP
+    /// channel — the same shape `brain_capture`'s own HTTP-approve test uses
+    /// — and asserting `channel: "http"` here is the one test that pins
+    /// `channel.map(ResolvedVia::as_str)` at `brain_get`'s own
+    /// `record_audit` call site: a regression that dropped the channel back
+    /// to `None` for `brain_get` specifically (while leaving `brain_capture`
+    /// correct) would pass every other test in this file and fail only this
+    /// one.
+    #[tokio::test]
+    async fn brain_get_approved_over_http_is_audited_with_the_http_channel() {
+        let (dir, router, state, token) =
+            fixture_router_with_read_only_policy(policy::PolicyMode::AskOnce, 300);
+
+        let call_router = router.clone();
+        let call_token = token.clone();
+        let handle = tokio::spawn(async move {
+            let body = call_body(1, "brain_get", serde_json::json!({"file": "hello.md"}));
+            post(
+                &call_router,
+                body,
+                &call_token,
+                &standard_headers("tools/call", Some("brain_get")),
+            )
+            .await
+        });
+
+        let pending = wait_for_one_pending(&state).await;
+        assert!(state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Approve,
+            approval::ResolvedVia::Http
+        ));
+
+        let resp = handle.await.unwrap();
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no text content: {resp}"));
+        assert!(text.contains("hello from inside the vault"), "{resp}");
+
+        let entries = read_audit_entries(dir.path());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["tool"], "brain_get");
+        assert_eq!(entries[0]["decision"], "approved");
+        assert_eq!(
+            entries[0]["channel"], "http",
+            "brain_get's own record_audit call site must report the channel too: {entries:?}"
+        );
+        assert_eq!(entries[0]["outcome"], "ok");
     }
 
     /// End-to-end proof of the brief's scope-vs-pack requirement: a token
@@ -3229,6 +3540,7 @@ mod tests {
                 args_summary: "capabilities: (no arguments)".to_string(),
             },
             Decision::Auto,
+            None,
             Instant::now(),
             Outcome::Ok,
         )
@@ -4146,9 +4458,11 @@ mod tests {
             !handle.is_finished(),
             "the call must still be blocked, not yet returned"
         );
-        assert!(state
-            .approvals
-            .resolve(&pending.id, approval::Decision::Approve));
+        assert!(state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Approve,
+            approval::ResolvedVia::Http
+        ));
 
         let resp = handle.await.unwrap();
         assert!(resp.get("error").is_none(), "{resp}");
@@ -4170,6 +4484,10 @@ mod tests {
         let entries = read_audit_entries(dir.path());
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["decision"], "approved");
+        assert_eq!(
+            entries[0]["channel"], "http",
+            "the channel that answered this approval must be recorded: {entries:?}"
+        );
         assert_eq!(entries[0]["outcome"], "ok");
     }
 
@@ -4196,9 +4514,11 @@ mod tests {
         });
 
         let pending = wait_for_one_pending(&state).await;
-        assert!(state
-            .approvals
-            .resolve(&pending.id, approval::Decision::Deny));
+        assert!(state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Deny,
+            approval::ResolvedVia::Http
+        ));
 
         let resp = handle.await.unwrap();
         let message = resp["error"]["message"]
@@ -4220,6 +4540,10 @@ mod tests {
         let entries = read_audit_entries(dir.path());
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["decision"], "denied");
+        assert_eq!(
+            entries[0]["channel"], "http",
+            "a human Deny must still be recorded with the channel that answered: {entries:?}"
+        );
         assert_eq!(entries[0]["outcome"], "error");
     }
 
@@ -4252,6 +4576,10 @@ mod tests {
         let entries = read_audit_entries(dir.path());
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["decision"], "timedout");
+        assert!(
+            entries[0]["channel"].is_null(),
+            "nothing answered, so there is no channel to record: {entries:?}"
+        );
         assert_eq!(entries[0]["outcome"], "error");
     }
 
@@ -4280,9 +4608,11 @@ mod tests {
             .await
         });
         let pending = wait_for_one_pending(&state).await;
-        assert!(state
-            .approvals
-            .resolve(&pending.id, approval::Decision::Approve));
+        assert!(state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Approve,
+            approval::ResolvedVia::Http
+        ));
         let resp1 = handle.await.unwrap();
         assert!(resp1.get("error").is_none(), "{resp1}");
 
@@ -4553,9 +4883,11 @@ mod tests {
             Some("t1"),
             "the pending entry must carry the vault the call named"
         );
-        assert!(state
-            .approvals
-            .resolve(&pending.id, approval::Decision::Approve));
+        assert!(state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Approve,
+            approval::ResolvedVia::Http
+        ));
         assert!(handle.await.unwrap().get("error").is_none());
 
         assert!(
@@ -4599,9 +4931,11 @@ mod tests {
             !second.is_finished(),
             "the cross-vault call must be blocked on a fresh approval, not satisfied by t1's grant"
         );
-        assert!(state
-            .approvals
-            .resolve(&pending2.id, approval::Decision::Deny));
+        assert!(state.approvals.resolve(
+            &pending2.id,
+            approval::Decision::Deny,
+            approval::ResolvedVia::Http
+        ));
         let resp2 = second.await.unwrap();
         assert!(resp2["error"]["message"]
             .as_str()
@@ -4648,9 +4982,11 @@ mod tests {
                 .await
             });
             let pending = wait_for_one_pending(&state).await;
-            assert!(state
-                .approvals
-                .resolve(&pending.id, approval::Decision::Approve));
+            assert!(state.approvals.resolve(
+                &pending.id,
+                approval::Decision::Approve,
+                approval::ResolvedVia::Http
+            ));
             let resp = handle.await.unwrap();
             assert!(resp.get("error").is_none(), "{resp}");
 
@@ -4768,5 +5104,539 @@ mod tests {
             reported, registered,
             "capabilities' tool list and the router's registered tools have drifted apart"
         );
+    }
+
+    // ── Gateway PR 5, Task 4: Telegram outcome edits close the loop ──────
+    //
+    // A THIRD copy of the mock-Bot-API-server pattern `telegram_api.rs`
+    // (Task 1) and `telegram.rs` (Task 4) each already carry their own copy
+    // of — see `telegram_api.rs`'s `MockServer` doc comment for the full
+    // rationale (a real bound socket, since `TelegramChannel`'s `BotApi` is
+    // a real blocking `ureq` client that no in-process `axum::Router`
+    // caller, including this file's own `oneshot`-based `post` helper, can
+    // intercept). Named distinctly (`Telegram*`) rather than reusing
+    // `MockServer`/`MockState` — this file already has many other
+    // differently-shaped fixtures, and a bare "Mock" name would be
+    // ambiguous a few thousand lines down from here.
+
+    #[derive(Clone, Default)]
+    struct TelegramMockState {
+        responses: std::sync::Arc<std::sync::Mutex<HashMap<String, serde_json::Value>>>,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    }
+
+    impl TelegramMockState {
+        fn set_response(&self, method: &str, body: serde_json::Value) {
+            self.responses
+                .lock()
+                .unwrap()
+                .insert(method.to_string(), body);
+        }
+
+        fn requests(&self) -> Vec<(String, serde_json::Value)> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    // `axum::Json` fully-qualified throughout this handler — the bare name
+    // `Json` in this module's scope already resolves to `rmcp`'s OWN
+    // wrapper type (`use rmcp::handler::server::wrapper::Json` at this
+    // file's top, pulled in here via `use super::*;`), not `axum::Json`.
+    async fn telegram_mock_handler(
+        axum::extract::Path(params): axum::extract::Path<HashMap<String, String>>,
+        axum::extract::State(state): axum::extract::State<TelegramMockState>,
+        axum::Json(body): axum::Json<serde_json::Value>,
+    ) -> axum::Json<serde_json::Value> {
+        let method = params.get("method").cloned().unwrap_or_default();
+        state.requests.lock().unwrap().push((method.clone(), body));
+        // Gateway PR 5, Task 5: none of THIS file's tests script a
+        // `getUpdates` response — they only care about `sendMessage`/
+        // `editMessageText` — but `await_approval` now calls
+        // `TelegramChannel::ensure_polling` right after `fire` whenever
+        // `state.telegram` is `Some`, which every caller of
+        // `fixture_router_with_mutating_policy_and_telegram` is. Task 5
+        // review, F2 ride-along: this used to sleep 50ms before answering
+        // an unscripted `getUpdates` call specifically to keep that real
+        // background poller's request rate sane (this mock never
+        // implements genuine long-poll pacing on its own). That sleep is
+        // now REDUNDANT: production's own `poll_loop` paces every
+        // successful cycle to `telegram::cycle_floor()` regardless of
+        // how fast the peer answers, so a mock that answers instantly can
+        // no longer turn a live poller into a hot loop — removed rather
+        // than kept "for realism," to avoid two independent knobs claiming
+        // to solve the same problem.
+        let resp = state
+            .responses
+            .lock()
+            .unwrap()
+            .get(&method)
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({ "ok": true, "result": null }));
+        axum::Json(resp)
+    }
+
+    struct TelegramMockServer {
+        base: String,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl TelegramMockServer {
+        fn start(state: TelegramMockState) -> Self {
+            use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let port = std::sync::Arc::new(AtomicU16::new(0));
+            let stop_thread = stop.clone();
+            let port_thread = port.clone();
+            let join = std::thread::spawn(move || {
+                let mock_router = axum::Router::new()
+                    .route(
+                        "/{bot_and_token}/{method}",
+                        axum::routing::post(telegram_mock_handler),
+                    )
+                    .with_state(state);
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    port_thread.store(listener.local_addr().unwrap().port(), Ordering::SeqCst);
+                    let server = axum::serve(listener, mock_router);
+                    let graceful = server.with_graceful_shutdown(async move {
+                        while !stop_thread.load(Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    });
+                    let _ = graceful.await;
+                });
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let bound = loop {
+                let p = port.load(std::sync::atomic::Ordering::SeqCst);
+                if p != 0 {
+                    break p;
+                }
+                assert!(Instant::now() < deadline, "server never bound");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            Self {
+                base: format!("http://127.0.0.1:{bound}"),
+                stop,
+                join: Some(join),
+            }
+        }
+    }
+
+    impl Drop for TelegramMockServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(j) = self.join.take() {
+                let _ = j.join();
+            }
+        }
+    }
+
+    /// Same bounded-poll shape as [`wait_for_one_pending`], needed for the
+    /// same reason: `TelegramChannel::fire`/`note_outcome` hand their real
+    /// work off to `tokio::task::spawn_blocking` and return immediately.
+    async fn wait_for_telegram_requests(
+        state: &TelegramMockState,
+        n: usize,
+    ) -> Vec<(String, serde_json::Value)> {
+        for _ in 0..200 {
+            let requests = state.requests();
+            if requests.len() >= n {
+                return requests;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("fewer than {n} telegram request(s) arrived within the poll window");
+    }
+
+    /// Waits for the FIRST recorded request whose method is `method`,
+    /// regardless of its position among every other request `tg_state` has
+    /// seen. Gateway PR 5, Task 5: once `await_approval` nudges
+    /// `TelegramChannel::ensure_polling` right after `fire`, a live
+    /// Telegram-configured fixture's mock server also receives background
+    /// `getUpdates` traffic interleaved with `sendMessage`/
+    /// `editMessageText` — so a fixed positional index (`requests[1]`) can
+    /// no longer be trusted to mean "the second request KIND this test
+    /// cares about". Bounded the same way every other poll helper in this
+    /// file is.
+    async fn wait_for_telegram_request_method(
+        state: &TelegramMockState,
+        method: &str,
+    ) -> serde_json::Value {
+        // Widened from ~2s (Task 5 review, F2): `TelegramChannel::ensure_polling`'s
+        // `poll_loop` now paces every successful cycle to at least
+        // `telegram::cycle_floor()` (production default 1s; these three
+        // tests dial it down via `telegram::set_cycle_floor_ms_for_test` —
+        // Task 5 review round 2, I3b), so a request that only shows up on
+        // a SECOND poll cycle can still take real time proportional to
+        // whatever floor is active.
+        for _ in 0..2000 {
+            if let Some((_, body)) = state.requests().into_iter().find(|(m, _)| m == method) {
+                return body;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "no {method} telegram request arrived within the poll window: {:?}",
+            state.requests()
+        );
+    }
+
+    /// Waits for the Telegram poller `state.telegram` (if any) started to
+    /// have actually exited (Task 5 review, F7) — the same
+    /// `TelegramChannel::is_polling` flag `telegram.rs`'s own
+    /// `wait_for_polling_false` polls, reached here via a `pub(crate)`
+    /// accessor since `TelegramChannel::polling` itself is private to a
+    /// DIFFERENT module (`server.rs`'s `mod tests` is not a descendant of
+    /// `telegram.rs`'s module tree, so ordinary Rust visibility does not
+    /// already grant access the way it does within `telegram.rs`'s own
+    /// tests). Before this fix, none of the three Telegram outcome tests
+    /// below waited this out at all: their detached poller thread kept
+    /// running for up to ~2s past the test function's own return, with the
+    /// REAL `$HOME` restored (the `test_env` guard drops when the test
+    /// function returns) — harmless only by luck (the mock server is also
+    /// gone by then, so the thread's `getUpdates` calls just fail and
+    /// eventually give up), not by design.
+    ///
+    /// `is_polling() == false` does not ALWAYS mean the thread is
+    /// completely done — see `telegram.rs`'s own `wait_for_polling_false`
+    /// doc comment for the transient-`false`-during-reclaim window (Task 5
+    /// review round 2, M2) and why it's safe to ignore here too: none of
+    /// the three tests below register anything new while this helper is
+    /// polling, so the reclaim path this caveat is about is never reached.
+    async fn wait_for_telegram_poller_to_exit(state: &Arc<GatewayState>) {
+        let Some(channel) = state.telegram.as_ref() else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if !channel.is_polling() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the telegram poller did not exit within the poll window"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Shared setup for the three Telegram outcome-wording tests below:
+    /// mirrors [`fixture_router_with_mutating_policy`]'s shape
+    /// (`policy.mutating: ask_once`, so `brain_capture` reaches
+    /// `await_approval`) plus a `telegram:` block, so `GatewayState::new`
+    /// builds a real `state.telegram`. Callers must start their OWN
+    /// `TelegramMockServer` and set
+    /// `crate::commands::gateway::telegram::TELEGRAM_API_BASE_ENV` at it
+    /// BEFORE calling this — `TelegramChannel::new` resolves the API base
+    /// at construction time, inside this function.
+    ///
+    /// Gateway PR 5, Task 5: `await_approval` now calls
+    /// `TelegramChannel::ensure_polling` right after `fire` whenever
+    /// `state.telegram` is `Some` — which every caller of this fixture's
+    /// `state` is. That poller persists the `getUpdates` offset under
+    /// `$HOME`/`%USERPROFILE%` (`telegram::persist_offset` →
+    /// `crate::home::home_dir`, never `dirs::`), so a real approval flow
+    /// driven through this fixture needs BOTH pointed at a tempdir — or it
+    /// would spawn a background thread touching the developer's or CI
+    /// runner's ACTUAL `~/.onebrain/gateway/telegram-<token_key>.offset`
+    /// (Task 5 review round 2, M6: an earlier revision of this comment
+    /// named the pre-F9, un-keyed filename). This fixture
+    /// deliberately does NOT set that env itself, though: `crate::test_env`'s
+    /// `ENV_LOCK` is a plain, NON-reentrant `std::sync::Mutex`, and every
+    /// caller below already holds it (via their own
+    /// `crate::test_env::set_var(TELEGRAM_API_BASE_ENV, ..)` call, made
+    /// before calling this fixture) — a second, nested
+    /// `crate::test_env::set_vars` call from inside this function, on the
+    /// SAME thread, would try to re-acquire that same lock and deadlock
+    /// immediately (verified the hard way: an earlier revision of this
+    /// fixture did exactly that, and every test using it hung forever).
+    /// Callers must fold `HOME`/`USERPROFILE` into their OWN single
+    /// `crate::test_env::set_vars` call instead, alongside
+    /// `TELEGRAM_API_BASE_ENV` — see the call sites below.
+    ///
+    /// `home` (Task 5 review, ride-along b) is a REQUIRED parameter, not
+    /// merely something the doc comment above asks callers to remember: a
+    /// caller who forgets to redirect `$HOME`/`%USERPROFILE%` before
+    /// calling this fixture would otherwise find out only if a real
+    /// poller happened to touch the filesystem in some observable way —
+    /// this makes the mistake a loud, immediate assertion failure instead.
+    /// This function still doesn't SET the env itself (would deadlock, see
+    /// above) — it VERIFIES the caller already did, using the exact same
+    /// resolution [`crate::home::home_dir`] itself performs, so this check
+    /// can never drift from what the poller would actually resolve.
+    fn fixture_router_with_mutating_policy_and_telegram(
+        approval_wait_seconds: u64,
+        home: &Path,
+    ) -> (tempfile::TempDir, axum::Router, Arc<GatewayState>, String) {
+        assert_eq!(
+            crate::home::home_dir()
+                .expect("HOME/USERPROFILE must already be redirected before calling this fixture")
+                .canonicalize()
+                .expect("the redirected home must exist"),
+            home.canonicalize()
+                .expect("the `home` tempdir passed to this fixture must exist"),
+            "caller must redirect $HOME/%USERPROFILE% to `home` — via ONE combined \
+             `crate::test_env::set_vars` call, alongside TELEGRAM_API_BASE_ENV — before \
+             calling this fixture, or a live poller it can trigger would touch the real home"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("onebrain.yml"), "folders: {}\n").unwrap();
+
+        let mut vaults = BTreeMap::new();
+        vaults.insert("t1".to_string(), root.to_path_buf());
+        let config = GatewayConfig {
+            default_vault: Some(root.to_path_buf()),
+            vaults,
+            policy: policy::PolicyConfig {
+                mutating: policy::PolicyMode::AskOnce,
+                approval_wait_seconds,
+                ..policy::PolicyConfig::default()
+            },
+            telegram: TelegramConfig {
+                bot_token: "T".to_string(),
+                chat_id: 5,
+            },
+            ..GatewayConfig::default()
+        };
+        let audit = AuditLog::open_at(audit_log_path(root)).unwrap();
+        let state = Arc::new(GatewayState::new(config, audit));
+        assert!(
+            state.telegram.is_some(),
+            "precondition: this fixture's config must make telegram available"
+        );
+        let (auth_ctx, token) = test_auth_ctx(root);
+        let router = build_gateway_router(state.clone(), auth_ctx);
+        (dir, router, state, token)
+    }
+
+    /// End-to-end proof that `await_approval`'s `note_outcome` calls are
+    /// unconditional on every `WaitOutcome::Decided` arm — not just the arm
+    /// whose `ResolvedVia` happens to be `Telegram` (which has no caller
+    /// until Task 5's poller exists at all). An approval resolved via the
+    /// (simulated, out-of-band) HTTP channel — `state.approvals.resolve(..,
+    /// ResolvedVia::Http)`, the SAME established pattern
+    /// `brain_get_approved_over_http_is_audited_with_the_http_channel` and
+    /// every other Step-3 approval test in this file already use, not a
+    /// literal `POST /approvals` call (Task 4 review, F7 — an earlier
+    /// revision of this doc overclaimed the latter) — must still edit away
+    /// the Telegram prompt `state.telegram`'s `fire` sent for the SAME
+    /// pending approval, with the wording naming the channel that actually
+    /// answered (`"via http"`), not Telegram itself.
+    #[tokio::test]
+    async fn an_approval_resolved_by_http_still_edits_the_telegram_message() {
+        // Task 5 review round 2, I3b: small test-only floor — see
+        // `telegram::set_cycle_floor_ms_for_test`'s own doc comment.
+        crate::commands::gateway::telegram::set_cycle_floor_ms_for_test(20);
+        let tg_state = TelegramMockState::default();
+        tg_state.set_response(
+            "sendMessage",
+            serde_json::json!({ "ok": true, "result": { "message_id": 99 } }),
+        );
+        let tg_server = TelegramMockServer::start(tg_state.clone());
+        // ONE combined `set_vars` call — see `fixture_router_with_mutating_policy_and_telegram`'s
+        // own doc comment for why a SECOND, nested call (e.g. inside that
+        // fixture) would deadlock on `test_env`'s non-reentrant lock.
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            (
+                crate::commands::gateway::telegram::TELEGRAM_API_BASE_ENV,
+                tg_server.base.as_str().as_ref(),
+            ),
+            ("HOME", home.path().as_os_str()),
+            ("USERPROFILE", home.path().as_os_str()),
+        ]);
+
+        let (_dir, router, state, token) =
+            fixture_router_with_mutating_policy_and_telegram(300, home.path());
+
+        let call_router = router.clone();
+        let call_token = token.clone();
+        let handle = tokio::spawn(async move {
+            let body = call_body(
+                1,
+                "brain_capture",
+                serde_json::json!({"title": "Telegram Loop", "text": "note body"}),
+            );
+            post(
+                &call_router,
+                body,
+                &call_token,
+                &standard_headers("tools/call", Some("brain_capture")),
+            )
+            .await
+        });
+
+        let pending = wait_for_one_pending(&state).await;
+        // Precondition: `fire` must have already sent the prompt before the
+        // approval can be resolved, or there would be nothing to edit.
+        wait_for_telegram_requests(&tg_state, 1).await;
+
+        assert!(state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Approve,
+            approval::ResolvedVia::Http
+        ));
+
+        let resp = handle.await.unwrap();
+        assert!(resp.get("error").is_none(), "{resp}");
+
+        let body = wait_for_telegram_request_method(&tg_state, "editMessageText").await;
+        assert_eq!(body["message_id"], 99, "{body}");
+        assert!(
+            body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("✅ Approved via http"),
+            "the edit must name the channel that actually answered: {body}"
+        );
+
+        // Task 5 review, F7: wait out the real poller `await_approval`'s
+        // Telegram nudge started, rather than leaving its thread running
+        // past this test function's own return.
+        wait_for_telegram_poller_to_exit(&state).await;
+    }
+
+    /// Task 4 review, F4: pins the SECOND of the three exact outcome
+    /// strings `await_approval` passes to `note_outcome` — only the
+    /// `Approve` wording had coverage before this. Same shape as the
+    /// `Approve` test above, resolved `Deny` instead.
+    #[tokio::test]
+    async fn an_approval_denied_over_http_edits_the_telegram_message_with_denied_wording() {
+        // Task 5 review round 2, I3b: small test-only floor — see
+        // `telegram::set_cycle_floor_ms_for_test`'s own doc comment.
+        crate::commands::gateway::telegram::set_cycle_floor_ms_for_test(20);
+        let tg_state = TelegramMockState::default();
+        tg_state.set_response(
+            "sendMessage",
+            serde_json::json!({ "ok": true, "result": { "message_id": 100 } }),
+        );
+        let tg_server = TelegramMockServer::start(tg_state.clone());
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            (
+                crate::commands::gateway::telegram::TELEGRAM_API_BASE_ENV,
+                tg_server.base.as_str().as_ref(),
+            ),
+            ("HOME", home.path().as_os_str()),
+            ("USERPROFILE", home.path().as_os_str()),
+        ]);
+
+        let (_dir, router, state, token) =
+            fixture_router_with_mutating_policy_and_telegram(300, home.path());
+
+        let call_router = router.clone();
+        let call_token = token.clone();
+        let handle = tokio::spawn(async move {
+            let body = call_body(
+                1,
+                "brain_capture",
+                serde_json::json!({"title": "Deny Me Telegram", "text": "note body"}),
+            );
+            post(
+                &call_router,
+                body,
+                &call_token,
+                &standard_headers("tools/call", Some("brain_capture")),
+            )
+            .await
+        });
+
+        let pending = wait_for_one_pending(&state).await;
+        wait_for_telegram_requests(&tg_state, 1).await;
+
+        assert!(state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Deny,
+            approval::ResolvedVia::Http
+        ));
+
+        let resp = handle.await.unwrap();
+        assert!(resp.get("error").is_some(), "{resp}");
+
+        let body = wait_for_telegram_request_method(&tg_state, "editMessageText").await;
+        assert_eq!(body["message_id"], 100, "{body}");
+        assert!(
+            body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("⛔ Denied via http"),
+            "{body}"
+        );
+
+        // Task 5 review, F7: wait out the real poller, same as the
+        // `Approve` test above.
+        wait_for_telegram_poller_to_exit(&state).await;
+    }
+
+    /// Task 4 review, F4: pins the THIRD exact outcome string — the
+    /// timeout wording, reached when nothing answers before
+    /// `approval_wait_seconds` elapses. A short-but-nonzero wait (unlike
+    /// `capabilities_times_out_when_policy_needs_approval_and_nothing_answers`'s
+    /// `0`): this test needs `fire`'s own blocking `sendMessage` call to
+    /// actually land before the timeout fires, or there is nothing for
+    /// `note_outcome` to edit.
+    #[tokio::test]
+    async fn an_approval_that_times_out_edits_the_telegram_message_with_expired_wording() {
+        // Task 5 review round 2, I3b: small test-only floor — see
+        // `telegram::set_cycle_floor_ms_for_test`'s own doc comment.
+        crate::commands::gateway::telegram::set_cycle_floor_ms_for_test(20);
+        let tg_state = TelegramMockState::default();
+        tg_state.set_response(
+            "sendMessage",
+            serde_json::json!({ "ok": true, "result": { "message_id": 101 } }),
+        );
+        let tg_server = TelegramMockServer::start(tg_state.clone());
+        let home = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            (
+                crate::commands::gateway::telegram::TELEGRAM_API_BASE_ENV,
+                tg_server.base.as_str().as_ref(),
+            ),
+            ("HOME", home.path().as_os_str()),
+            ("USERPROFILE", home.path().as_os_str()),
+        ]);
+
+        let (_dir, router, state, token) =
+            fixture_router_with_mutating_policy_and_telegram(1, home.path());
+
+        let body = call_body(
+            1,
+            "brain_capture",
+            serde_json::json!({"title": "Timeout Telegram", "text": "note body"}),
+        );
+        let resp = post(
+            &router,
+            body,
+            &token,
+            &standard_headers("tools/call", Some("brain_capture")),
+        )
+        .await;
+        let message = resp["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a JSON-RPC error: {resp}"));
+        assert!(message.contains("timed out"), "{message}");
+
+        let body = wait_for_telegram_request_method(&tg_state, "editMessageText").await;
+        assert_eq!(body["message_id"], 101, "{body}");
+        assert!(
+            body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("⏰ Expired — no one answered in time"),
+            "{body}"
+        );
+
+        // Task 5 review, F7: wait out the real poller — this test's
+        // `approval_wait_seconds: 1` means it started one too, right after
+        // `fire`, exactly like the other two tests above.
+        wait_for_telegram_poller_to_exit(&state).await;
     }
 }

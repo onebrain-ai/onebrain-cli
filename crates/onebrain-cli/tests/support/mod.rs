@@ -63,12 +63,13 @@ pub fn scratch_cache_root() -> PathBuf {
 // ── Redacted capture tails for panic messages ────────────────────────────
 //
 // The gateway binary integration tests (`gateway_http.rs`,
-// `gateway_oauth_e2e.rs`, `gateway_approval_e2e.rs`) all spawn `onebrain
-// gateway run` with stdout/stderr redirected to files inside a `TempDir`. If
-// the process dies before printing its `gateway listening on …` line, those
-// files are the ONLY record of why — and the `TempDir` holding them is
-// deleted during the panic unwind, so anything not put into the panic
-// message itself is gone by the time a human reads the failure.
+// `gateway_oauth_e2e.rs`, `gateway_approval_e2e.rs`, `gateway_telegram_e2e.rs`)
+// all spawn `onebrain gateway run` with stdout/stderr redirected to files
+// inside a `TempDir`. If the process dies before printing its `gateway
+// listening on …` line, those files are the ONLY record of why — and the
+// `TempDir` holding them is deleted during the panic unwind, so anything
+// not put into the panic message itself is gone by the time a human reads
+// the failure.
 //
 // Two things must therefore both be true of that message:
 //
