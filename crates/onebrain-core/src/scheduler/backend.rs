@@ -13,7 +13,7 @@
 
 use crate::scheduler::context::SchedulerContext;
 use crate::scheduler::error::SchedulerError;
-use crate::scheduler::launchd::plist_path;
+use crate::scheduler::launchd::{is_safe_label, plist_path};
 use crate::scheduler::types::ScheduleEntry;
 use std::path::PathBuf;
 
@@ -247,7 +247,12 @@ mod imp {
             else {
                 continue;
             };
-            if label.is_empty() {
+            // The label is read back out of the RAW filename, but every
+            // label→path mapping sanitizes. A name that is not already
+            // sanitize-stable therefore does not round-trip, and acting on it
+            // would read one artifact's owner and delete another's — see
+            // `launchd::is_safe_label`. We never write such a name.
+            if !is_safe_label(label) {
                 continue;
             }
             out.push(InstalledArtifact {
@@ -416,7 +421,11 @@ mod imp {
             else {
                 continue;
             };
-            if label.is_empty() {
+            // Same round-trip guard as the macOS arm: `unit_base_name` maps a
+            // label through `sanitize_label`, so a unit filename that is not
+            // already sanitize-stable is not one we wrote, and acting on it
+            // would target a DIFFERENT unit pair — see `launchd::is_safe_label`.
+            if !is_safe_label(label) {
                 continue;
             }
             out.push(InstalledArtifact {
@@ -614,7 +623,12 @@ mod imp {
             .into_iter()
             .filter_map(|name| {
                 let label = name.strip_prefix("\\OneBrain\\")?.to_string();
-                if label.is_empty() {
+                // Same round-trip guard as the other two arms: `task_name`
+                // maps a label through `sanitize_label`, so a task name that
+                // is not already sanitize-stable is not one we registered, and
+                // acting on it would target a DIFFERENT task — see
+                // `launchd::is_safe_label`.
+                if !is_safe_label(&label) {
                     return None;
                 }
                 let owner = owner_of(&label, ctx);
@@ -889,8 +903,16 @@ mod tests {
         .unwrap();
         std::fs::write(agents.join("com.example.other.plist"), "not ours").unwrap();
         std::fs::write(agents.join("README.txt"), "ignored").unwrap();
+        // Not sanitize-stable, so not a name any renderer here can produce.
+        // Enumerating it would make `owner_of`/`remove` resolve to
+        // `com.onebrain.daily-x.plist` instead — a different artifact.
+        std::fs::write(agents.join("com.onebrain.daily_x.plist"), "stray").unwrap();
 
         let installed = list_installed(&ctx).unwrap();
+        assert!(
+            !installed.iter().any(|a| a.label == "daily_x"),
+            "a label that does not round-trip through sanitize_label is not ours: {installed:?}"
+        );
         assert_eq!(
             installed,
             vec![
@@ -958,8 +980,16 @@ mod tests {
         .unwrap();
         std::fs::write(dir.join("onebrain-orphan-timer.timer"), "[Timer]\n").unwrap(); // no .service → Unknown
         std::fs::write(dir.join("other-thing.timer"), "[Timer]\n").unwrap();
+        // Not sanitize-stable, so not a name `unit_base_name` can produce.
+        // Enumerating it would make `owner_of`/`remove` resolve to the
+        // `onebrain-daily-x.*` pair instead — different units.
+        std::fs::write(dir.join("onebrain-daily_x.timer"), "[Timer]\n").unwrap();
 
         let installed = list_installed(&ctx).unwrap();
+        assert!(
+            !installed.iter().any(|a| a.label == "daily_x"),
+            "a label that does not round-trip through sanitize_label is not ours: {installed:?}"
+        );
         assert_eq!(
             installed,
             vec![

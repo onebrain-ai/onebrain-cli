@@ -2,9 +2,14 @@
 //! the wired CLI end-to-end (assert_cmd spawns the real binary) against
 //! synthetic vaults built in tempdirs.
 //!
-//! All tests that touch `~/Library/LaunchAgents` set `HOME=<tempdir>` so
-//! the real LaunchAgents directory is untouched. `dirs::home_dir()` reads
-//! `$HOME` on Unix, which is the standard isolation pattern.
+//! All tests that touch `~/Library/LaunchAgents` (or `~/.config/systemd/user`)
+//! set `HOME=<tempdir>` so the real artifact directory is untouched. The
+//! spawned binary resolves its home through the CLI's own `home::home_dir()`
+//! helper, which honours `HOME`/`USERPROFILE` on EVERY platform — unlike
+//! `dirs::home_dir()`, whose Windows arm asks the shell for the real profile
+//! and walks straight past the sandbox (#402). Every spawn also sets
+//! `ONEBRAIN_SCHEDULER_NO_ACTIVATE=1`: `launchctl`/`systemctl` domains are
+//! user-global namespaces that `HOME` does not sandbox at all.
 
 mod support;
 
@@ -1128,11 +1133,11 @@ fn linux_dry_run_prints_both_units() {
 /// proceeding past them.
 ///
 /// This is an INTEGRATION test on purpose. `run_with(dry_run=false)` reaches
-/// `build_scheduler_context` -> `dirs::home_dir()` and writes real plists into
+/// `build_scheduler_context` -> `home::home_dir()` and writes real plists into
 /// the caller's ~/Library/LaunchAgents. There is no injection seam in that
 /// path — `ctx` is built inside `run_with` and `backend::install(entry, &ctx)`
 /// is called inline in the same function. Pinning HOME at the PROCESS level is
-/// the only mechanism that actually redirects `dirs::home_dir()`;
+/// the only mechanism that actually redirects `home::home_dir()`;
 /// `ONEBRAIN_SCHEDULER_NO_ACTIVATE=1` additionally keeps `launchctl` out of it.
 #[cfg(target_os = "macos")]
 #[test]
@@ -1172,8 +1177,14 @@ fn a_bad_entry_still_installs_nothing() {
 }
 
 /// `register-schedule [args]` against `vault` with `home` as `$HOME`, the
-/// activation kill-switch set, and the scratch cache root — the one way every
-/// test in this file may spawn the binary. Returns the assertion for chaining.
+/// activation kill-switch set, and the scratch cache root — the way NEW tests
+/// in this file spawn the binary. (The 40-odd tests above predate it and still
+/// spell the same three env vars out inline; they are equivalent, not
+/// exempt.) Returns the assertion for chaining.
+///
+/// `#[cfg(unix)]` because every caller is: `clippy --all-targets -D warnings`
+/// on Windows would otherwise fail the build on an unused function.
+#[cfg(unix)]
 fn register(vault: &Path, home: &Path, args: &[&str]) -> assert_cmd::assert::Assert {
     let mut argv = vec!["register-schedule"];
     argv.extend_from_slice(args);
@@ -1349,6 +1360,47 @@ fn dry_run_previews_the_prune_without_deleting() {
             "Would remove stale schedule 'digest' (no longer in onebrain.yml)",
         ));
     assert!(digest.exists(), "dry run must not delete");
+}
+
+/// A stray artifact whose filename is not sanitize-stable must not make the
+/// sweep delete a LIVE one (#410 fix round 1).
+///
+/// `list_installed` reads labels back out of raw filenames, but every
+/// label→path mapping sanitizes: `com.onebrain.daily_x.plist` enumerates as
+/// label `daily_x`, which is absent from the config — and both
+/// `owner_of("daily_x")` and `remove("daily_x")` resolve to
+/// `com.onebrain.daily-x.plist`, the live entry. The sweep therefore read one
+/// file's ownership (ours) and deleted a different one. `is_safe_label` skips
+/// such a name outright: we never write one, so it is not ours.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_stray_unsanitized_plist_never_makes_the_sweep_delete_a_live_one() {
+    let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily-x\n");
+    write_skill(v.path(), "daily-x", "name: daily-x\nschedulable: true");
+    let home = tempdir().unwrap();
+    let agents = home.path().join("Library/LaunchAgents");
+
+    register(v.path(), home.path(), &[]).success();
+    let live = agents.join("com.onebrain.daily-x.plist");
+    assert!(live.exists(), "the configured entry must install");
+
+    // Sanitizes to the SAME label as the live entry — the collision the guard
+    // exists for. Content is deliberately garbage: nothing about this file
+    // should ever be read.
+    let stray = agents.join("com.onebrain.daily_x.plist");
+    std::fs::write(&stray, "<!-- not ours: `_` is not sanitize-stable -->").unwrap();
+
+    register(v.path(), home.path(), &[])
+        .success()
+        .stdout(predicate::str::contains("Removed stale").not());
+    assert!(
+        live.exists(),
+        "the live artifact must survive a stray look-alike"
+    );
+    assert!(
+        stray.exists(),
+        "a file this CLI could never have written is not ours to delete"
+    );
 }
 
 /// Linux twin of the #410 repro — the sweep is platform-neutral above the

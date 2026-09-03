@@ -570,7 +570,7 @@ fn render_plugin_update_animated(
 pub(crate) fn render_plugin_update_animated_to<W: std::io::Write>(
     report: &plugin_update::PluginUpdateReport,
     mode: &OutputMode,
-    writer: W,
+    mut writer: W,
     step_delay_override: Option<std::time::Duration>,
 ) -> Result<()> {
     // Animated path: `force_static = false` → the per-step braille spinner
@@ -587,7 +587,20 @@ pub(crate) fn render_plugin_update_animated_to<W: std::io::Write>(
         partial_failure: report.partial_failure.as_deref(),
         daemon_retired: report.daemon_retired,
     };
-    render_plugin_update_inner(writer, &fields, mode, false, step_delay_override)
+    render_plugin_update_inner(&mut writer, &fields, mode, false, step_delay_override)?;
+    // `PluginUpdateFields` carries no warnings, and this path bypasses `emit`
+    // — so before #410's fix round 1 every `report.warnings` entry was
+    // DROPPED on the one surface a human actually sees: a real colour TTY
+    // without `--quiet`. A pruned schedule (`W_SCHEDULE_ORPHAN_REMOVED`)
+    // vanished behind "launchd plists · N refreshed", which is exactly the
+    // silent deletion #352 named; `W_MALFORMED_HOOK_ENTRY` had been invisible
+    // there since it was introduced. Same line format as the static path
+    // (`output::dispatcher::emit`'s text arm), so both surfaces read
+    // identically for every warning code.
+    for w in &report.warnings {
+        writeln!(writer, "⚠️  {}", w.message)?;
+    }
+    Ok(())
 }
 
 /// Plain, borrow-only view of the fields the `plugin update` renderer needs.
@@ -1389,10 +1402,11 @@ mod tests {
 
     #[test]
     fn plugin_update_text_no_schedule_entries_renders_distinct_detail() {
-        // Round-2 review HIGH-1: a vault with zero `schedule:` entries
-        // returns `Ok(0)` from `register_schedule::run_embedded` — a well-formed
-        // no-op. The plist step must render as "no schedule entries" rather
-        // than the misleading "done" the pre-Round-2 bool collapse produced.
+        // Round-2 review HIGH-1: a vault with zero `schedule:` entries makes
+        // `register_schedule::run_embedded` report `written == 0` — a
+        // well-formed no-op. The plist step must render as "no schedule
+        // entries" rather than the misleading "done" the pre-Round-2 bool
+        // collapse produced.
         let report = plugin_update::PluginUpdateReport {
             dry_run: false,
             vault_synced: true,
@@ -1524,6 +1538,49 @@ mod tests {
         assert!(
             out.contains("update complete"),
             "verdict missing after animation:\n{out:?}"
+        );
+    }
+
+    /// #410/#352: the animated path is the surface a human typing `onebrain
+    /// plugin update` in a terminal actually gets, and it used to drop
+    /// `report.warnings` on the floor — so a schedule pruned by the reconcile
+    /// sweep was reported to nobody. Both text surfaces must render every
+    /// warning code identically.
+    #[test]
+    fn plugin_update_animated_renders_report_warnings() {
+        let report = plugin_update::PluginUpdateReport {
+            dry_run: false,
+            vault_synced: true,
+            hooks_rewritten: 1,
+            plists_rewritten: true,
+            plists_count: Some(1),
+            version_before: None,
+            version_after: None,
+            partial_failure: None,
+            warnings: vec![crate::v31::hook_rewriter::RewriteWarning {
+                code: "W_SCHEDULE_ORPHAN_REMOVED".to_string(),
+                message: "removed stale schedule 'digest' (no longer in onebrain.yml)".to_string(),
+            }],
+            daemon_retired: false,
+        };
+        let mut buf = Vec::new();
+        render_plugin_update_animated_to(
+            &report,
+            &text_mode_mono(),
+            &mut buf,
+            Some(std::time::Duration::ZERO),
+        )
+        .unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("removed stale schedule 'digest'"),
+            "the animated path must not swallow report warnings:\n{out}"
+        );
+        // Same glyph + spacing the static path uses, so the two surfaces are
+        // not merely both-present but identical.
+        assert!(
+            out.contains("⚠️  removed stale schedule 'digest'"),
+            "warning line must match the static renderer's format:\n{out:?}"
         );
     }
 

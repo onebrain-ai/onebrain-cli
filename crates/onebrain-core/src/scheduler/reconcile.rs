@@ -31,6 +31,35 @@ pub fn normalize_path(p: &Path) -> PathBuf {
     out
 }
 
+/// Whether two paths name the same vault.
+///
+/// Lexical equality first — cheap, and the ONLY answer available for a path
+/// that no longer exists on disk (an artifact naming a deleted vault must
+/// still classify as foreign, not as ours). Then, only if that fails,
+/// `canonicalize` BOTH sides and compare the resolved results.
+///
+/// The second half is what makes ownership independent of which resolver
+/// spelled the path (#410 fix round 1). `register`'s walk-up resolves the
+/// PHYSICAL cwd — on macOS `/private/var/folders/…` — while `--vault-dir`,
+/// the global `--vault`, `ONEBRAIN_VAULT` and `plugin update --vault` pass
+/// the path as the user typed it (`/var/folders/…`, or a symlink under their
+/// home). Purely lexical comparison classified this vault's own artifacts as
+/// foreign, so they were never pruned and the "missing config → no sweep"
+/// guard could not be tested: the test passed for the wrong reason.
+///
+/// A canonicalize failure on either side is NOT equality — it means we have
+/// no proof, and the caller's rule is that unproven ownership is never
+/// deleted.
+pub fn same_vault(a: &Path, b: &Path) -> bool {
+    if normalize_path(a) == normalize_path(b) {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// The environment variable every renderer writes into its artifact. The CLI
 /// already honours it (`--vault` help: "beats ONEBRAIN_VAULT"), so it is a
 /// real setting for onebrain commands and an inert one for foreign binaries.
@@ -74,21 +103,21 @@ pub struct ReconcilePlan {
 /// install loop overwrote them, and a cross-vault collision on a current
 /// label is the pre-existing global-namespace limitation, not this
 /// function's business. Output is sorted by label so reports are stable.
+///
+/// Vault identity is [`same_vault`], not string or lexical equality — see
+/// its doc comment for why the two spellings of one vault must compare equal.
 pub fn plan_reconcile(
     installed: &[InstalledArtifact],
     current_labels: &[String],
     vault: &Path,
 ) -> ReconcilePlan {
-    let vault = normalize_path(vault);
     let mut plan = ReconcilePlan::default();
     for artifact in installed {
         if current_labels.iter().any(|l| l == &artifact.label) {
             continue;
         }
         match &artifact.owner {
-            Ownership::Vault(p) if normalize_path(p) == vault => {
-                plan.prune.push(artifact.label.clone())
-            }
+            Ownership::Vault(p) if same_vault(p, vault) => plan.prune.push(artifact.label.clone()),
             Ownership::Vault(p) => plan.foreign.push((artifact.label.clone(), p.clone())),
             Ownership::Unknown => plan.unknown.push(artifact.label.clone()),
         }
@@ -387,6 +416,47 @@ mod tests {
     #[test]
     fn normalize_path_plain_absolute_unchanged() {
         assert_eq!(normalize_path(Path::new("/x/y")), PathBuf::from("/x/y"));
+    }
+
+    /// The case lexical comparison gets wrong: one directory reached through
+    /// a symlink and through its real path. `register`'s walk-up hands back
+    /// the physical spelling while `--vault-dir` hands back whatever the user
+    /// typed, so this is the everyday shape, not an exotic one.
+    #[cfg(unix)]
+    #[test]
+    fn same_vault_sees_through_a_symlink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-vault");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.path().join("linked-vault");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_ne!(normalize_path(&real), normalize_path(&link), "the premise");
+        assert!(same_vault(&real, &link));
+        assert!(same_vault(&link, &real), "and symmetrically");
+    }
+
+    #[test]
+    fn same_vault_rejects_two_different_existing_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = tmp.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        assert!(!same_vault(&a, &b));
+    }
+
+    #[test]
+    fn same_vault_falls_back_to_lexical_for_paths_that_do_not_exist() {
+        // An artifact naming a since-deleted vault still has to classify, and
+        // `canonicalize` cannot help — lexical equality is the only evidence.
+        assert!(same_vault(
+            Path::new("/no/such/./v/../v/ob-1"),
+            Path::new("/no/such/v/ob-1")
+        ));
+        assert!(!same_vault(
+            Path::new("/no/such/v/ob-1"),
+            Path::new("/no/such/v/ob-2")
+        ));
     }
 
     fn art(label: &str, owner: Ownership) -> InstalledArtifact {

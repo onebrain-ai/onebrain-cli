@@ -12,6 +12,15 @@
 //! When none of the above branches fire we walk the `schedule:` list,
 //! validate each entry, build a [`SchedulerContext`] from the current process
 //! environment, run collision detection, then write (or `--dry-run` print).
+//!
+//! A registration pass finishes by RECONCILING the OS scheduler against the
+//! config ([`sweep_orphans`], #410/#352): an installed artifact this vault
+//! provably installed and that no longer has an entry is removed, and
+//! anything else that is not in the config — another vault's, or of unknown
+//! origin — is reported and left alone. Ownership is read from the artifact
+//! itself, never inferred from "not in onebrain.yml", and no removal is ever
+//! silent (the embedded caller gets the labels back through
+//! [`EmbeddedOutcome`]).
 
 use anyhow::{anyhow, Context, Result};
 use onebrain_core::scheduler::backend;
@@ -30,10 +39,17 @@ use std::path::{Path, PathBuf};
 /// was owned by this vault and no longer in the config (#410). Returned
 /// rather than printed so the caller can render it inside its own frame —
 /// a removal that happens silently is the bug #352 named.
+///
+/// `warnings` carries the reconcile step's best-effort failures (a scan that
+/// would not run, an artifact that would not delete) for the same reason:
+/// the embedded path suppresses every `eprintln!`, so without this channel a
+/// job that keeps firing after its entry was deleted would be reported
+/// nowhere at all.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EmbeddedOutcome {
     pub written: usize,
     pub pruned: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 /// Entry point dispatched from `main.rs`. Returns the standard `anyhow`
@@ -68,9 +84,9 @@ pub fn run(
 /// Returns `written == 0` when `onebrain.yml` has no `schedule:` entries (a
 /// well-formed no-op, NOT an error), and `written == entries.len()` on a
 /// successful registration pass. `pruned` carries every artifact the
-/// reconcile sweep removed (#410) so the caller can surface it — this path
-/// is quiet, and a silent deletion is the bug #352 named. Errors bubble up
-/// via `?` as usual.
+/// reconcile sweep removed (#410) and `warnings` every failure it could only
+/// report, so the caller can surface both — this path is quiet, and a silent
+/// deletion is the bug #352 named. Errors bubble up via `?` as usual.
 pub fn run_embedded(
     vault: Option<PathBuf>,
     dry_run: bool,
@@ -135,9 +151,33 @@ fn run_with(
         if !quiet {
             println!("No schedule entries in onebrain.yml. Nothing to register.");
         }
-        let ctx = build_scheduler_context(&vault)?;
-        let pruned = sweep_orphans(&ctx, &[], dry_run, quiet);
-        return Ok(EmbeddedOutcome { written: 0, pruned });
+        // A context we cannot build is a scan we cannot perform, not a reason
+        // to fail: before the sweep existed this arm returned without touching
+        // the environment at all, so `?` here would turn a well-formed no-op
+        // into a hard error on a machine with no resolvable home. Report it
+        // exactly as a failed scan is reported and leave every artifact alone.
+        return Ok(match build_scheduler_context(&vault) {
+            Ok(ctx) => {
+                let sweep = sweep_orphans(&ctx, &[], dry_run, quiet);
+                EmbeddedOutcome {
+                    written: 0,
+                    pruned: sweep.pruned,
+                    warnings: sweep.warnings,
+                }
+            }
+            Err(e) => {
+                let message =
+                    format!("Could not scan installed schedules — {e}; orphans left in place");
+                if !quiet {
+                    eprintln!("\u{26a0} {message}");
+                }
+                EmbeddedOutcome {
+                    written: 0,
+                    pruned: Vec::new(),
+                    warnings: vec![message],
+                }
+            }
+        });
     }
 
     // Pass 1 — structural + field-format validation. We do NOT mutate input
@@ -250,10 +290,11 @@ fn run_with(
     }
 
     // #410: reconcile the OS scheduler against the config. Runs on every
-    // non-dry-run register — plain, --refresh, and embedded — because the
-    // guard is OWNERSHIP, not a flag. After the loop, so a failed install
-    // still leaves "nothing changed" rather than "schedule lost".
-    let pruned = sweep_orphans(&ctx, &current_labels, dry_run, quiet);
+    // register — plain, --refresh, embedded, and --dry-run (which previews
+    // the removals instead of performing them) — because the guard is
+    // OWNERSHIP, not a flag. After the loop, so a failed install still leaves
+    // "nothing changed" rather than "schedule lost".
+    let sweep = sweep_orphans(&ctx, &current_labels, dry_run, quiet);
 
     if !quiet {
         // No "Use launchctl to load" epilogue: install() now boots the job
@@ -266,7 +307,8 @@ fn run_with(
     }
     Ok(EmbeddedOutcome {
         written: entries.len(),
-        pruned,
+        pruned: sweep.pruned,
+        warnings: sweep.warnings,
     })
 }
 
@@ -505,9 +547,9 @@ pub(crate) fn build_scheduler_context(vault: &Path) -> Result<SchedulerContext> 
         .unwrap_or_else(|| "onebrain".to_string());
     let homedir = crate::home::home_dir()?;
     // #410: this path is written into every artifact as the ownership
-    // marker (and already into `--vault` argv), so it must be absolute and
-    // lexically normalized — a relative `--vault` was unusable at fire time
-    // anyway (launchd runs jobs with cwd=/).
+    // marker (and already into `--vault` argv), so it must be absolute — a
+    // relative `--vault` was unusable at fire time anyway (launchd runs jobs
+    // with cwd=/).
     let vault_abs = if vault.is_absolute() {
         vault.to_path_buf()
     } else {
@@ -515,6 +557,20 @@ pub(crate) fn build_scheduler_context(vault: &Path) -> Result<SchedulerContext> 
             .context("read current directory")?
             .join(vault)
     };
+    // …and CANONICAL, not merely lexically normalized (#410 fix round 1).
+    // The same vault arrives here spelled two different ways depending on who
+    // resolved it: `register`'s walk-up reports the physical cwd
+    // (`/private/var/…` on macOS) while `--vault-dir`, the global `--vault`,
+    // `ONEBRAIN_VAULT` and `plugin update --vault` pass the path as typed
+    // (`/var/…`, or a symlink under the user's home). Writing the unresolved
+    // spelling made this vault's own artifacts read as another vault's, so
+    // they were never pruned. `same_vault` still resolves a mismatch when
+    // comparing, but pinning the marker here keeps artifacts written by
+    // different entry points byte-identical. Falls back to the lexical form
+    // when the path does not exist yet — `canonicalize` needs it on disk.
+    let vault_path = std::fs::canonicalize(&vault_abs)
+        .map(|p| normalize_path(&p))
+        .unwrap_or_else(|_| normalize_path(&vault_abs));
     // #315: job logs are machine-local operational output, not vault content.
     // On a synced vault (iCloud) the old in-vault files eventually became
     // unopenable-for-append, and launchd opens the log paths BEFORE exec — so
@@ -522,7 +578,7 @@ pub(crate) fn build_scheduler_context(vault: &Path) -> Result<SchedulerContext> 
     let log_base_path =
         onebrain_core::scheduler::default_log_dir(&homedir, &|k| std::env::var(k).ok());
     Ok(SchedulerContext {
-        vault_path: normalize_path(&vault_abs),
+        vault_path,
         skill_cli_path,
         log_base_path,
         homedir,
@@ -744,34 +800,47 @@ fn cleanup_stale_labels(
     }
 }
 
+/// What one reconcile sweep did. `pruned` is every label actually removed;
+/// `warnings` is every best-effort failure it could only report, carried out
+/// rather than printed because the embedded (`plugin update`) caller
+/// suppresses this function's own output entirely — see [`EmbeddedOutcome`].
+/// The messages are the same text the non-quiet path prints, minus the glyph.
+#[derive(Debug, Default)]
+struct SweepOutcome {
+    pruned: Vec<String>,
+    warnings: Vec<String>,
+}
+
 /// Remove every installed artifact that this vault owns and that has no
 /// entry in the config; report — and keep — everything else that is not in
-/// the config (#410). Returns the labels actually removed.
+/// the config (#410).
 ///
 /// The decision is `plan_reconcile`'s; this function only executes it and
 /// talks. Best-effort throughout: a scan or removal failure is reported and
 /// never fails registration (the entries were installed successfully by the
 /// time this runs). In `quiet` mode the informational lines are suppressed
-/// but the returned list is how the embedded caller still shows removals.
+/// but the returned [`SweepOutcome`] is how the embedded caller still shows
+/// removals and failures.
 fn sweep_orphans(
     ctx: &SchedulerContext,
     current_labels: &[String],
     dry_run: bool,
     quiet: bool,
-) -> Vec<String> {
+) -> SweepOutcome {
+    let mut out = SweepOutcome::default();
     let installed = match backend::list_installed(ctx) {
         Ok(v) => v,
         Err(e) => {
+            let message =
+                format!("Could not scan installed schedules — {e}; orphans left in place");
             if !quiet {
-                eprintln!(
-                    "\u{26a0} Could not scan installed schedules — {e}; orphans left in place"
-                );
+                eprintln!("\u{26a0} {message}");
             }
-            return Vec::new();
+            out.warnings.push(message);
+            return out;
         }
     };
     let plan = plan_reconcile(&installed, current_labels, &ctx.vault_path);
-    let mut pruned = Vec::new();
     for label in &plan.prune {
         if dry_run {
             if !quiet {
@@ -786,15 +855,20 @@ fn sweep_orphans(
                         "\u{2713} Removed stale schedule '{label}' (no longer in onebrain.yml)"
                     );
                 }
-                pruned.push(label.clone());
+                out.pruned.push(label.clone());
             }
+            // The artifact vanished between the scan and the removal (another
+            // register, or the user deleting it by hand). The end state is the
+            // one we wanted and WE did not remove anything — nothing to report.
             Ok(false) => {}
             Err(e) => {
+                let message = format!(
+                    "Could not remove stale schedule '{label}' — {e}; it may keep firing until removed manually"
+                );
                 if !quiet {
-                    eprintln!(
-                        "\u{26a0} Could not remove stale schedule '{label}' — {e}; it may keep firing until removed manually"
-                    );
+                    eprintln!("\u{26a0} {message}");
                 }
+                out.warnings.push(message);
             }
         }
     }
@@ -811,7 +885,7 @@ fn sweep_orphans(
             );
         }
     }
-    pruned
+    out
 }
 
 fn remove_all(vault: &Path) -> Result<()> {
@@ -1111,6 +1185,27 @@ mod tests {
     /// config-loading path the real commands do.
     fn write_config(dir: &std::path::Path, yaml: &str) {
         std::fs::write(dir.join("onebrain.yml"), yaml).unwrap();
+    }
+
+    /// Point home resolution at `home` and disable OS-scheduler activation for
+    /// the guard's lifetime.
+    ///
+    /// MANDATORY for every unit test that reaches `build_scheduler_context`.
+    /// That function resolves the home through `crate::home::home_dir()`, so
+    /// without the override the test's `SchedulerContext` names the
+    /// DEVELOPER'S REAL `~/Library/LaunchAgents` (or `~/.config/systemd/user`)
+    /// — and since v3.4.26 a registration pass ends by reconciling that
+    /// directory against the config. The tempdir vault owns nothing there, so
+    /// ownership alone kept the real jobs safe; this guard means the sweep
+    /// never looks at them in the first place, and `NO_ACTIVATE` additionally
+    /// keeps `launchctl`/`systemctl` — process-global namespaces `HOME` does
+    /// not sandbox — out of the unit suite entirely.
+    fn sandboxed_home(home: &std::path::Path) -> crate::test_env::EnvVarGuard {
+        crate::test_env::set_vars(&[
+            ("HOME", home.as_os_str()),
+            ("USERPROFILE", home.as_os_str()),
+            ("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1".as_ref()),
+        ])
     }
 
     #[test]
@@ -1831,38 +1926,50 @@ mod tests {
     // ── run_embedded: quiet-mode branches ─────────────────────────────────────
 
     #[test]
-    fn run_embedded_empty_schedule_returns_zero() {
+    fn run_embedded_empty_schedule_writes_nothing_and_prunes_nothing() {
         // `run_embedded` hardcodes quiet=true internally, so the empty-schedule
         // `if !quiet { println!(...) }` TRUE arm is unreachable here (it's only
         // covered via `run()`, which passes quiet=false). This exercises the
-        // false arm: the println is skipped and Ok(0) is still returned.
+        // false arm: the println is skipped and `written == 0` is still
+        // reported.
         let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = sandboxed_home(home.path());
         std::fs::write(dir.path().join("onebrain.yml"), "# no schedule entries\n").unwrap();
         let outcome = run_embedded(Some(dir.path().to_path_buf()), false, false).unwrap();
-        assert_eq!(outcome.written, 0, "empty schedule → Ok(0) in quiet mode");
+        assert_eq!(outcome.written, 0, "empty schedule → nothing written");
         assert!(
             outcome.pruned.is_empty(),
-            "a tempdir vault owns no artifact on this machine"
+            "a tempdir vault owns no artifact under a tempdir home"
         );
     }
 
     #[test]
-    fn run_embedded_refresh_quiet_no_entries_returns_zero() {
+    fn run_embedded_refresh_quiet_no_entries_writes_nothing() {
         // Exercises the `if refresh && !quiet { println!(...) }` false branch:
-        // refresh=true but quiet=true suppresses the message; still Ok(0).
+        // refresh=true but quiet=true suppresses the message; still nothing
+        // written.
         let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = sandboxed_home(home.path());
         std::fs::write(dir.path().join("onebrain.yml"), "# no schedule\n").unwrap();
         let outcome = run_embedded(Some(dir.path().to_path_buf()), false, true).unwrap();
-        assert_eq!(outcome.written, 0, "refresh + quiet + no entries → Ok(0)");
+        assert_eq!(
+            outcome.written, 0,
+            "refresh + quiet + no entries → nothing written"
+        );
     }
 
     // Unix-only: uses /bin/sh which doesn't exist on Windows.
     #[cfg(unix)]
     #[test]
-    fn run_embedded_dry_run_quiet_returns_entry_count() {
+    fn run_embedded_dry_run_quiet_reports_the_entry_count_as_written() {
         // Exercises `dry_run=true, quiet=true`: the inner `if !quiet { println!... }`
-        // is skipped, `continue` fires, no plist is written, Ok(N) is returned.
+        // is skipped, `continue` fires, no plist is written, and `written`
+        // still carries the entry count.
         let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = sandboxed_home(home.path());
         std::fs::write(
             dir.path().join("onebrain.yml"),
             "schedule:\n- cron: \"0 9 * * *\"\n  command: /bin/sh\n",
@@ -1875,6 +1982,80 @@ mod tests {
         );
     }
 
+    /// The "a deletion is never silent" contract (#410/#352) at the embedded
+    /// seam: `run_embedded` prints nothing, so the ONLY way a pruned artifact
+    /// reaches the user is the returned `pruned` list. Register one entry,
+    /// delete it from the config, register again — and the label must come
+    /// back out with the artifact actually gone.
+    #[cfg(unix)]
+    #[test]
+    fn run_embedded_returns_the_pruned_labels() {
+        let vault = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = sandboxed_home(home.path());
+        write_skill_file(vault.path(), "daily", "schedulable: true");
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "schedule:\n- cron: \"0 9 * * *\"\n  skill: /daily\n",
+        )
+        .unwrap();
+
+        let first = run_embedded(Some(vault.path().to_path_buf()), false, false).unwrap();
+        assert_eq!(first.written, 1, "the entry must install");
+        assert!(first.pruned.is_empty(), "nothing to prune on a first run");
+
+        std::fs::write(vault.path().join("onebrain.yml"), "# empty\n").unwrap();
+        let second = run_embedded(Some(vault.path().to_path_buf()), false, false).unwrap();
+        assert_eq!(second.written, 0);
+        assert_eq!(
+            second.pruned,
+            vec!["daily".to_string()],
+            "the removal must be reported back — this path prints nothing"
+        );
+        assert!(second.warnings.is_empty(), "{:?}", second.warnings);
+
+        let ctx = build_scheduler_context(vault.path()).unwrap();
+        assert!(
+            backend::list_installed(&ctx).unwrap().is_empty(),
+            "the artifact must actually be gone, not merely reported"
+        );
+    }
+
+    /// `sweep_orphans`' scan-failure arm: an artifact directory that cannot be
+    /// enumerated must leave every orphan in place, report why, and never
+    /// panic — registration already succeeded by the time this runs.
+    ///
+    /// A FILE where the home directory should be makes `read_dir` fail with
+    /// ENOTDIR on both Unix backends: not `NotFound` (which is a legitimate
+    /// empty list), so it reaches the `Err` arm.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_orphans_reports_a_scan_failure_and_prunes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = sandboxed_home(tmp.path());
+        let not_a_home = tmp.path().join("home-that-is-a-file");
+        std::fs::write(&not_a_home, "not a directory").unwrap();
+        let ctx = SchedulerContext {
+            vault_path: tmp.path().join("vault"),
+            skill_cli_path: "/usr/local/bin/onebrain".to_string(),
+            log_base_path: tmp.path().join("logs"),
+            homedir: not_a_home,
+            uid: current_uid(),
+        };
+
+        let sweep = sweep_orphans(&ctx, &[], false, false);
+        assert!(
+            sweep.pruned.is_empty(),
+            "a scan we could not perform proves nothing about ownership"
+        );
+        assert_eq!(sweep.warnings.len(), 1, "{:?}", sweep.warnings);
+        assert!(
+            sweep.warnings[0].contains("Could not scan installed schedules"),
+            "{}",
+            sweep.warnings[0]
+        );
+    }
+
     // ── print_status: command-mode and skill-with-args paths ──────────────────
 
     #[test]
@@ -1882,6 +2063,8 @@ mod tests {
         // Exercises the `is_command_mode(entry)` arm in print_status, including
         // the non-empty argv branch: `Some(Args::List(v))` → `format!(" {}", ...)`.
         let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = sandboxed_home(home.path());
         std::fs::write(
             dir.path().join("onebrain.yml"),
             "schedule:\n- cron: \"0 9 * * *\"\n  command: /bin/backup\n  args:\n    - --verbose\n",
@@ -1907,6 +2090,8 @@ mod tests {
         // Exercises the `Some(Args::Map(m)) if !m.is_empty()` arm in print_status's
         // skill branch, building the `" (key=val)"` arg-str.
         let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = sandboxed_home(home.path());
         std::fs::write(
             dir.path().join("onebrain.yml"),
             "schedule:\n- cron: \"0 9 * * *\"\n  skill: /distill\n  args:\n    topic: weekly\n",
@@ -1932,6 +2117,8 @@ mod tests {
         // Far-future date avoids any time-sensitivity; `_ => String::new()` skill
         // arm is hit since no args are set.
         let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let _env = sandboxed_home(home.path());
         std::fs::write(
             dir.path().join("onebrain.yml"),
             "schedule:\n- at: \"2099-01-01 09:00\"\n  skill: /daily\n",
@@ -1964,6 +2151,11 @@ mod tests {
         // only true of a world where nothing was registered.
         let dir = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
+        // The context is injected, so home resolution is not in play — but
+        // `backend::remove` still reaches `launchctl`/`systemctl`, which
+        // `HOME` does not sandbox. The guard's `NO_ACTIVATE` leg is what keeps
+        // this test off the developer's real scheduler domain.
+        let _env = sandboxed_home(home.path());
         let config: ScheduleConfig = serde_yaml::from_str(
             "schedule:\n- cron: \"0 9 * * *\"\n  skill: /unit-remove-noop-probe\n",
         )
@@ -2221,24 +2413,30 @@ mod tests {
     }
 
     /// #410: the marker written into every artifact is `ctx.vault_path`, so
-    /// it must be absolute and normalized — a relative `--vault .` used to
+    /// it must be absolute and canonical — a relative `--vault .` used to
     /// land verbatim in `--vault` argv too, which launchd (cwd=/) could never
-    /// resolve at fire time.
+    /// resolve at fire time, and an unresolved spelling made this vault's own
+    /// artifacts read as another vault's (fix round 1).
     #[test]
     fn build_scheduler_context_absolutizes_and_normalizes_the_vault_path() {
         let d = tempfile::tempdir().unwrap();
-        let _env = crate::test_env::set_vars(&[
-            ("HOME", d.path().as_os_str()),
-            ("USERPROFILE", d.path().as_os_str()),
-        ]);
+        let _env = sandboxed_home(d.path());
         let cwd = std::env::current_dir().unwrap();
         let ctx = build_scheduler_context(Path::new("./sub/../.")).unwrap();
+        // The canonical spelling of the cwd — which `current_dir()` already
+        // returns on the Unix hosts, so this is an identity there and a real
+        // resolution wherever it is not.
         assert_eq!(
             ctx.vault_path,
-            onebrain_core::scheduler::normalize_path(&cwd)
+            onebrain_core::scheduler::normalize_path(&cwd.canonicalize().unwrap())
         );
         assert!(ctx.vault_path.is_absolute());
         // #402: the scheduler site honours the env override on every platform.
+        // NOTE: on Unix this can only ever hold — `dirs::home_dir()` already
+        // reads `$HOME` there. Windows is the platform it can FAIL on, where
+        // `dirs` calls `SHGetKnownFolderPath` and ignores `%USERPROFILE%`
+        // entirely; keeping the assertion here is what pins `home::home_dir()`
+        // being used at this call site.
         assert_eq!(
             ctx.homedir.canonicalize().unwrap(),
             d.path().canonicalize().unwrap()

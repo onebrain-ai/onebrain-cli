@@ -163,18 +163,7 @@ pub fn run(
                 // instead of a misleading "done".
                 report.plists_rewritten = outcome.written > 0;
                 report.plists_count = Some(outcome.written as u32);
-                // #410/#352: an artifact removed by the reconcile sweep is
-                // surfaced through the report's warning channel — this path
-                // is quiet by design, and a silent deletion is the bug #352
-                // named.
-                for label in outcome.pruned {
-                    report.warnings.push(super::hook_rewriter::RewriteWarning {
-                        code: "W_SCHEDULE_ORPHAN_REMOVED".to_string(),
-                        message: format!(
-                            "removed stale schedule '{label}' (no longer in onebrain.yml)"
-                        ),
-                    });
-                }
+                report.warnings.extend(schedule_outcome_warnings(&outcome));
             }
             Err(e) => {
                 // A platform with no scheduler backend is a SKIP, not a
@@ -233,6 +222,36 @@ pub fn run(
     }
 
     Ok(report)
+}
+
+/// Map an embedded registration's reconcile results onto the report's warning
+/// channel (#410/#352).
+///
+/// The embedded `schedule register` runs with `quiet = true`, so it prints
+/// nothing of its own: without this the artifacts the sweep DELETED, and the
+/// ones it failed to delete (which keep firing), would reach the user
+/// nowhere at all. A silent deletion is the bug #352 named.
+///
+/// Split out as a plain function so the mapping can be unit-tested without
+/// spawning a registration — the seam this test needs is the mapping, not the
+/// scheduler.
+fn schedule_outcome_warnings(
+    outcome: &crate::commands::register_schedule::EmbeddedOutcome,
+) -> Vec<RewriteWarning> {
+    let mut out = Vec::new();
+    for label in &outcome.pruned {
+        out.push(RewriteWarning {
+            code: "W_SCHEDULE_ORPHAN_REMOVED".to_string(),
+            message: format!("removed stale schedule '{label}' (no longer in onebrain.yml)"),
+        });
+    }
+    for message in &outcome.warnings {
+        out.push(RewriteWarning {
+            code: "W_SCHEDULE_SWEEP_FAILED".to_string(),
+            message: message.clone(),
+        });
+    }
+    out
 }
 
 fn append_partial_failure(report: &mut PluginUpdateReport, failure: String) {
@@ -311,6 +330,48 @@ mod tests {
         assert!(r.vault_synced);
         assert!(!r.plists_rewritten);
         assert!(r.partial_failure.as_deref().unwrap().contains("launchctl"));
+    }
+
+    /// #410/#352, the "a deletion is never silent" contract at this seam: the
+    /// embedded registration prints nothing, so every pruned label and every
+    /// best-effort sweep failure MUST become a report warning — the only
+    /// channel the framed `plugin update` report has for them.
+    #[test]
+    fn schedule_outcome_warnings_surface_prunes_and_sweep_failures() {
+        let outcome = crate::commands::register_schedule::EmbeddedOutcome {
+            written: 1,
+            pruned: vec!["digest".to_string()],
+            warnings: vec![
+                "Could not remove stale schedule 'weekly' — boom; it may keep firing until \
+                 removed manually"
+                    .to_string(),
+            ],
+        };
+        let warnings = schedule_outcome_warnings(&outcome);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert_eq!(warnings[0].code, "W_SCHEDULE_ORPHAN_REMOVED");
+        assert!(
+            warnings[0].message.contains("digest"),
+            "the removal must name the label: {}",
+            warnings[0].message
+        );
+        assert_eq!(warnings[1].code, "W_SCHEDULE_SWEEP_FAILED");
+        assert!(
+            warnings[1].message.contains("may keep firing"),
+            "a failed removal must say what it means: {}",
+            warnings[1].message
+        );
+    }
+
+    /// The common case: nothing pruned, nothing failed → no warnings, so an
+    /// ordinary `plugin update` gains no noise.
+    #[test]
+    fn schedule_outcome_warnings_are_empty_for_a_clean_run() {
+        let outcome = crate::commands::register_schedule::EmbeddedOutcome {
+            written: 2,
+            ..Default::default()
+        };
+        assert!(schedule_outcome_warnings(&outcome).is_empty());
     }
 
     #[test]

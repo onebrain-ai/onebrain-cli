@@ -55,10 +55,14 @@ pub use cron_parse::{
 };
 pub use entry::{is_command_mode, is_one_shot, is_skill_mode, validate_entry};
 pub use error::SchedulerError;
-pub use launchd::{generate_plist, label_for_entry, legacy_truncated_label, plist_path};
+pub use launchd::{
+    generate_plist, is_safe_label, label_for_entry, legacy_truncated_label, plist_path,
+};
 pub use log_dir::{default_log_dir, is_in_vault};
 pub use log_paths::scheduler_log_path;
-pub use reconcile::{normalize_path, plan_reconcile, InstalledArtifact, Ownership, ReconcilePlan};
+pub use reconcile::{
+    normalize_path, plan_reconcile, same_vault, InstalledArtifact, Ownership, ReconcilePlan,
+};
 pub use types::{Args, ScheduleConfig, ScheduleEntry, SkillFrontmatter};
 pub use xml::escape as xml_escape;
 pub use xml::unescape as xml_unescape;

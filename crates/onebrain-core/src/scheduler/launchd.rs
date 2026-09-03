@@ -164,6 +164,25 @@ fn sanitize_label(raw: &str) -> String {
         .collect()
 }
 
+/// Whether `s` is a label this CLI could have written: non-empty, and every
+/// character already in `[A-Za-z0-9-]` — i.e. a fixed point of
+/// [`sanitize_label`].
+///
+/// **The round-trip hazard this exists for (#410 fix round 1).** Every
+/// label→artifact mapping (`plist_path`, `systemd::unit_base_name`,
+/// `schtasks::task_name`) passes the label through `sanitize_label`, but
+/// `backend::list_installed` derives labels back out of the RAW filename. A
+/// stray `com.onebrain.daily_x.plist` therefore enumerates as label `daily_x`,
+/// while `owner_of("daily_x")` and `remove("daily_x")` both resolve to
+/// `com.onebrain.daily-x.plist` — a different file, possibly a live entry of
+/// this vault's. The reconcile sweep would read one artifact's ownership and
+/// delete another's. Since no renderer here can ever emit an unsanitized
+/// name, an enumerated label that fails this check is provably not ours, and
+/// every `list_installed` arm skips it.
+pub fn is_safe_label(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
 /// Compute the on-disk plist path for a skill or label string.
 ///
 /// Accepts either a leading-slash skill name (`/daily`) or a pre-stripped
