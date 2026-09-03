@@ -256,6 +256,27 @@ fn inner_reason(e: &SchedulerError) -> String {
     }
 }
 
+/// `Some(config)` when a config file exists (possibly with no `schedule:`
+/// block), `None` when there is no `onebrain.yml`/`vault.yml` at all. The
+/// distinction matters for reconciliation (#410): an empty block is an
+/// instruction ("no schedules"), a missing file is not evidence of anything
+/// — `resolve_vault_root` falls back to cwd, and pruning on that would be
+/// the reverted ledger bug in a new coat.
+pub(crate) fn read_vault_config_opt(vault: &Path) -> Result<Option<ScheduleConfig>> {
+    // Dual-read: canonical `onebrain.yml` preferred, legacy `vault.yml`
+    // fallback (see the history note on `read_vault_config` below).
+    let yaml_path = onebrain_core::find_config_file(vault)
+        .unwrap_or_else(|| vault.join(onebrain_core::CONFIG_FILENAME));
+    if !yaml_path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&yaml_path)
+        .with_context(|| format!("read {}", yaml_path.display()))?;
+    let cfg: ScheduleConfig =
+        serde_yaml::from_str(&raw).with_context(|| format!("parse {}", yaml_path.display()))?;
+    Ok(Some(cfg))
+}
+
 pub(crate) fn read_vault_config(vault: &Path) -> Result<ScheduleConfig> {
     // Dual-read: canonical `onebrain.yml` preferred, legacy `vault.yml`
     // fallback. Hardcoding `vault.yml` here made `schedule register` find no
@@ -263,16 +284,7 @@ pub(crate) fn read_vault_config(vault: &Path) -> Result<ScheduleConfig> {
     // (re)register/refresh the user's schedule. `resolve_logs_folder` already
     // dual-reads via `load_vault_config`; this is the matching fix for the
     // schedule-entries reader (which parses the raw file into `ScheduleConfig`).
-    let yaml_path = onebrain_core::find_config_file(vault)
-        .unwrap_or_else(|| vault.join(onebrain_core::CONFIG_FILENAME));
-    if !yaml_path.exists() {
-        return Ok(ScheduleConfig::default());
-    }
-    let raw = std::fs::read_to_string(&yaml_path)
-        .with_context(|| format!("read {}", yaml_path.display()))?;
-    let cfg: ScheduleConfig =
-        serde_yaml::from_str(&raw).with_context(|| format!("parse {}", yaml_path.display()))?;
-    Ok(cfg)
+    Ok(read_vault_config_opt(vault)?.unwrap_or_default())
 }
 
 // The register-time character ban (`"`, `$`, backtick, `\` refused in any
@@ -450,7 +462,18 @@ pub(crate) fn build_scheduler_context(vault: &Path) -> Result<SchedulerContext> 
         .ok()
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| "onebrain".to_string());
-    let homedir = dirs::home_dir().ok_or_else(|| anyhow!("could not resolve home directory"))?;
+    let homedir = crate::home::home_dir()?;
+    // #410: this path is written into every artifact as the ownership
+    // marker (and already into `--vault` argv), so it must be absolute and
+    // lexically normalized — a relative `--vault` was unusable at fire time
+    // anyway (launchd runs jobs with cwd=/).
+    let vault_abs = if vault.is_absolute() {
+        vault.to_path_buf()
+    } else {
+        env::current_dir()
+            .context("read current directory")?
+            .join(vault)
+    };
     // #315: job logs are machine-local operational output, not vault content.
     // On a synced vault (iCloud) the old in-vault files eventually became
     // unopenable-for-append, and launchd opens the log paths BEFORE exec — so
@@ -458,7 +481,7 @@ pub(crate) fn build_scheduler_context(vault: &Path) -> Result<SchedulerContext> 
     let log_base_path =
         onebrain_core::scheduler::default_log_dir(&homedir, &|k| std::env::var(k).ok());
     Ok(SchedulerContext {
-        vault_path: vault.to_path_buf(),
+        vault_path: normalize_path(&vault_abs),
         skill_cli_path,
         log_base_path,
         homedir,
@@ -2069,5 +2092,41 @@ mod tests {
         let a = label_for_entry(&mk("alpha"));
         let b = label_for_entry(&mk("beta"));
         assert_ne!(a, b, "differing only past char 40 must still differ: {a}");
+    }
+
+    #[test]
+    fn read_vault_config_opt_is_none_without_a_config_file_and_some_with_an_empty_one() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_vault_config_opt(dir.path()).unwrap().is_none());
+        std::fs::write(dir.path().join("onebrain.yml"), "# no schedule key\n").unwrap();
+        let cfg = read_vault_config_opt(dir.path())
+            .unwrap()
+            .expect("file exists");
+        assert!(cfg.schedule.is_empty());
+    }
+
+    /// #410: the marker written into every artifact is `ctx.vault_path`, so
+    /// it must be absolute and normalized — a relative `--vault .` used to
+    /// land verbatim in `--vault` argv too, which launchd (cwd=/) could never
+    /// resolve at fire time.
+    #[test]
+    fn build_scheduler_context_absolutizes_and_normalizes_the_vault_path() {
+        let d = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            ("HOME", d.path().as_os_str()),
+            ("USERPROFILE", d.path().as_os_str()),
+        ]);
+        let cwd = std::env::current_dir().unwrap();
+        let ctx = build_scheduler_context(Path::new("./sub/../.")).unwrap();
+        assert_eq!(
+            ctx.vault_path,
+            onebrain_core::scheduler::normalize_path(&cwd)
+        );
+        assert!(ctx.vault_path.is_absolute());
+        // #402: the scheduler site honours the env override on every platform.
+        assert_eq!(
+            ctx.homedir.canonicalize().unwrap(),
+            d.path().canonicalize().unwrap()
+        );
     }
 }
