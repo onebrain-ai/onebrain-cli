@@ -223,6 +223,8 @@ pub fn generate_service_unit(
     for a in &argv {
         sanitize_unit_value(a)?;
     }
+    let vault = ctx.vault_path.to_string_lossy();
+    sanitize_unit_value(&vault)?;
     let exec = argv
         .iter()
         .map(|a| quote_arg(a))
@@ -230,7 +232,13 @@ pub fn generate_service_unit(
         .join(" ");
 
     let mut out = format!(
-        "[Unit]\nDescription=OneBrain scheduled entry ({label})\n\n[Service]\nType=oneshot\nExecStart={exec}\n"
+        "[Unit]\nDescription=OneBrain scheduled entry ({label})\n\n[Service]\nType=oneshot\nExecStart={exec}\n{}\n",
+        // #410: ownership marker — see reconcile.rs. `Environment=` expands
+        // `%` specifiers but not `$`, so this has its own quoter.
+        crate::scheduler::reconcile::quote_env_assignment(
+            crate::scheduler::reconcile::VAULT_ENV_KEY,
+            &vault
+        )
     );
     if is_one_shot(entry) {
         // Self-removal needs THREE operations, so it is /bin/sh -c (the
@@ -632,5 +640,38 @@ mod tests {
     fn timer_snapshot() {
         let ctx = ctx_with_cli("/usr/local/bin/onebrain");
         insta::assert_snapshot!(generate_timer_unit(&daily_entry(), &ctx));
+    }
+
+    /// #410: the `[Service]` section names the vault that installed the unit
+    /// so `register` can prune by ownership. Escaped through the Environment=
+    /// rules (`%`→`%%`, quotes/backslashes) and readable back through the
+    /// reconcile parser — including for a FOREIGN command, which is the case
+    /// `--vault` argv can never cover.
+    #[test]
+    fn service_unit_carries_the_vault_marker_for_skill_and_foreign_command() {
+        let mut ctx = ctx_with_cli("/usr/local/bin/onebrain");
+        ctx.vault_path = std::path::PathBuf::from("/home/u/my \"vault\" 100%");
+        for entry in [
+            daily_entry(),
+            crate::scheduler::test_support::foreign_command_entry(),
+        ] {
+            let unit = generate_service_unit(&entry, &ctx).unwrap();
+            assert!(
+                unit.contains("\nEnvironment=\"ONEBRAIN_VAULT=/home/u/my \\\"vault\\\" 100%%\"\n"),
+                "{unit}"
+            );
+            assert_eq!(
+                crate::scheduler::reconcile::owner_from_service_unit(&unit),
+                crate::scheduler::reconcile::Ownership::Vault(ctx.vault_path.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn service_unit_refuses_a_vault_path_with_a_newline() {
+        let mut ctx = ctx_with_cli("/usr/local/bin/onebrain");
+        ctx.vault_path =
+            std::path::PathBuf::from("/home/u/x\nExecStartPost=/bin/sh -c 'touch /tmp/pwned'");
+        assert!(generate_service_unit(&daily_entry(), &ctx).is_err());
     }
 }

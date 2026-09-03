@@ -4,3 +4,4 @@ Description=OneBrain scheduled entry (daily)
 [Service]
 Type=oneshot
 ExecStart=/bin/echo skill run --vault /v/ob-1 --skill /daily --harness claude
+Environment="ONEBRAIN_VAULT=/v/ob-1"

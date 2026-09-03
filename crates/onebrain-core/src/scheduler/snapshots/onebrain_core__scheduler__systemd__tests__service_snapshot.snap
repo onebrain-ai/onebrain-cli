@@ -1,7 +1,6 @@
 ---
 source: crates/onebrain-core/src/scheduler/systemd.rs
-assertion_line: 325
-expression: "generate_service_unit(&daily_entry(), &ctx)"
+expression: "generate_service_unit(&daily_entry(), &ctx).unwrap()"
 ---
 [Unit]
 Description=OneBrain scheduled entry (daily)
@@ -9,3 +8,4 @@ Description=OneBrain scheduled entry (daily)
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/onebrain skill run --vault /v/ob-1 --skill /daily --harness claude
+Environment="ONEBRAIN_VAULT=/v/ob-1"
