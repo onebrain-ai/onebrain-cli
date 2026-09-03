@@ -19,6 +19,8 @@
 //! - [`systemd`] — Linux user-timer unit rendering (pure; corpus-backed)
 //! - [`schtasks`] — Windows trigger translation (pure; corpus-backed)
 //! - [`log_paths`] — runtime stdout/stderr log path builder
+//! - [`reconcile`] — ownership types, reconcile planner, and per-backend
+//!   artifact-ownership parsers (#410, #352)
 //! - [`run_log`] — the CLI-owned job log, opened after exec (#372)
 //! - [`run_record`] — pure rendering of a scheduled run into a vault record (#363)
 //! - [`error`] — `SchedulerError` (matched error strings for parity tests)

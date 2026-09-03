@@ -99,6 +99,33 @@ pub fn plan_reconcile(
     plan
 }
 
+// ── binary identity (shared by every legacy `--vault` argv fallback) ───────
+
+/// The last path component of `argv0`, splitting on both `/` and `\` so it
+/// works for POSIX paths (launchd/systemd artifacts) and Windows paths (Task
+/// Scheduler `<Command>`) regardless of which OS is running this code —
+/// `std::path::Path` alone would miss backslash separators on a non-Windows
+/// host.
+fn argv0_basename(argv0: &str) -> &str {
+    argv0.rsplit(['/', '\\']).next().unwrap_or(argv0)
+}
+
+/// Whether `argv0` is the onebrain binary: basename `onebrain`, or on
+/// Windows `onebrain.exe`. Case-sensitive — every renderer this CLI writes
+/// spells its own binary name consistently, so case-folding would only widen
+/// what a foreign binary could spoof.
+///
+/// This gates every legacy `--vault` argv fallback below (#410 review round
+/// 1): a foreign scheduled job that happens to accept its own `--vault` flag
+/// is NOT evidence that the path named there is a vault this CLI installed
+/// for — only onebrain's own skill-mode and command-mode invocations ever
+/// meant `--vault` that way, and only those two shapes ever got the fallback
+/// written by a renderer in the first place.
+fn is_onebrain_binary(argv0: &str) -> bool {
+    let base = argv0_basename(argv0);
+    base == "onebrain" || base.strip_suffix(".exe") == Some("onebrain")
+}
+
 // ── launchd ────────────────────────────────────────────────────────────────
 
 /// Text between the first `<string>` and `</string>` at or after `from`.
@@ -109,22 +136,26 @@ fn next_plist_string(text: &str, from: usize) -> Option<&str> {
     Some(&rest[start..end])
 }
 
-/// The `<string>` that follows an exact `<key>{key}</key>` element.
+/// The `<string>` that follows an exact `<key>{key}</key>` element — but
+/// ONLY when the value is immediately (past whitespace) a `<string>`.
+///
+/// This is an allowlist, not a denylist: an earlier version rejected a
+/// handful of named non-string types it happened to think of (`<key>`,
+/// `<integer>`, `<dict>`, `<array>`) and let anything else — `<true/>`,
+/// `<false/>`, `<real>`, `<data>`, `<date>` — walk past the key's real value
+/// to grab an unrelated LATER `<string>` (#410 review round 1). Requiring
+/// the very next element to be `<string>` is exhaustive by construction.
 fn plist_string_after_key(text: &str, key: &str) -> Option<String> {
     let needle = format!("<key>{key}</key>");
     let at = text.find(&needle)? + needle.len();
-    // The value must be the very next element: a `<key>` seen before the
-    // `<string>` means the key's value was not a string at all.
-    let rest = &text[at..];
-    let next_string = rest.find("<string>")?;
-    if rest[..next_string].contains("<key>")
-        || rest[..next_string].contains("<integer>")
-        || rest[..next_string].contains("<dict>")
-        || rest[..next_string].contains("<array>")
-    {
+    let after = &text[at..];
+    let trimmed = after.trim_start();
+    if !trimmed.starts_with("<string>") {
         return None;
     }
-    next_plist_string(text, at).map(xml_unescape)
+    let start = at + (after.len() - trimmed.len()) + "<string>".len();
+    let end = text[start..].find("</string>")? + start;
+    Some(xml_unescape(&text[start..end]))
 }
 
 /// The `<string>` that follows an exact `<string>{value}</string>` element.
@@ -134,16 +165,31 @@ fn plist_string_after_string(text: &str, value: &str) -> Option<String> {
     next_plist_string(text, at).map(xml_unescape)
 }
 
-/// Owner of a launchd plist: the `ONEBRAIN_VAULT` marker, else the value
-/// after a standalone `--vault` argv element (pre-marker skill-mode and
-/// onebrain command-mode artifacts), else Unknown. Tolerant scanning of our
-/// own byte-pinned template — no plist parser is a dependency here.
+/// argv[0] of a plist: the first `<string>` inside the `<array>` that
+/// follows `<key>ProgramArguments</key>`.
+fn plist_program_arguments_argv0(text: &str) -> Option<String> {
+    let needle = "<key>ProgramArguments</key>";
+    let at = text.find(needle)? + needle.len();
+    next_plist_string(text, at).map(xml_unescape)
+}
+
+/// Owner of a launchd plist: the `ONEBRAIN_VAULT` marker, else — ONLY when
+/// argv[0] is the onebrain binary itself — the value after a standalone
+/// `--vault` argv element (pre-marker skill-mode and onebrain command-mode
+/// artifacts), else Unknown. The argv[0] gate (#410 review round 1) matters
+/// because a foreign scheduled job that happens to accept its own `--vault`
+/// flag is not evidence it was installed for that vault. Tolerant scanning
+/// of our own byte-pinned template — no plist parser is a dependency here.
 pub fn owner_from_plist(text: &str) -> Ownership {
     if let Some(v) = plist_string_after_key(text, VAULT_ENV_KEY) {
         return Ownership::Vault(PathBuf::from(v));
     }
-    if let Some(v) = plist_string_after_string(text, "--vault") {
-        return Ownership::Vault(PathBuf::from(v));
+    let is_onebrain =
+        plist_program_arguments_argv0(text).is_some_and(|argv0| is_onebrain_binary(&argv0));
+    if is_onebrain {
+        if let Some(v) = plist_string_after_string(text, "--vault") {
+            return Ownership::Vault(PathBuf::from(v));
+        }
     }
     Ownership::Unknown
 }
@@ -230,7 +276,11 @@ fn split_execstart(value: &str) -> Vec<String> {
 }
 
 /// Owner of a systemd `.service` unit: the `Environment="ONEBRAIN_VAULT=…"`
-/// line, else `--vault <path>` in `ExecStart=`, else Unknown.
+/// line, else — ONLY when argv[0] of `ExecStart=` is the onebrain binary
+/// itself — `--vault <path>` in `ExecStart=`, else Unknown. The argv[0] gate
+/// (#410 review round 1) matters because a foreign command that happens to
+/// accept its own `--vault` flag is not evidence it was installed for that
+/// vault.
 pub fn owner_from_service_unit(text: &str) -> Ownership {
     let marker_prefix = format!("Environment=\"{VAULT_ENV_KEY}=");
     for line in text.lines() {
@@ -243,6 +293,9 @@ pub fn owner_from_service_unit(text: &str) -> Ownership {
     for line in text.lines() {
         if let Some(exec) = line.strip_prefix("ExecStart=") {
             let argv = split_execstart(exec);
+            if !argv.first().is_some_and(|a| is_onebrain_binary(a)) {
+                continue;
+            }
             if let Some(i) = argv.iter().position(|a| a == "--vault") {
                 if let Some(path) = argv.get(i + 1) {
                     return Ownership::Vault(PathBuf::from(path));
@@ -264,8 +317,11 @@ fn xml_element_text<'a>(text: &'a str, element: &str) -> Option<&'a str> {
 }
 
 /// Owner of a Task Scheduler task from its `/Query /XML` document: the
-/// `<Description>` marker, else `--vault "path"` / `--vault path` in
-/// `<Arguments>`, else Unknown.
+/// `<Description>` marker, else — ONLY when `<Command>` is the onebrain
+/// binary itself — `--vault "path"` / `--vault path` in `<Arguments>`, else
+/// Unknown. The `<Command>` gate (#410 review round 1) matters because a
+/// foreign command that happens to accept its own `--vault` flag is not
+/// evidence it was installed for that vault.
 pub fn owner_from_task_xml(text: &str) -> Ownership {
     if let Some(desc) = xml_element_text(text, "Description") {
         if let Some(path) = xml_unescape(desc).strip_prefix(TASK_DESCRIPTION_PREFIX) {
@@ -274,16 +330,21 @@ pub fn owner_from_task_xml(text: &str) -> Ownership {
             }
         }
     }
-    if let Some(args) = xml_element_text(text, "Arguments") {
-        let args = xml_unescape(args);
-        // `--vault "C:\My Vault\ob"` (quote_win_arg output for a spaced path)
-        // or `--vault C:\ob` (unquoted). Backslash-doubling before an inner
-        // quote is not reversed — a path containing `"` is not a real case.
-        let re = regex::Regex::new(r#"--vault (?:"([^"]+)"|(\S+))"#).expect("static regex");
-        if let Some(caps) = re.captures(&args) {
-            let path = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str());
-            if let Some(path) = path {
-                return Ownership::Vault(PathBuf::from(path));
+    let is_onebrain =
+        xml_element_text(text, "Command").is_some_and(|c| is_onebrain_binary(&xml_unescape(c)));
+    if is_onebrain {
+        if let Some(args) = xml_element_text(text, "Arguments") {
+            let args = xml_unescape(args);
+            // `--vault "C:\My Vault\ob"` (quote_win_arg output for a spaced
+            // path) or `--vault C:\ob` (unquoted). Backslash-doubling before
+            // an inner quote is not reversed — a path containing `"` is not
+            // a real case.
+            let re = regex::Regex::new(r#"--vault (?:"([^"]+)"|(\S+))"#).expect("static regex");
+            if let Some(caps) = re.captures(&args) {
+                let path = caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str());
+                if let Some(path) = path {
+                    return Ownership::Vault(PathBuf::from(path));
+                }
             }
         }
     }
@@ -473,11 +534,39 @@ mod tests {
             owner_from_task_xml(quoted),
             Ownership::Vault(PathBuf::from("C:\\My Vault\\ob"))
         );
-        let bare = "<Arguments>search reindex --vault C:\\ob</Arguments>";
+        // Unquoted `--vault` value, still gated on `<Command>` being onebrain.
+        let bare = "<Actions><Exec><Command>C:\\bin\\onebrain.exe</Command><Arguments>search reindex --vault C:\\ob</Arguments></Exec></Actions>";
         assert_eq!(
             owner_from_task_xml(bare),
             Ownership::Vault(PathBuf::from("C:\\ob"))
         );
+    }
+
+    #[test]
+    fn plist_vault_argv_from_non_onebrain_binary_is_unknown() {
+        let plist = "<plist version=\"1.0\">\n<dict>\n    <key>ProgramArguments</key>\n    <array>\n        <string>/usr/local/bin/backup-tool</string>\n        <string>--vault</string>\n        <string>/x</string>\n    </array>\n</dict>\n</plist>";
+        assert_eq!(owner_from_plist(plist), Ownership::Unknown);
+    }
+
+    #[test]
+    fn service_unit_vault_token_from_non_onebrain_binary_is_unknown() {
+        let unit = "[Service]\nExecStart=/usr/local/bin/backup-tool --vault /x\n";
+        assert_eq!(owner_from_service_unit(unit), Ownership::Unknown);
+    }
+
+    #[test]
+    fn task_xml_vault_arg_from_non_onebrain_command_is_unknown() {
+        let xml = "<Actions><Exec><Command>C:\\tools\\backup.exe</Command><Arguments>--vault C:\\x</Arguments></Exec></Actions>";
+        assert_eq!(owner_from_task_xml(xml), Ownership::Unknown);
+    }
+
+    #[test]
+    fn plist_marker_key_followed_by_boolean_then_unrelated_string_is_unknown() {
+        // An allowlist (only `<string>` counts) rather than a denylist of
+        // named non-string types is what makes this exhaustive — see the
+        // doc comment on `plist_string_after_key`.
+        let text = "<key>ONEBRAIN_VAULT</key>\n    <true/>\n    <key>Other</key>\n    <string>/not/this</string>";
+        assert_eq!(owner_from_plist(text), Ownership::Unknown);
     }
 
     #[test]
