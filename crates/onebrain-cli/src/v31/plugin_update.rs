@@ -155,14 +155,26 @@ pub fn run(
             /* dry_run */ false,
             /* refresh */ true,
         ) {
-            Ok(count) => {
+            Ok(outcome) => {
                 // v3.2.13: `plists_rewritten = true` ONLY when actual writes
                 // happened. A vault without `schedule:` entries returns
-                // `Ok(0)` — the step ran successfully but produced no work,
-                // so the renderer surfaces "no schedule entries" instead of
-                // a misleading "done".
-                report.plists_rewritten = count > 0;
-                report.plists_count = Some(count as u32);
+                // `written == 0` — the step ran successfully but produced no
+                // work, so the renderer surfaces "no schedule entries"
+                // instead of a misleading "done".
+                report.plists_rewritten = outcome.written > 0;
+                report.plists_count = Some(outcome.written as u32);
+                // #410/#352: an artifact removed by the reconcile sweep is
+                // surfaced through the report's warning channel — this path
+                // is quiet by design, and a silent deletion is the bug #352
+                // named.
+                for label in outcome.pruned {
+                    report.warnings.push(super::hook_rewriter::RewriteWarning {
+                        code: "W_SCHEDULE_ORPHAN_REMOVED".to_string(),
+                        message: format!(
+                            "removed stale schedule '{label}' (no longer in onebrain.yml)"
+                        ),
+                    });
+                }
             }
             Err(e) => {
                 // A platform with no scheduler backend is a SKIP, not a

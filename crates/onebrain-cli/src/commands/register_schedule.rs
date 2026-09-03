@@ -17,12 +17,24 @@ use anyhow::{anyhow, Context, Result};
 use onebrain_core::scheduler::backend;
 use onebrain_core::scheduler::{
     self, is_command_mode, is_one_shot, is_skill_mode, label_for_entry, normalize_path,
-    validate_at, validate_cron, validate_entry, Args, ScheduleConfig, ScheduleEntry,
-    SchedulerContext, SchedulerError, SkillFrontmatter,
+    plan_reconcile, validate_at, validate_cron, validate_entry, Args, ScheduleConfig,
+    ScheduleEntry, SchedulerContext, SchedulerError, SkillFrontmatter,
 };
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
+
+/// What an embedded (`onebrain plugin update`) registration did. `written`
+/// is the number of artifacts (re)written — `0` for a well-formed "no
+/// schedule entries" no-op; `pruned` is every artifact removed because it
+/// was owned by this vault and no longer in the config (#410). Returned
+/// rather than printed so the caller can render it inside its own frame —
+/// a removal that happens silently is the bug #352 named.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EmbeddedOutcome {
+    pub written: usize,
+    pub pruned: Vec<String>,
+}
 
 /// Entry point dispatched from `main.rs`. Returns the standard `anyhow`
 /// error which `classify_exit_code` maps to an exit code.
@@ -53,10 +65,17 @@ pub fn run(
 /// the CLI surface) keep their existing output — only the embedded-from-
 /// plugin-update path passes `quiet = true`.
 ///
-/// Returns `Ok(0)` when `onebrain.yml` has no `schedule:` entries (a
-/// well-formed no-op, NOT an error). `Ok(N)` where `N == entries.len()`
-/// on a successful registration pass. Errors bubble up via `?` as usual.
-pub fn run_embedded(vault: Option<PathBuf>, dry_run: bool, refresh: bool) -> Result<usize> {
+/// Returns `written == 0` when `onebrain.yml` has no `schedule:` entries (a
+/// well-formed no-op, NOT an error), and `written == entries.len()` on a
+/// successful registration pass. `pruned` carries every artifact the
+/// reconcile sweep removed (#410) so the caller can surface it — this path
+/// is quiet, and a silent deletion is the bug #352 named. Errors bubble up
+/// via `?` as usual.
+pub fn run_embedded(
+    vault: Option<PathBuf>,
+    dry_run: bool,
+    refresh: bool,
+) -> Result<EmbeddedOutcome> {
     run_with(vault, dry_run, false, refresh, None, false, None, true)
 }
 
@@ -70,7 +89,7 @@ fn run_with(
     status: bool,
     test: Option<String>,
     quiet: bool,
-) -> Result<usize> {
+) -> Result<EmbeddedOutcome> {
     let vault = match vault {
         Some(path) => path,
         None => {
@@ -81,31 +100,44 @@ fn run_with(
 
     if remove {
         remove_all(&vault)?;
-        return Ok(0);
+        return Ok(EmbeddedOutcome::default());
     }
     if status {
         print_status(&vault)?;
-        return Ok(0);
+        return Ok(EmbeddedOutcome::default());
     }
     if let Some(skill) = test {
         test_run(&vault, &skill)?;
-        return Ok(0);
+        return Ok(EmbeddedOutcome::default());
     }
     if let Some(skill) = resume {
         resume_skill(&vault, &skill)?;
-        return Ok(0);
+        return Ok(EmbeddedOutcome::default());
     }
     if refresh && !quiet {
         println!("(--refresh: re-emitting plists with current vault path)");
     }
 
-    let config = read_vault_config(&vault)?;
-    let entries = config.schedule;
-    if entries.is_empty() {
+    let Some(config) = read_vault_config_opt(&vault)? else {
+        // No onebrain.yml at all. Not an error — and NOT an instruction to
+        // reconcile: a missing file proves nothing about what this vault
+        // wants installed (#410 design, "missing config → no sweep").
         if !quiet {
             println!("No schedule entries in onebrain.yml. Nothing to register.");
         }
-        return Ok(0);
+        return Ok(EmbeddedOutcome::default());
+    };
+    let entries = config.schedule;
+    if entries.is_empty() {
+        // A config file with no entries IS an instruction: nothing should be
+        // installed. Deleting the whole `schedule:` block used to return
+        // here before any cleanup, leaving every job firing (#352).
+        if !quiet {
+            println!("No schedule entries in onebrain.yml. Nothing to register.");
+        }
+        let ctx = build_scheduler_context(&vault)?;
+        let pruned = sweep_orphans(&ctx, &[], dry_run, quiet);
+        return Ok(EmbeddedOutcome { written: 0, pruned });
     }
 
     // Pass 1 — structural + field-format validation. We do NOT mutate input
@@ -217,6 +249,12 @@ fn run_with(
         cleanup_stale_labels(entry, &current_labels, &ctx, quiet);
     }
 
+    // #410: reconcile the OS scheduler against the config. Runs on every
+    // non-dry-run register — plain, --refresh, and embedded — because the
+    // guard is OWNERSHIP, not a flag. After the loop, so a failed install
+    // still leaves "nothing changed" rather than "schedule lost".
+    let pruned = sweep_orphans(&ctx, &current_labels, dry_run, quiet);
+
     if !quiet {
         // No "Use launchctl to load" epilogue: install() now boots the job
         // out and back in itself (#312), so the instruction would be false.
@@ -226,7 +264,10 @@ fn run_with(
             backend::describe()
         );
     }
-    Ok(entries.len())
+    Ok(EmbeddedOutcome {
+        written: entries.len(),
+        pruned,
+    })
 }
 
 /// Resolve the active vault root. Falls back to `cwd` when no `vault.yml`
@@ -701,6 +742,76 @@ fn cleanup_stale_labels(
             Err(_) => {}
         }
     }
+}
+
+/// Remove every installed artifact that this vault owns and that has no
+/// entry in the config; report — and keep — everything else that is not in
+/// the config (#410). Returns the labels actually removed.
+///
+/// The decision is `plan_reconcile`'s; this function only executes it and
+/// talks. Best-effort throughout: a scan or removal failure is reported and
+/// never fails registration (the entries were installed successfully by the
+/// time this runs). In `quiet` mode the informational lines are suppressed
+/// but the returned list is how the embedded caller still shows removals.
+fn sweep_orphans(
+    ctx: &SchedulerContext,
+    current_labels: &[String],
+    dry_run: bool,
+    quiet: bool,
+) -> Vec<String> {
+    let installed = match backend::list_installed(ctx) {
+        Ok(v) => v,
+        Err(e) => {
+            if !quiet {
+                eprintln!(
+                    "\u{26a0} Could not scan installed schedules — {e}; orphans left in place"
+                );
+            }
+            return Vec::new();
+        }
+    };
+    let plan = plan_reconcile(&installed, current_labels, &ctx.vault_path);
+    let mut pruned = Vec::new();
+    for label in &plan.prune {
+        if dry_run {
+            if !quiet {
+                println!("Would remove stale schedule '{label}' (no longer in onebrain.yml)");
+            }
+            continue;
+        }
+        match backend::remove(label, ctx) {
+            Ok(true) => {
+                if !quiet {
+                    println!(
+                        "\u{2713} Removed stale schedule '{label}' (no longer in onebrain.yml)"
+                    );
+                }
+                pruned.push(label.clone());
+            }
+            Ok(false) => {}
+            Err(e) => {
+                if !quiet {
+                    eprintln!(
+                        "\u{26a0} Could not remove stale schedule '{label}' — {e}; it may keep firing until removed manually"
+                    );
+                }
+            }
+        }
+    }
+    if !quiet {
+        for label in &plan.unknown {
+            println!(
+                "\u{26a0} Installed but not in onebrain.yml, owner unknown — left in place: '{label}'"
+            );
+        }
+        for (label, owner) in &plan.foreign {
+            println!(
+                "\u{2139} Installed but not in onebrain.yml, owned by another vault ({}) — left in place: '{label}'",
+                owner.display()
+            );
+        }
+    }
+    pruned
 }
 
 fn remove_all(vault: &Path) -> Result<()> {
@@ -1727,8 +1838,12 @@ mod tests {
         // false arm: the println is skipped and Ok(0) is still returned.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("onebrain.yml"), "# no schedule entries\n").unwrap();
-        let count = run_embedded(Some(dir.path().to_path_buf()), false, false).unwrap();
-        assert_eq!(count, 0, "empty schedule → Ok(0) in quiet mode");
+        let outcome = run_embedded(Some(dir.path().to_path_buf()), false, false).unwrap();
+        assert_eq!(outcome.written, 0, "empty schedule → Ok(0) in quiet mode");
+        assert!(
+            outcome.pruned.is_empty(),
+            "a tempdir vault owns no artifact on this machine"
+        );
     }
 
     #[test]
@@ -1737,8 +1852,8 @@ mod tests {
         // refresh=true but quiet=true suppresses the message; still Ok(0).
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("onebrain.yml"), "# no schedule\n").unwrap();
-        let count = run_embedded(Some(dir.path().to_path_buf()), false, true).unwrap();
-        assert_eq!(count, 0, "refresh + quiet + no entries → Ok(0)");
+        let outcome = run_embedded(Some(dir.path().to_path_buf()), false, true).unwrap();
+        assert_eq!(outcome.written, 0, "refresh + quiet + no entries → Ok(0)");
     }
 
     // Unix-only: uses /bin/sh which doesn't exist on Windows.
@@ -1753,9 +1868,9 @@ mod tests {
             "schedule:\n- cron: \"0 9 * * *\"\n  command: /bin/sh\n",
         )
         .unwrap();
-        let count = run_embedded(Some(dir.path().to_path_buf()), true, false).unwrap();
+        let outcome = run_embedded(Some(dir.path().to_path_buf()), true, false).unwrap();
         assert_eq!(
-            count, 1,
+            outcome.written, 1,
             "dry_run quiet mode returns entry count without writing"
         );
     }

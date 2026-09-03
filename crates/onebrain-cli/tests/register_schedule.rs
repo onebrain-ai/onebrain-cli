@@ -1170,3 +1170,238 @@ fn a_bad_entry_still_installs_nothing() {
     let n = std::fs::read_dir(&agents).unwrap().count();
     assert_eq!(n, 0, "a config with any invalid entry must install NOTHING");
 }
+
+/// `register-schedule [args]` against `vault` with `home` as `$HOME`, the
+/// activation kill-switch set, and the scratch cache root — the one way every
+/// test in this file may spawn the binary. Returns the assertion for chaining.
+fn register(vault: &Path, home: &Path, args: &[&str]) -> assert_cmd::assert::Assert {
+    let mut argv = vec!["register-schedule"];
+    argv.extend_from_slice(args);
+    Command::cargo_bin("onebrain")
+        .unwrap()
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
+        .args(&argv)
+        .current_dir(vault)
+        .env("HOME", home)
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
+        .assert()
+}
+
+/// A hand-written plist that claims `vault` installed it — what another
+/// vault's `register` (or this one's, earlier) would have left on disk.
+#[cfg(target_os = "macos")]
+fn plist_owned_by(label: &str, vault: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n    <key>Label</key>\n    <string>com.onebrain.{label}</string>\n    <key>ProgramArguments</key>\n    <array>\n        <string>/bin/echo</string>\n    </array>\n    <key>EnvironmentVariables</key>\n    <dict>\n        <key>ONEBRAIN_VAULT</key>\n        <string>{vault}</string>\n    </dict>\n    <key>RunAtLoad</key>\n    <false/>\n</dict>\n</plist>"
+    )
+}
+
+/// #410 end to end: delete an entry, run a plain `register`, and the
+/// artifact is gone — no `--refresh`, no manual `launchctl bootout`.
+#[cfg(target_os = "macos")]
+#[test]
+fn deleting_an_entry_prunes_its_artifact_on_the_next_register() {
+    let v = write_skill_vault(
+        "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n  - cron: \"30 8 * * *\"\n    skill: /digest\n",
+    );
+    write_skill(v.path(), "digest", "name: digest\nschedulable: true");
+    let home = tempdir().unwrap();
+    let agents = home.path().join("Library/LaunchAgents");
+
+    register(v.path(), home.path(), &[]).success();
+    assert!(agents.join("com.onebrain.digest.plist").exists());
+
+    std::fs::write(
+        v.path().join("vault.yml"),
+        "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n",
+    )
+    .unwrap();
+    register(v.path(), home.path(), &[])
+        .success()
+        .stdout(predicate::str::contains(
+            "\u{2713} Removed stale schedule 'digest' (no longer in onebrain.yml)",
+        ));
+    assert!(
+        !agents.join("com.onebrain.digest.plist").exists(),
+        "orphan must be pruned"
+    );
+    assert!(
+        agents.join("com.onebrain.daily.plist").exists(),
+        "current entry untouched"
+    );
+}
+
+/// The guard the reverted ledger lacked, and one that can actually fail: an
+/// artifact that names ANOTHER vault as its owner survives our register and
+/// is reported, not deleted.
+#[cfg(target_os = "macos")]
+#[test]
+fn registering_never_prunes_an_artifact_owned_by_another_vault() {
+    let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n");
+    let home = tempdir().unwrap();
+    let agents = home.path().join("Library/LaunchAgents");
+    std::fs::create_dir_all(&agents).unwrap();
+    let theirs = agents.join("com.onebrain.weekly.plist");
+    std::fs::write(
+        &theirs,
+        plist_owned_by("weekly", "/Users/someone-else/vault"),
+    )
+    .unwrap();
+
+    for _ in 0..2 {
+        register(v.path(), home.path(), &[]).success().stdout(predicate::str::contains(
+            "\u{2139} Installed but not in onebrain.yml, owned by another vault (/Users/someone-else/vault) — left in place: 'weekly'",
+        ));
+        assert!(
+            theirs.exists(),
+            "another vault's artifact must never be removed"
+        );
+    }
+}
+
+/// No marker, no `--vault` argv: nothing proves ownership, so nothing is
+/// deleted — the artifact is named so a human can decide.
+#[cfg(target_os = "macos")]
+#[test]
+fn registering_keeps_and_reports_an_artifact_of_unknown_ownership() {
+    let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n");
+    let home = tempdir().unwrap();
+    let agents = home.path().join("Library/LaunchAgents");
+    std::fs::create_dir_all(&agents).unwrap();
+    let mystery = agents.join("com.onebrain.mystery.plist");
+    std::fs::write(&mystery, "<!-- no marker, no argv -->").unwrap();
+
+    register(v.path(), home.path(), &[])
+        .success()
+        .stdout(predicate::str::contains(
+            "\u{26a0} Installed but not in onebrain.yml, owner unknown — left in place: 'mystery'",
+        ));
+    assert!(mystery.exists());
+}
+
+/// Deleting the whole `schedule:` block is the most common form of "entry
+/// deleted" (#352) and used to return before any cleanup. A config file with
+/// no entries prunes everything this vault owns.
+#[cfg(target_os = "macos")]
+#[test]
+fn an_empty_schedule_block_prunes_everything_this_vault_owns() {
+    let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n");
+    let home = tempdir().unwrap();
+    let daily = home
+        .path()
+        .join("Library/LaunchAgents/com.onebrain.daily.plist");
+    register(v.path(), home.path(), &[]).success();
+    assert!(daily.exists());
+
+    std::fs::write(v.path().join("vault.yml"), "# schedule block deleted\n").unwrap();
+    register(v.path(), home.path(), &[])
+        .success()
+        .stdout(predicate::str::contains("Nothing to register"))
+        .stdout(predicate::str::contains("Removed stale schedule 'daily'"));
+    assert!(!daily.exists());
+}
+
+/// A MISSING config file is not an instruction. With `--vault-dir` pointing
+/// at a directory that has no onebrain.yml, nothing is swept even though the
+/// artifact on disk names exactly that directory as its owner.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_missing_config_file_never_triggers_the_sweep() {
+    let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n");
+    let home = tempdir().unwrap();
+    let daily = home
+        .path()
+        .join("Library/LaunchAgents/com.onebrain.daily.plist");
+    register(v.path(), home.path(), &[]).success();
+    assert!(daily.exists());
+
+    std::fs::remove_file(v.path().join("vault.yml")).unwrap();
+    let vault_flag = format!("--vault-dir={}", v.path().display());
+    register(v.path(), home.path(), &[vault_flag.as_str()])
+        .success()
+        .stdout(predicate::str::contains("Nothing to register"))
+        .stdout(predicate::str::contains("Removed stale").not());
+    assert!(daily.exists(), "no config file → no evidence → no deletion");
+}
+
+/// `--dry-run` previews the sweep and touches nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn dry_run_previews_the_prune_without_deleting() {
+    let v = write_skill_vault(
+        "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n  - cron: \"30 8 * * *\"\n    skill: /digest\n",
+    );
+    write_skill(v.path(), "digest", "name: digest\nschedulable: true");
+    let home = tempdir().unwrap();
+    let digest = home
+        .path()
+        .join("Library/LaunchAgents/com.onebrain.digest.plist");
+    register(v.path(), home.path(), &[]).success();
+    std::fs::write(
+        v.path().join("vault.yml"),
+        "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n",
+    )
+    .unwrap();
+
+    register(v.path(), home.path(), &["--dry-run"])
+        .success()
+        .stdout(predicate::str::contains(
+            "Would remove stale schedule 'digest' (no longer in onebrain.yml)",
+        ));
+    assert!(digest.exists(), "dry run must not delete");
+}
+
+/// Linux twin of the #410 repro — the sweep is platform-neutral above the
+/// backend seam, and this is the one place CI can prove it on systemd.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn linux_deleting_an_entry_prunes_its_units_on_the_next_register() {
+    let v = write_skill_vault(
+        "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n  - cron: \"30 8 * * *\"\n    skill: /digest\n",
+    );
+    write_skill(v.path(), "digest", "name: digest\nschedulable: true");
+    let home = tempdir().unwrap();
+    let units = home.path().join(".config/systemd/user");
+    register(v.path(), home.path(), &[]).success();
+    assert!(units.join("onebrain-digest.timer").exists());
+
+    std::fs::write(
+        v.path().join("vault.yml"),
+        "schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n",
+    )
+    .unwrap();
+    register(v.path(), home.path(), &[])
+        .success()
+        .stdout(predicate::str::contains(
+            "Removed stale schedule 'digest' (no longer in onebrain.yml)",
+        ));
+    assert!(!units.join("onebrain-digest.timer").exists());
+    assert!(!units.join("onebrain-digest.service").exists());
+    assert!(units.join("onebrain-daily.timer").exists());
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn linux_registering_never_prunes_units_owned_by_another_vault() {
+    let v = write_skill_vault("schedule:\n  - cron: \"0 9 * * *\"\n    skill: /daily\n");
+    let home = tempdir().unwrap();
+    let units = home.path().join(".config/systemd/user");
+    std::fs::create_dir_all(&units).unwrap();
+    std::fs::write(
+        units.join("onebrain-weekly.timer"),
+        "[Timer]\nOnCalendar=*-*-* 09:00:00\n",
+    )
+    .unwrap();
+    std::fs::write(
+        units.join("onebrain-weekly.service"),
+        "[Service]\nType=oneshot\nExecStart=/bin/echo hi\nEnvironment=\"ONEBRAIN_VAULT=/home/someone-else/vault\"\n",
+    )
+    .unwrap();
+    register(v.path(), home.path(), &[])
+        .success()
+        .stdout(predicate::str::contains(
+            "owned by another vault (/home/someone-else/vault) — left in place: 'weekly'",
+        ));
+    assert!(units.join("onebrain-weekly.timer").exists());
+    assert!(units.join("onebrain-weekly.service").exists());
+}
