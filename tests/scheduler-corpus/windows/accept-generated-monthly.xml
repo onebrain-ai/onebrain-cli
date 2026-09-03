@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>OneBrain scheduled entry</Description></RegistrationInfo>
+  <RegistrationInfo><Description>OneBrain scheduled entry for vault /v/ob-1</Description></RegistrationInfo>
   <Triggers>
     <CalendarTrigger>
       <StartBoundary>2000-01-01T09:00:00</StartBoundary>

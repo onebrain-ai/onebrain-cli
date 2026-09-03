@@ -596,10 +596,18 @@ pub fn generate_task_xml(
         .map(|(cmd, args)| (xml_escape(&cmd), xml_escape(&args)))
         .expect("argv always has a command");
 
+    // #410: ownership marker — the only registration-info slot Task
+    // Scheduler keeps verbatim and hands back on `/Query /XML`.
+    let description = format!(
+        "{}{}",
+        crate::scheduler::reconcile::TASK_DESCRIPTION_PREFIX,
+        ctx.vault_path.to_string_lossy()
+    );
+
     Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n\
          <Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n\
-         \x20 <RegistrationInfo><Description>OneBrain scheduled entry</Description></RegistrationInfo>\n\
+         \x20 <RegistrationInfo><Description>{}</Description></RegistrationInfo>\n\
          \x20 <Triggers>\n{triggers}  </Triggers>\n\
          \x20 <Principals>\n\
          \x20   <Principal id=\"Author\">\n\
@@ -618,7 +626,9 @@ pub fn generate_task_xml(
          \x20   <Exec><Command>{}</Command><Arguments>{}</Arguments></Exec>\n\
          \x20 </Actions>\n\
          </Task>\n",
-        arguments.0, arguments.1
+        xml_escape(&description),
+        arguments.0,
+        arguments.1
     ))
 }
 
@@ -1191,5 +1201,32 @@ mod tests {
             generate_task_xml(&daily_entry(), &ctx).unwrap(),
             generate_task_xml(&daily_entry(), &ctx).unwrap()
         );
+    }
+
+    /// #410: Task Scheduler XML has no environment element (`ExecAction`
+    /// admits Command/Arguments/WorkingDirectory only), so the ownership
+    /// marker rides in `<Description>` — visible as "Comment" in the UI, and
+    /// read back by the reconcile parser. Foreign command included: that is
+    /// the shape `--vault` argv never covers.
+    #[test]
+    fn task_xml_description_carries_the_vault_marker() {
+        let mut ctx = ctx_with_cli(r"C:\bin\onebrain.exe");
+        ctx.vault_path = std::path::PathBuf::from(r"C:\My & Vault\ob");
+        for entry in [
+            entry_cron("0 9 * * *"),
+            crate::scheduler::test_support::foreign_command_entry(),
+        ] {
+            let xml = generate_task_xml(&entry, &ctx).unwrap();
+            assert!(
+                xml.contains(
+                    r"<Description>OneBrain scheduled entry for vault C:\My &amp; Vault\ob</Description>"
+                ),
+                "{xml}"
+            );
+            assert_eq!(
+                crate::scheduler::reconcile::owner_from_task_xml(&xml),
+                crate::scheduler::reconcile::Ownership::Vault(ctx.vault_path.clone())
+            );
+        }
     }
 }
