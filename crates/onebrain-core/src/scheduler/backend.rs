@@ -614,6 +614,9 @@ mod imp {
             .into_iter()
             .filter_map(|name| {
                 let label = name.strip_prefix("\\OneBrain\\")?.to_string();
+                if label.is_empty() {
+                    return None;
+                }
                 let owner = owner_of(&label, ctx);
                 Some(InstalledArtifact { label, owner })
             })
@@ -978,6 +981,7 @@ mod tests {
             owner_of("weekly", &ctx),
             Ownership::Vault("/v/other".into())
         );
+        assert_eq!(owner_of("missing", &ctx), Ownership::Unknown);
     }
 
     #[cfg(all(unix, not(target_os = "macos")))]
