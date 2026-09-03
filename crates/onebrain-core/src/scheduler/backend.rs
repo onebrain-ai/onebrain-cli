@@ -46,6 +46,30 @@ pub fn is_installed(
     imp::is_installed(label_safe, ctx)
 }
 
+/// Every artifact this backend can see under the OneBrain namespace, with
+/// what each says about its owner (#410). Sorted by label. A missing
+/// artifact directory is an empty list, not an error; an unreadable or
+/// unparseable artifact is `Ownership::Unknown`, not an error — only a
+/// failure to enumerate at all (an unreadable directory, a scheduler query
+/// that will not run) surfaces, and the caller degrades to "could not scan".
+pub fn list_installed(
+    ctx: &SchedulerContext,
+) -> Result<Vec<crate::scheduler::reconcile::InstalledArtifact>, SchedulerError> {
+    let mut out = imp::list_installed(ctx)?;
+    out.sort_by(|a, b| a.label.cmp(&b.label));
+    Ok(out)
+}
+
+/// What one installed artifact says about its owner. `Unknown` when it is
+/// absent or unreadable — the conservative answer, since Unknown is never
+/// deleted.
+pub fn owner_of(
+    label_safe: &str,
+    ctx: &SchedulerContext,
+) -> crate::scheduler::reconcile::Ownership {
+    imp::owner_of(label_safe, ctx)
+}
+
 /// Human-readable name of the active backend, for help text and diagnostics.
 pub fn describe() -> &'static str {
     imp::describe()
@@ -202,6 +226,44 @@ mod imp {
         })
     }
 
+    use crate::scheduler::reconcile::{owner_from_plist, InstalledArtifact, Ownership};
+
+    pub fn list_installed(
+        ctx: &SchedulerContext,
+    ) -> Result<Vec<InstalledArtifact>, SchedulerError> {
+        let dir = ctx.homedir.join("Library/LaunchAgents");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(label) = name
+                .strip_prefix("com.onebrain.")
+                .and_then(|s| s.strip_suffix(".plist"))
+            else {
+                continue;
+            };
+            if label.is_empty() {
+                continue;
+            }
+            out.push(InstalledArtifact {
+                label: label.to_string(),
+                owner: owner_of(label, ctx),
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn owner_of(label_safe: &str, ctx: &SchedulerContext) -> Ownership {
+        std::fs::read_to_string(plist_path(label_safe, &ctx.homedir))
+            .map(|t| owner_from_plist(&t))
+            .unwrap_or(Ownership::Unknown)
+    }
+
     pub fn describe() -> &'static str {
         "launchd"
     }
@@ -331,6 +393,47 @@ mod imp {
                 InstallState::Absent
             },
         )
+    }
+
+    use crate::scheduler::reconcile::{owner_from_service_unit, InstalledArtifact, Ownership};
+
+    pub fn list_installed(
+        ctx: &SchedulerContext,
+    ) -> Result<Vec<InstalledArtifact>, SchedulerError> {
+        let dir = unit_dir(&ctx.homedir);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(label) = name
+                .strip_prefix("onebrain-")
+                .and_then(|s| s.strip_suffix(".timer"))
+            else {
+                continue;
+            };
+            if label.is_empty() {
+                continue;
+            }
+            out.push(InstalledArtifact {
+                label: label.to_string(),
+                owner: owner_of(label, ctx),
+            });
+        }
+        Ok(out)
+    }
+
+    /// The marker lives in the `.service` half of the pair.
+    pub fn owner_of(label_safe: &str, ctx: &SchedulerContext) -> Ownership {
+        let service =
+            unit_dir(&ctx.homedir).join(format!("{}.service", unit_base_name(label_safe)));
+        std::fs::read_to_string(service)
+            .map(|t| owner_from_service_unit(&t))
+            .unwrap_or(Ownership::Unknown)
     }
 
     pub fn describe() -> &'static str {
@@ -474,6 +577,61 @@ mod imp {
             }
             Ok(_) => Ok(InstallState::Absent),
             Err(_) => Ok(InstallState::Absent),
+        }
+    }
+
+    use crate::scheduler::reconcile::{
+        owner_from_task_xml, task_names_from_csv, InstalledArtifact, Ownership,
+    };
+
+    /// `schtasks /Query /FO CSV /NH` lists every task; keep the `\OneBrain\`
+    /// folder and ask each for its XML. With activation disabled (the test
+    /// harness) nothing is installed by definition, matching `remove` and
+    /// `is_installed` above.
+    pub fn list_installed(
+        ctx: &SchedulerContext,
+    ) -> Result<Vec<InstalledArtifact>, SchedulerError> {
+        if activation_disabled() {
+            return Ok(Vec::new());
+        }
+        let out = Command::new("schtasks")
+            .args(["/Query", "/FO", "CSV", "/NH"])
+            .output()
+            .map_err(|e| SchedulerError::BackendCommand {
+                command: "schtasks /Query /FO CSV /NH".to_string(),
+                status: "spawn failed".to_string(),
+                stderr: e.to_string(),
+            })?;
+        if !out.status.success() {
+            return Err(SchedulerError::BackendCommand {
+                command: "schtasks /Query /FO CSV /NH".to_string(),
+                status: out.status.to_string(),
+                stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+            });
+        }
+        let names = task_names_from_csv(&String::from_utf8_lossy(&out.stdout));
+        Ok(names
+            .into_iter()
+            .filter_map(|name| {
+                let label = name.strip_prefix("\\OneBrain\\")?.to_string();
+                let owner = owner_of(&label, ctx);
+                Some(InstalledArtifact { label, owner })
+            })
+            .collect())
+    }
+
+    pub fn owner_of(label_safe: &str, ctx: &SchedulerContext) -> Ownership {
+        let _ = ctx;
+        if activation_disabled() {
+            return Ownership::Unknown;
+        }
+        let name = task_name(label_safe);
+        match Command::new("schtasks")
+            .args(["/Query", "/TN", &name, "/XML"])
+            .output()
+        {
+            Ok(o) if o.status.success() => owner_from_task_xml(&String::from_utf8_lossy(&o.stdout)),
+            _ => Ownership::Unknown,
         }
     }
 
@@ -696,5 +854,137 @@ mod tests {
         let b = test_support::daily_command_entry();
         assert_eq!(artifact_key(&a, &ctx), artifact_key(&a, &ctx));
         assert_ne!(artifact_key(&a, &ctx), artifact_key(&b, &ctx));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn list_installed_reads_every_onebrain_plist_and_classifies_its_owner() {
+        use crate::scheduler::launchd::generate_plist;
+        use crate::scheduler::reconcile::{InstalledArtifact, Ownership};
+        use crate::scheduler::test_support::{ctx_in, daily_entry, entry_labelled};
+        let home = tempfile::tempdir().unwrap();
+        let agents = home.path().join("Library/LaunchAgents");
+        std::fs::create_dir_all(&agents).unwrap();
+        let ctx = ctx_in(home.path()); // vault_path = /v/ob-1
+        let mut other = ctx_in(home.path());
+        other.vault_path = std::path::PathBuf::from("/v/other");
+
+        std::fs::write(
+            agents.join("com.onebrain.daily.plist"),
+            generate_plist(&daily_entry(), &ctx).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            agents.join("com.onebrain.weekly.plist"),
+            generate_plist(&entry_labelled("weekly"), &other).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            agents.join("com.onebrain.legacy.plist"),
+            "<!-- stale pre-#116 plist -->",
+        )
+        .unwrap();
+        std::fs::write(agents.join("com.example.other.plist"), "not ours").unwrap();
+        std::fs::write(agents.join("README.txt"), "ignored").unwrap();
+
+        let installed = list_installed(&ctx).unwrap();
+        assert_eq!(
+            installed,
+            vec![
+                InstalledArtifact {
+                    label: "daily".into(),
+                    owner: Ownership::Vault("/v/ob-1".into())
+                },
+                InstalledArtifact {
+                    label: "legacy".into(),
+                    owner: Ownership::Unknown
+                },
+                InstalledArtifact {
+                    label: "weekly".into(),
+                    owner: Ownership::Vault("/v/other".into())
+                },
+            ]
+        );
+        assert_eq!(
+            owner_of("weekly", &ctx),
+            Ownership::Vault("/v/other".into())
+        );
+        assert_eq!(owner_of("missing", &ctx), Ownership::Unknown);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn list_installed_with_no_launch_agents_dir_is_empty_not_an_error() {
+        let home = tempfile::tempdir().unwrap();
+        let ctx = crate::scheduler::test_support::ctx_in(home.path());
+        assert!(list_installed(&ctx).unwrap().is_empty());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn list_installed_reads_every_onebrain_timer_and_classifies_its_owner() {
+        use crate::scheduler::reconcile::{InstalledArtifact, Ownership};
+        use crate::scheduler::systemd::{generate_service_unit, generate_timer_unit, unit_dir};
+        use crate::scheduler::test_support::{ctx_in, daily_entry, entry_labelled};
+        let home = tempfile::tempdir().unwrap();
+        let dir = unit_dir(home.path());
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = ctx_in(home.path());
+        let mut other = ctx_in(home.path());
+        other.vault_path = std::path::PathBuf::from("/v/other");
+
+        std::fs::write(
+            dir.join("onebrain-daily.timer"),
+            generate_timer_unit(&daily_entry(), &ctx),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("onebrain-daily.service"),
+            generate_service_unit(&daily_entry(), &ctx).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("onebrain-weekly.timer"),
+            generate_timer_unit(&entry_labelled("weekly"), &other),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("onebrain-weekly.service"),
+            generate_service_unit(&entry_labelled("weekly"), &other).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("onebrain-orphan-timer.timer"), "[Timer]\n").unwrap(); // no .service → Unknown
+        std::fs::write(dir.join("other-thing.timer"), "[Timer]\n").unwrap();
+
+        let installed = list_installed(&ctx).unwrap();
+        assert_eq!(
+            installed,
+            vec![
+                InstalledArtifact {
+                    label: "daily".into(),
+                    owner: Ownership::Vault("/v/ob-1".into())
+                },
+                InstalledArtifact {
+                    label: "orphan-timer".into(),
+                    owner: Ownership::Unknown
+                },
+                InstalledArtifact {
+                    label: "weekly".into(),
+                    owner: Ownership::Vault("/v/other".into())
+                },
+            ]
+        );
+        assert_eq!(
+            owner_of("weekly", &ctx),
+            Ownership::Vault("/v/other".into())
+        );
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn list_installed_with_no_unit_dir_is_empty_not_an_error() {
+        let home = tempfile::tempdir().unwrap();
+        let ctx = crate::scheduler::test_support::ctx_in(home.path());
+        assert!(list_installed(&ctx).unwrap().is_empty());
     }
 }

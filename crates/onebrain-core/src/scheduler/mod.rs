@@ -45,7 +45,8 @@ pub mod xml;
 pub mod test_support;
 
 pub use backend::{
-    artifact_key, describe, ensure_log_dir, install, is_installed, remove, InstallState,
+    artifact_key, describe, ensure_log_dir, install, is_installed, list_installed, owner_of,
+    remove, InstallState,
 };
 pub use context::SchedulerContext;
 pub use cron_parse::{
