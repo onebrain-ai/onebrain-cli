@@ -15,6 +15,18 @@ pub fn escape(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
+/// Inverse of [`escape`], for reading our own artifacts back.
+///
+/// `&amp;` is decoded LAST for the mirror-image reason `escape` encodes it
+/// first: decoding it earlier would let the `&lt;` it produces be decoded a
+/// second time.
+pub fn unescape(s: &str) -> String {
+    s.replace("&quot;", "\"")
+        .replace("&gt;", ">")
+        .replace("&lt;", "<")
+        .replace("&amp;", "&")
+}
+
 #[cfg(test)]
 mod tests {
     use super::escape;
@@ -45,5 +57,25 @@ mod tests {
             escape("/Users/u/Library/Logs/onebrain"),
             "/Users/u/Library/Logs/onebrain"
         );
+    }
+
+    use super::unescape;
+
+    #[test]
+    fn unescape_reverses_escape_for_every_sensitive_char() {
+        let raw = "<a href=\"x\">&</a>";
+        assert_eq!(unescape(&escape(raw)), raw);
+    }
+
+    #[test]
+    fn unescape_handles_amp_last_so_a_literal_entity_survives() {
+        // `&amp;lt;` is the escape of the four-character text `&lt;`; decoding
+        // `&amp;` first would turn it into `<` — one decode too many.
+        assert_eq!(unescape("&amp;lt;"), "&lt;");
+    }
+
+    #[test]
+    fn unescape_leaves_ordinary_text_untouched() {
+        assert_eq!(unescape("/Users/u/vault"), "/Users/u/vault");
     }
 }

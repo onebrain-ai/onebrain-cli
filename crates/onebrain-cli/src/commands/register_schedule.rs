@@ -16,9 +16,9 @@
 use anyhow::{anyhow, Context, Result};
 use onebrain_core::scheduler::backend;
 use onebrain_core::scheduler::{
-    self, is_command_mode, is_one_shot, is_skill_mode, label_for_entry, validate_at, validate_cron,
-    validate_entry, Args, ScheduleConfig, ScheduleEntry, SchedulerContext, SchedulerError,
-    SkillFrontmatter,
+    self, is_command_mode, is_one_shot, is_skill_mode, label_for_entry, normalize_path,
+    validate_at, validate_cron, validate_entry, Args, ScheduleConfig, ScheduleEntry,
+    SchedulerContext, SchedulerError, SkillFrontmatter,
 };
 use std::collections::HashMap;
 use std::env;
@@ -443,22 +443,6 @@ pub fn resolve_command_binary(name: &str, vault_root: Option<&Path>) -> Result<S
         Ok(p) if p.exists() => Ok(p.display().to_string()),
         _ => Err(anyhow!(SchedulerError::CommandNotFoundInPath(name.into()))),
     }
-}
-
-/// Lexical path normalization (no symlink resolution, no disk touch).
-/// Equivalent to Node's `path.resolve` after the base is applied.
-fn normalize_path(p: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for c in p.components() {
-        match c {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 pub(crate) fn build_scheduler_context(vault: &Path) -> Result<SchedulerContext> {
@@ -1091,26 +1075,6 @@ mod tests {
         } else {
             "sh"
         }
-    }
-
-    #[test]
-    fn normalize_path_strips_curdir_and_pops_parentdir() {
-        let p = normalize_path(Path::new("/a/b/./c/../d"));
-        assert_eq!(p, PathBuf::from("/a/b/d"));
-    }
-
-    // Additional normalize_path branches
-    #[test]
-    fn normalize_path_parent_dir_pops_prefix() {
-        // ../x relative to /a/b should yield /a/x
-        let p = normalize_path(Path::new("/a/b/../x"));
-        assert_eq!(p, PathBuf::from("/a/x"));
-    }
-
-    #[test]
-    fn normalize_path_plain_absolute_unchanged() {
-        let p = normalize_path(Path::new("/usr/local/bin/foo"));
-        assert_eq!(p, PathBuf::from("/usr/local/bin/foo"));
     }
 
     #[test]
