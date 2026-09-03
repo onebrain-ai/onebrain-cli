@@ -27,6 +27,11 @@ expression: out
         <key>Hour</key>
         <integer>9</integer>
     </dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ONEBRAIN_VAULT</key>
+        <string>/Users/test/vault</string>
+    </dict>
     <key>RunAtLoad</key>
     <false/>
 </dict>

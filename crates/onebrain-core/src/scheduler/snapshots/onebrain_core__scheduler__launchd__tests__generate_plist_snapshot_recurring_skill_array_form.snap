@@ -47,6 +47,11 @@ expression: out
             <integer>18</integer>
         </dict>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ONEBRAIN_VAULT</key>
+        <string>/Users/test/vault</string>
+    </dict>
     <key>RunAtLoad</key>
     <false/>
 </dict>

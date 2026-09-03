@@ -599,6 +599,21 @@ pub fn generate_plist(
         String::new()
     };
 
+    // #410: the ownership marker. Every artifact names the vault that
+    // installed it, so a later `register` can prune by OWNERSHIP rather than
+    // by name (the v3.4.21 ledger deleted another vault's live job on a name
+    // match). `ONEBRAIN_VAULT` is a real CLI setting — meaningful to
+    // onebrain commands, inert to foreign binaries such as rsync.
+    let marker = format!(
+        "\x20   <key>EnvironmentVariables</key>\n\
+         \x20   <dict>\n\
+         \x20       <key>{}</key>\n\
+         \x20       <string>{}</string>\n\
+         \x20   </dict>\n",
+        crate::scheduler::reconcile::VAULT_ENV_KEY,
+        xml_escape(&ctx.vault_path.to_string_lossy()),
+    );
+
     Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -612,6 +627,7 @@ pub fn generate_plist(
          \x20   </array>\n\
          {}\n\
          {redirect}\
+         {marker}\
          \x20   <key>RunAtLoad</key>\n\
          \x20   <false/>\n\
          </dict>\n\
@@ -661,6 +677,21 @@ mod tests {
             args: Some(Args::List(args.iter().map(|s| s.to_string()).collect())),
             ..Default::default()
         }
+    }
+
+    /// The `<key>ProgramArguments</key><array>…</array>` slice of a rendered
+    /// plist — used to scope assertions about argv content away from the
+    /// #410 `EnvironmentVariables` ownership marker, which also carries the
+    /// ctx vault path (by design, unconditionally) elsewhere in the document.
+    fn program_arguments_block(out: &str) -> &str {
+        let after_key = out
+            .split_once("<key>ProgramArguments</key>")
+            .expect("plist always has ProgramArguments")
+            .1;
+        after_key
+            .split_once("</array>")
+            .expect("ProgramArguments array always closes")
+            .0
     }
 
     #[test]
@@ -1127,9 +1158,13 @@ mod tests {
             1,
             "exactly one --vault (the user's), no appended duplicate, out:\n{out}"
         );
-        // The appended ctx vault path must NOT be present — only the user's.
-        assert!(!out.contains("<string>/Users/test/vault</string>"));
-        assert!(out.contains("<string>/other/vault</string>"));
+        // The appended ctx vault path must NOT be present in ProgramArguments
+        // — only the user's. (It legitimately appears elsewhere, in the #410
+        // EnvironmentVariables ownership marker — that block always carries
+        // ctx.vault_path regardless of the command's own --vault argv.)
+        let program_args = program_arguments_block(&out);
+        assert!(!program_args.contains("<string>/Users/test/vault</string>"));
+        assert!(program_args.contains("<string>/other/vault</string>"));
     }
 
     #[test]
@@ -1143,8 +1178,11 @@ mod tests {
                 ..Default::default()
             };
             let out = generate_plist(&e, &test_ctx()).unwrap();
+            // Scoped to ProgramArguments — see the comment in
+            // `onebrain_recurring_command_with_explicit_vault_arg_not_doubled`
+            // on why the ctx vault path legitimately appears elsewhere.
             assert!(
-                !out.contains("<string>/Users/test/vault</string>"),
+                !program_arguments_block(&out).contains("<string>/Users/test/vault</string>"),
                 "explicit vault flag `{arg}` should suppress the appended \
                  ctx vault, out:\n{out}"
             );
@@ -1579,8 +1617,9 @@ mod tests {
         assert!(out.contains("<key>Weekday</key>\n            <integer>3</integer>"));
         assert!(out.contains("<key>Weekday</key>\n            <integer>5</integer>"));
         let dict_count = out.matches("<dict>").count();
-        // 1 top-level <dict> (the plist root) + 3 StartCalendarInterval dicts.
-        assert_eq!(dict_count, 4, "out:\n{out}");
+        // 1 top-level <dict> (the plist root) + 3 StartCalendarInterval dicts
+        // + 1 #410 EnvironmentVariables ownership marker dict.
+        assert_eq!(dict_count, 5, "out:\n{out}");
     }
 
     #[test]
@@ -1630,5 +1669,45 @@ mod tests {
         assert!(out.contains("<key>Day</key>\n            <integer>15</integer>"));
         // No Weekday key at all — day-of-month is the only restricted field.
         assert!(!out.contains("<key>Weekday</key>"));
+    }
+
+    /// #410: every artifact says which vault installed it, so a later
+    /// `register` can prune it by OWNERSHIP rather than by name. All four
+    /// block shapes (recurring/one-shot × skill/command) — the one-shot
+    /// `/bin/sh -c` wrapper inherits the env var like any child.
+    #[test]
+    fn every_plist_shape_carries_the_vault_marker() {
+        let ctx = test_ctx_with_vault("/Users/test/My & Vault");
+        let shapes = [
+            skill_entry("daily", "0 9 * * *"),
+            command_entry("/usr/bin/rsync", &["-av", "/a", "/b"], "0 5 * * *"),
+            ScheduleEntry {
+                at: Some("2026-08-01 09:00".into()),
+                skill: Some("/daily".into()),
+                ..Default::default()
+            },
+            ScheduleEntry {
+                at: Some("2026-08-01 09:00".into()),
+                command: Some("/usr/bin/rsync".into()),
+                args: Some(Args::List(vec!["-av".into()])),
+                ..Default::default()
+            },
+        ];
+        for entry in shapes {
+            let out = generate_plist(&entry, &ctx).unwrap();
+            assert!(
+                out.contains(
+                    "    <key>EnvironmentVariables</key>\n    <dict>\n        <key>ONEBRAIN_VAULT</key>\n        <string>/Users/test/My &amp; Vault</string>\n    </dict>\n    <key>RunAtLoad</key>"
+                ),
+                "marker missing or misplaced:\n{out}"
+            );
+            assert_eq!(
+                crate::scheduler::reconcile::owner_from_plist(&out),
+                crate::scheduler::reconcile::Ownership::Vault(PathBuf::from(
+                    "/Users/test/My & Vault"
+                )),
+                "the marker must read back through the reconcile parser"
+            );
+        }
     }
 }
