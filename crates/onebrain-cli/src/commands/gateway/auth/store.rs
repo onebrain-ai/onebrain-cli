@@ -492,6 +492,10 @@ impl AuthStore {
     /// `issue_token_pair` / `rotate_refresh` take NO lock — only the inner
     /// `*_for_resource` / `*_for_client` bodies do.
     pub(crate) fn lock_exclusive(&self) -> Result<StoreLock> {
+        // The gateway dir may have been deleted while `gateway run` is up;
+        // recreate it (as `write_json_atomic` does) rather than failing every
+        // mutator until a restart.
+        ensure_private_dir(&self.root)?;
         let path = self.lock_path();
         let mut opts = std::fs::OpenOptions::new();
         opts.create(true).write(true).truncate(false);
@@ -2179,6 +2183,16 @@ mod tests {
     /// themselves: the lock is not re-entrant, so a locked wrapper would
     /// block forever on its own inner call. A watchdog turns that hang into
     /// a failure instead of a stuck test run.
+    #[test]
+    fn a_mutator_recreates_a_deleted_gateway_dir() {
+        let (_dir, store) = open_temp();
+        std::fs::remove_dir_all(&store.root).unwrap();
+        store
+            .issue_token_pair("c1", "brain")
+            .expect("mutator must heal a deleted gateway dir");
+        assert!(store.root.join("auth.lock").exists());
+    }
+
     #[test]
     fn token_wrappers_do_not_deadlock_on_the_inner_lock() {
         let (_dir, store) = open_temp();

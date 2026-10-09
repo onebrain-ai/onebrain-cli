@@ -1683,12 +1683,18 @@ fn issue_pair_for_consumed_code(store: &AuthStore, auth_code: &super::auth::Auth
             match store.get_client(&auth_code.client_id) {
                 Ok(Some(_)) => {}
                 Ok(None) => {
-                    let _ = store.revoke_family(&refresh.family);
+                    if let Err(e) = store.revoke_family(&refresh.family) {
+                        tracing::warn!(error = %e, client_id = %auth_code.client_id,
+                            "failed to revoke family after client re-check");
+                    }
                     return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "client re-check failed during /token");
-                    let _ = store.revoke_family(&refresh.family);
+                    if let Err(e) = store.revoke_family(&refresh.family) {
+                        tracing::warn!(error = %e, client_id = %auth_code.client_id,
+                            "failed to revoke family after client re-check");
+                    }
                     return oauth_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "server_error",

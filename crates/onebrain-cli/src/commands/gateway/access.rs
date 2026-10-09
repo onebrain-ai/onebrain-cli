@@ -95,8 +95,8 @@ fn store_unreadable() -> HintedError {
 
 fn store_unwritable() -> HintedError {
     HintedError::new(
-        "couldn't update the gateway auth store — nothing was changed",
-        "check permissions on `~/.onebrain/gateway`, then retry",
+        "the gateway auth store could not be read or updated",
+        "check `~/.onebrain/gateway` is readable and writable, then retry (a re-run is safe)",
     )
 }
 
