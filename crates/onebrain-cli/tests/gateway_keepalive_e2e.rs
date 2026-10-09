@@ -108,6 +108,9 @@ struct Sandbox {
     _root: TempDir,
     home: PathBuf,
     vault: TempDir,
+    // Read only by the unix-only SIGTERM test; elsewhere it is held purely
+    // so its drop kills the gateway.
+    #[cfg_attr(not(unix), allow(dead_code))]
     child: KillOnDrop,
     mcp_url: String,
     approvals_url: String,
@@ -286,6 +289,7 @@ fn join_within(reader: JoinHandle<Vec<Timed>>, limit: Duration) -> Vec<Timed> {
 
 /// Wait up to `limit` for `child` to exit; panic otherwise. Used by the
 /// shutdown tests (Tasks 3/4).
+#[cfg(unix)]
 fn wait_exit(child: &mut std::process::Child, limit: Duration) -> std::process::ExitStatus {
     let deadline = Instant::now() + limit;
     loop {

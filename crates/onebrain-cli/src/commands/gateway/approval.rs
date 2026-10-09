@@ -377,7 +377,7 @@ impl Approvals {
     }
 
     /// Whether `id` currently has an attached prompt process.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub fn has_prompt(&self, id: &str) -> bool {
         let prompts = self.prompts.lock().unwrap_or_else(|e| e.into_inner());
         prompts.contains_key(id)
