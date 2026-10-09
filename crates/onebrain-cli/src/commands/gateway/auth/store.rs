@@ -1295,27 +1295,6 @@ fn read_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T>
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn check_files_parse_is_read_only_and_names_the_broken_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("gateway");
-        check_files_parse(&root).unwrap();
-        assert!(!root.exists(), "a health check must not create the store");
-        std::fs::create_dir_all(&root).unwrap();
-        for file in ["clients.json", "codes.json", "tokens.json", "pairing.json"] {
-            std::fs::write(root.join(file), b"{ broken").unwrap();
-            assert!(
-                format!("{:#}", check_files_parse(&root).unwrap_err()).contains(file),
-                "{file}"
-            );
-            std::fs::remove_file(root.join(file)).unwrap();
-        }
-        assert!(
-            !root.join("auth.lock").exists(),
-            "a health check must not take the lock"
-        );
-    }
     use super::*;
 
     fn open_temp() -> (tempfile::TempDir, AuthStore) {
@@ -1342,6 +1321,27 @@ mod tests {
         store.register_client(client("b")).unwrap();
         store.register_client(client("a")).unwrap(); // overwrite, not a new entry
         assert_eq!(store.client_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn check_files_parse_is_read_only_and_names_the_broken_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("gateway");
+        check_files_parse(&root).unwrap();
+        assert!(!root.exists(), "a health check must not create the store");
+        std::fs::create_dir_all(&root).unwrap();
+        for file in ["clients.json", "codes.json", "tokens.json", "pairing.json"] {
+            std::fs::write(root.join(file), b"{ broken").unwrap();
+            assert!(
+                format!("{:#}", check_files_parse(&root).unwrap_err()).contains(file),
+                "{file}"
+            );
+            std::fs::remove_file(root.join(file)).unwrap();
+        }
+        assert!(
+            !root.join("auth.lock").exists(),
+            "a health check must not take the lock"
+        );
     }
 
     // ── Clients ──────────────────────────────────────────────────────────

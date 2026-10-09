@@ -205,8 +205,7 @@ fn resolve_issuer(public_url: Option<&str>, bound: SocketAddr) -> String {
 }
 
 /// Every check `gateway run` refuses to start on — shared with
-/// `service install` and `doctor` so all three agree. (T1 may have added
-/// host-guard checks next to the `public_url` one; move them in here too.)
+/// `service install` and `doctor` so all three agree.
 pub(crate) fn validate_gateway_config(config: &GatewayConfig) -> anyhow::Result<()> {
     if let Some(url) = config.public_url.as_deref() {
         if let Err(reason) = validate_public_url(url) {

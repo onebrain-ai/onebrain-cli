@@ -333,7 +333,7 @@ pub(crate) fn run_tunnel_setup(
             "Note: gateway.yml was reformatted and its comments dropped."
         )?;
     }
-    if !token_file_supported {
+    if !token_file_supported && host.service_supported() {
         writeln!(
             out,
             "Note: this cloudflared has no --token-file; the service will pass the token in its \
@@ -356,12 +356,25 @@ pub(crate) fn run_tunnel_setup(
             "Next, keep these two running (restart a running `gateway run` so it picks up public_url):"
         )?;
         writeln!(out, "  onebrain gateway run")?;
-        writeln!(
-            out,
-            "  {} tunnel --no-autoupdate --protocol http2 run --token-file {}",
-            cloudflared.display(),
-            token_path.display()
-        )?;
+        if token_file_supported {
+            writeln!(
+                out,
+                "  {} tunnel --no-autoupdate --protocol http2 run --token-file {}",
+                cloudflared.display(),
+                token_path.display()
+            )?;
+        } else {
+            writeln!(
+                out,
+                "  (this cloudflared has no --token-file; `brew upgrade cloudflared` or the system package manager adds it)"
+            )?;
+            writeln!(
+                out,
+                "  TUNNEL_TOKEN=$(cat {}) {} tunnel --no-autoupdate --protocol http2 run",
+                token_path.display(),
+                cloudflared.display()
+            )?;
+        }
     }
     Ok(TunnelSetupOutcome {
         public_url,
@@ -682,6 +695,27 @@ mod tests {
         );
         assert!(!r.unwrap().token_file_supported);
         assert!(out.contains("brew upgrade cloudflared"), "{out}");
+    }
+
+    #[test]
+    fn old_cloudflared_off_macos_gets_a_working_manual_command_without_the_token() {
+        let root = tempfile::tempdir().unwrap();
+        let h = FakeHost {
+            help: Some("--token value".into()),
+            service: false,
+            ..host()
+        };
+        let (r, out) = run(
+            &format!("brain.example.com\n{FAKE_TOKEN}\n"),
+            &h,
+            root.path(),
+        );
+        r.unwrap();
+        assert!(!out.contains("LaunchAgent"), "{out}");
+        assert!(!out.contains("run --token-file"), "{out}");
+        assert!(out.contains("TUNNEL_TOKEN=$(cat "), "{out}");
+        assert!(out.contains("--protocol http2 run"), "{out}");
+        assert!(!out.contains(FAKE_TOKEN), "{out}");
     }
 
     #[test]

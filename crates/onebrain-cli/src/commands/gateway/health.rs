@@ -344,9 +344,11 @@ fn tunnel_row(env: &HealthEnv, cfg: &GatewayConfig) -> DoctorResult {
             CHECK_TUNNEL,
             format!("{issuer} not reachable from here ({e})"),
         )
-        .with_hint(
-            "check `onebrain gateway service status` and the Cloudflare dashboard's tunnel health",
-        ),
+        .with_hint(if env.service.is_some() {
+            "check `onebrain gateway service status` and the Cloudflare dashboard's tunnel health"
+        } else {
+            "check that the tunnel is running and the Cloudflare dashboard's tunnel health"
+        }),
         Ok(v) if v["issuer"].as_str() == Some(issuer) => {
             DoctorResult::ok(CHECK_TUNNEL, format!("{issuer} reaches this gateway"))
         }
