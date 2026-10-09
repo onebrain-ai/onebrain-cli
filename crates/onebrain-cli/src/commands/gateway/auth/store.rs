@@ -1143,7 +1143,9 @@ impl AuthStore {
     /// Remove `client_id`'s registration AND cut it off. Every token it holds
     /// is revoked (kept on disk, so `tokens list --all` still shows them until
     /// [`Self::purge_expired`] sweeps them). Every auth code issued to it is
-    /// deleted, so a code mid-flight can't mint a new pair afterwards.
+    /// deleted. This only covers what exists when it runs: the `/authorize`
+    /// and `/token` handlers re-check registration after minting a code or a
+    /// pair, which closes the window where a mint races this call.
     /// `Ok(None)` (nothing written) if no such client is registered.
     ///
     /// Write order is tokens → codes → registration. A crash part-way leaves

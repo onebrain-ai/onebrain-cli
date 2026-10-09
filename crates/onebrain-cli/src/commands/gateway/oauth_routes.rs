@@ -1398,16 +1398,11 @@ async fn authorize_post_handler(
     // auth code.
     let issued = {
         let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
-        store.issue_code(
-            &validated.client.client_id,
-            &validated.redirect_uri,
-            &validated.code_challenge,
-            &validated.resource,
-            &validated.scope,
-        )
+        issue_authorize_code(&store, &validated)
     };
     match issued {
-        Ok(auth_code) => redirect_with_code(&ctx, &validated, &auth_code.code),
+        Ok(Some(auth_code)) => redirect_with_code(&ctx, &validated, &auth_code.code),
+        Ok(None) => error_page(StatusCode::BAD_REQUEST, "unknown client_id"),
         Err(e) => {
             tracing::error!(error = %e, "failed to persist minted authorization code");
             error_page(
@@ -1416,6 +1411,32 @@ async fn authorize_post_handler(
             )
         }
     }
+}
+
+/// Mint the auth code for a validated request. `Ok(None)` = the client was
+/// removed meanwhile (the code was burned, nothing may redirect with it).
+///
+/// Validation (`get_client`) and `issue_code` are separate locked calls, so
+/// `AuthStore::remove_client` (another process) can run between them. After
+/// issuing we re-check registration: a remove AFTER the re-check deletes the
+/// new code itself, and a remove BEFORE it is caught here, so no redeemable
+/// code survives for a removed client.
+fn issue_authorize_code(
+    store: &AuthStore,
+    validated: &ValidatedAuthorize,
+) -> anyhow::Result<Option<super::auth::AuthCode>> {
+    let auth_code = store.issue_code(
+        &validated.client.client_id,
+        &validated.redirect_uri,
+        &validated.code_challenge,
+        &validated.resource,
+        &validated.scope,
+    )?;
+    if store.get_client(&validated.client.client_id)?.is_none() {
+        let _ = store.consume_code(&auth_code.code);
+        return Ok(None);
+    }
+    Ok(Some(auth_code))
 }
 
 /// The `/authorize` GET+POST route as its own small `Router` — mirrors
@@ -2302,6 +2323,42 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    #[test]
+    fn authorize_burns_the_code_when_the_client_was_removed_before_the_recheck() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::open_at(dir.path().join("auth")).unwrap();
+        let client = RegisteredClient {
+            client_id: "c1".to_string(),
+            client_name: None,
+            redirect_uris: vec!["https://cb".to_string()],
+            application_type: AppType::Web,
+            created: 0,
+        };
+        store.register_client(client.clone()).unwrap();
+        let validated = ValidatedAuthorize {
+            client,
+            redirect_uri: "https://cb".to_string(),
+            code_challenge: "chal".to_string(),
+            resource: "res".to_string(),
+            scope: "brain".to_string(),
+            state: None,
+        };
+        // Interleaving: the client is already gone when issue_code runs
+        // (validation had passed before the remove).
+        store.remove_client("c1").unwrap().unwrap();
+        assert!(issue_authorize_code(&store, &validated).unwrap().is_none());
+        // The freshly issued code must not be redeemable.
+        let raw = std::fs::read_to_string(dir.path().join("auth").join("codes.json")).unwrap();
+        let codes: Value = serde_json::from_str(&raw).unwrap();
+        let redeemable = codes
+            .as_object()
+            .unwrap()
+            .values()
+            .filter(|c| c["used"] == json!(false))
+            .count();
+        assert_eq!(redeemable, 0, "no redeemable code may survive");
     }
 
     #[test]
