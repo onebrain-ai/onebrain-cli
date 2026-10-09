@@ -359,9 +359,15 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
         .context("build tokio runtime for gateway")?;
 
     let serve = async move {
+        // Registered HERE, before the listener binds: `on_bind` prints the
+        // "gateway listening" line and a supervisor may signal right after
+        // it, but the shutdown future is first polled only inside the task
+        // axum spawns later — a lazy registration would leave SIGTERM at its
+        // default disposition (kill) in that window.
+        let signal = shutdown_signal();
         let (tx, rx) = tokio::sync::watch::channel(None);
         let shutdown = async move {
-            let which = shutdown_signal().await;
+            let which = signal.await;
             tracing::info!("{which} received; shutting down gateway");
             // Hub ruling: answer every waiting approval with a denial NOW,
             // so its call ends cleanly on its own stream (and Telegram /
@@ -469,28 +475,54 @@ fn block_on_bounded<F: std::future::Future>(
     out
 }
 
-/// Resolves on Ctrl-C, or — on Unix — SIGTERM (what launchd sends to stop
-/// an agent). Returns which one, for the log line.
-async fn shutdown_signal() -> &'static str {
+/// A future that resolves on Ctrl-C, or — on Unix — SIGTERM (what launchd
+/// sends to stop an agent), yielding which one for the log line. Not an
+/// `async fn`: on Unix both handlers are installed NOW, when this is called
+/// (inside the runtime), not when the future is first polled — see the call
+/// site in [`run`].
+fn shutdown_signal() -> impl std::future::Future<Output = &'static str> {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
-        match signal(SignalKind::terminate()) {
-            Ok(mut term) => tokio::select! {
-                _ = tokio::signal::ctrl_c() => "Ctrl-C",
-                _ = term.recv() => "SIGTERM",
-            },
-            Err(e) => {
+        let term = signal(SignalKind::terminate())
+            .map_err(|e| {
                 tracing::warn!(error = %e, "could not install a SIGTERM handler; Ctrl-C only");
-                let _ = tokio::signal::ctrl_c().await;
-                "Ctrl-C"
+            })
+            .ok();
+        let interrupt = signal(SignalKind::interrupt())
+            .map_err(|e| tracing::warn!(error = %e, "could not install a SIGINT handler"))
+            .ok();
+        async move {
+            let on_term = async {
+                match term {
+                    Some(mut term) => {
+                        term.recv().await;
+                    }
+                    None => std::future::pending().await,
+                }
+            };
+            let on_interrupt = async {
+                match interrupt {
+                    Some(mut interrupt) => {
+                        interrupt.recv().await;
+                    }
+                    None => {
+                        let _ = tokio::signal::ctrl_c().await;
+                    }
+                }
+            };
+            tokio::select! {
+                _ = on_interrupt => "Ctrl-C",
+                _ = on_term => "SIGTERM",
             }
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
-        "Ctrl-C"
+        async {
+            let _ = tokio::signal::ctrl_c().await;
+            "Ctrl-C"
+        }
     }
 }
 
