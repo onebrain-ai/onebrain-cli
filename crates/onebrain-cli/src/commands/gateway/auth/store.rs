@@ -164,6 +164,12 @@ pub struct TokenRecord {
     pub family: String,
     pub client_id: String,
     pub scope: String,
+    /// RFC 8707 resource this token was issued for (`{issuer}/mcp` today).
+    /// `None` on tokens minted before #404 — `#[serde(default)]` keeps every
+    /// existing `tokens.json` loading. Recorded, not yet enforced by
+    /// `require_bearer` (one resource today; see the #404 plan's hub notes).
+    #[serde(default)]
+    pub resource: Option<String>,
     pub expires: u64,
     pub revoked: bool,
     pub rotated_to: Option<String>,
@@ -183,6 +189,7 @@ impl std::fmt::Debug for TokenRecord {
             .field("family", &self.family)
             .field("client_id", &self.client_id)
             .field("scope", &self.scope)
+            .field("resource", &self.resource)
             .field("expires", &self.expires)
             .field("revoked", &self.revoked)
             .field(
@@ -431,22 +438,36 @@ impl AuthStore {
 
     // ── Tokens ───────────────────────────────────────────────────────────
 
-    /// Mint a fresh access+refresh pair (>= 32 random bytes each) sharing a
-    /// new random `family` id, with [`ACCESS_TTL_SECS`]/[`REFRESH_TTL_SECS`]
-    /// lifetimes. Persists both before returning them.
+    /// Mint a fresh access+refresh pair with no bound `resource` — see
+    /// [`Self::issue_token_pair_for_resource`].
     pub fn issue_token_pair(
         &self,
         client_id: &str,
         scope: &str,
     ) -> Result<(TokenRecord, TokenRecord)> {
+        self.issue_token_pair_for_resource(client_id, scope, None)
+    }
+
+    /// Mint a fresh access+refresh pair (>= 32 random bytes each) sharing a
+    /// new random `family` id, with [`ACCESS_TTL_SECS`]/[`REFRESH_TTL_SECS`]
+    /// lifetimes and `resource` bound onto both (RFC 8707, #404). Persists
+    /// both before returning them.
+    pub fn issue_token_pair_for_resource(
+        &self,
+        client_id: &str,
+        scope: &str,
+        resource: Option<&str>,
+    ) -> Result<(TokenRecord, TokenRecord)> {
         let family = core::mint_secret_32();
         let now = core::now_epoch_secs();
+        let resource = resource.map(str::to_string);
         let access = TokenRecord {
             token: core::mint_secret_32(),
             kind: TokenKind::Access,
             family: family.clone(),
             client_id: client_id.to_string(),
             scope: scope.to_string(),
+            resource: resource.clone(),
             expires: now + ACCESS_TTL_SECS,
             revoked: false,
             rotated_to: None,
@@ -457,6 +478,7 @@ impl AuthStore {
             family,
             client_id: client_id.to_string(),
             scope: scope.to_string(),
+            resource,
             expires: now + REFRESH_TTL_SECS,
             revoked: false,
             rotated_to: None,
@@ -497,6 +519,11 @@ impl AuthStore {
         }))
     }
 
+    /// [`Self::rotate_refresh_for_client`] with no client check.
+    pub fn rotate_refresh(&self, refresh: &str) -> Result<RotateOutcome> {
+        self.rotate_refresh_for_client(refresh, None)
+    }
+
     /// Rotate a refresh token, enforcing single-use + reuse detection. See
     /// the module docs for the full invariant and rationale; short version:
     ///
@@ -508,7 +535,16 @@ impl AuthStore {
     /// - Fresh and valid → mark it spent (`revoked = true`,
     ///   `rotated_to = Some(new_refresh)`), mint a new pair in the SAME
     ///   family → [`RotateOutcome::Rotated`].
-    pub fn rotate_refresh(&self, refresh: &str) -> Result<RotateOutcome> {
+    /// - `client_id` is `Some` and differs from the token's →
+    ///   [`RotateOutcome::Invalid`], WITHOUT spending the token (OAuth 2.1
+    ///   §4.3.1). Checked AFTER reuse detection — a replayed, already-rotated
+    ///   token still burns its family whatever client_id it arrives with —
+    ///   and before any state change otherwise.
+    pub fn rotate_refresh_for_client(
+        &self,
+        refresh: &str,
+        client_id: Option<&str>,
+    ) -> Result<RotateOutcome> {
         let mut tokens = self.load_tokens()?;
         let now = core::now_epoch_secs();
 
@@ -537,6 +573,12 @@ impl AuthStore {
             return Ok(RotateOutcome::ReuseDetected);
         }
 
+        if let Some(presented) = client_id {
+            if presented != rec.client_id {
+                return Ok(RotateOutcome::Invalid);
+            }
+        }
+
         if rec.revoked || rec.expires <= now {
             return Ok(RotateOutcome::Invalid);
         }
@@ -547,6 +589,7 @@ impl AuthStore {
             family: rec.family.clone(),
             client_id: rec.client_id.clone(),
             scope: rec.scope.clone(),
+            resource: rec.resource.clone(),
             expires: now + ACCESS_TTL_SECS,
             revoked: false,
             rotated_to: None,
@@ -557,6 +600,7 @@ impl AuthStore {
             family: rec.family.clone(),
             client_id: rec.client_id.clone(),
             scope: rec.scope.clone(),
+            resource: rec.resource.clone(),
             expires: now + REFRESH_TTL_SECS,
             revoked: false,
             rotated_to: None,
@@ -1293,6 +1337,7 @@ mod tests {
                 family: "fam".to_string(),
                 client_id: "c1".to_string(),
                 scope: "scope".to_string(),
+                resource: None,
                 expires: core::now_epoch_secs().saturating_sub(1),
                 revoked: false,
                 rotated_to: None,
@@ -1427,6 +1472,90 @@ mod tests {
         assert!(store.verify_pairing("ANYX-CODE").is_err());
     }
 
+    // ── #404 folds: resource binding + refresh client binding ─────────────
+
+    #[test]
+    fn issue_token_pair_for_resource_binds_it_and_rotation_carries_it() {
+        let (_dir, store) = open_temp();
+        let res = "http://127.0.0.1:7717/mcp";
+        let (access, refresh) = store
+            .issue_token_pair_for_resource("client1", "brain", Some(res))
+            .unwrap();
+        assert_eq!(access.resource.as_deref(), Some(res));
+        assert_eq!(refresh.resource.as_deref(), Some(res));
+        let RotateOutcome::Rotated {
+            access: a2,
+            refresh: r2,
+        } = store.rotate_refresh(&refresh.token).unwrap()
+        else {
+            panic!("expected Rotated");
+        };
+        assert_eq!(a2.resource.as_deref(), Some(res));
+        assert_eq!(r2.resource.as_deref(), Some(res));
+    }
+
+    #[test]
+    fn issue_token_pair_without_resource_leaves_it_unset() {
+        let (_dir, store) = open_temp();
+        let (access, refresh) = store.issue_token_pair("client1", "brain").unwrap();
+        assert!(access.resource.is_none());
+        assert!(refresh.resource.is_none());
+    }
+
+    /// Back-compat: a tokens.json written before `resource` existed (no key
+    /// at all) still loads, and its tokens still validate.
+    #[test]
+    fn token_record_written_before_resource_existed_still_loads() {
+        let (dir, store) = open_temp();
+        let expires = core::now_epoch_secs() + 3600;
+        let legacy = format!(
+            r#"{{"legacy-tok":{{"token":"legacy-tok","kind":"access","family":"fam","client_id":"c1","scope":"brain","expires":{expires},"revoked":false,"rotated_to":null}}}}"#
+        );
+        std::fs::write(dir.path().join("gateway").join("tokens.json"), legacy).unwrap();
+        let rec = store
+            .check_access("legacy-tok")
+            .unwrap()
+            .expect("a legacy token must still validate");
+        assert_eq!(rec.client_id, "c1");
+        assert!(rec.resource.is_none());
+    }
+
+    #[test]
+    fn rotate_refresh_for_client_rejects_another_client_without_spending_the_token() {
+        let (_dir, store) = open_temp();
+        let (_access, refresh) = store.issue_token_pair("client1", "scope").unwrap();
+        assert_eq!(
+            store
+                .rotate_refresh_for_client(&refresh.token, Some("client2"))
+                .unwrap(),
+            RotateOutcome::Invalid
+        );
+        assert!(matches!(
+            store
+                .rotate_refresh_for_client(&refresh.token, Some("client1"))
+                .unwrap(),
+            RotateOutcome::Rotated { .. }
+        ));
+    }
+
+    #[test]
+    fn rotate_refresh_for_client_still_burns_the_family_on_reuse_whatever_client_id_is_sent() {
+        let (_dir, store) = open_temp();
+        let (_a1, refresh1) = store.issue_token_pair("client1", "scope").unwrap();
+        let RotateOutcome::Rotated { access: a2, .. } =
+            store.rotate_refresh(&refresh1.token).unwrap()
+        else {
+            panic!("expected Rotated");
+        };
+        assert_eq!(
+            store
+                .rotate_refresh_for_client(&refresh1.token, Some("client2"))
+                .unwrap(),
+            RotateOutcome::ReuseDetected
+        );
+        assert!(store.check_access(&a2.token).unwrap().is_none());
+    }
+
     // ── Redacting Debug (requirement B, Task 2) ──────────────────────────
 
     #[test]
@@ -1437,6 +1566,7 @@ mod tests {
             family: "fam-123".to_string(),
             client_id: "client-9".to_string(),
             scope: "brain".to_string(),
+            resource: Some("http://127.0.0.1:7717/mcp".to_string()),
             expires: 42,
             revoked: false,
             rotated_to: Some("SUPER-SECRET-NEXT-TOKEN".to_string()),
@@ -1456,6 +1586,10 @@ mod tests {
         assert!(debug.contains("client-9"), "{debug}");
         assert!(debug.contains("brain"), "{debug}");
         assert!(debug.contains("<redacted>"), "{debug}");
+        assert!(
+            debug.contains("http://127.0.0.1:7717/mcp"),
+            "resource is non-secret and should stay visible: {debug}"
+        );
     }
 
     #[test]

@@ -1639,7 +1639,11 @@ fn token_authorization_code_grant(ctx: &AuthCtx, req: &TokenRequest) -> Response
         return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
 
-    match store.issue_token_pair(&auth_code.client_id, &auth_code.scope) {
+    match store.issue_token_pair_for_resource(
+        &auth_code.client_id,
+        &auth_code.scope,
+        Some(&auth_code.resource),
+    ) {
         Ok((access, refresh)) => {
             // Link this code to the family it minted so a LATER replay can
             // find and revoke it (see the doc comment above). Best-effort:
@@ -1663,7 +1667,7 @@ fn token_authorization_code_grant(ctx: &AuthCtx, req: &TokenRequest) -> Response
 
 /// The refresh_token grant (RFC 6749 §6). This function acquires
 /// `ctx.store.lock()` ONCE and makes exactly one call through that guard —
-/// [`super::auth::store::AuthStore::rotate_refresh`], which performs the
+/// [`super::auth::store::AuthStore::rotate_refresh_for_client`], which performs the
 /// ENTIRE reuse-detection cascade (spend the presented token, mint a fresh
 /// pair in the same family, OR burn the whole family on replay) as one
 /// complete load-modify-save pass over `tokens.json`. `AuthStore` itself
@@ -1681,10 +1685,16 @@ fn token_authorization_code_grant(ctx: &AuthCtx, req: &TokenRequest) -> Response
 /// caller — the same no-oracle posture as the authorization_code grant
 /// above, even though `rotate_refresh` itself (correctly) tells the two
 /// apart internally to decide whether to burn the family.
+///
+/// `client_id`, when sent, must match the token's (OAuth 2.1 §4.3.1) — a
+/// mismatch is the same uniform `invalid_grant`. When absent it is not
+/// required: existing clients and this repo's e2e refresh without it, and a
+/// public client gains nothing by omitting it (the refresh token itself is
+/// the credential).
 fn token_refresh_grant(ctx: &AuthCtx, req: &TokenRequest) -> Response {
     let refresh_token = req.refresh_token.as_deref().unwrap_or_default();
     let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
-    match store.rotate_refresh(refresh_token) {
+    match store.rotate_refresh_for_client(refresh_token, req.client_id.as_deref()) {
         Ok(RotateOutcome::Rotated { access, refresh }) => {
             TokenResponse::from_pair(&access, &refresh)
         }
@@ -4031,6 +4041,106 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert_eq!(body_json(resp).await, json!({"error": "invalid_grant"}));
+    }
+
+    /// Code-exchange a fresh pair for a new web client.
+    /// Returns `(client_id, resource, access, refresh)`.
+    async fn exchange_fresh_pair(
+        ctx: &AuthCtx,
+        router: &Router,
+    ) -> (String, String, String, String) {
+        let client_id = register_web_client(ctx, None, "https://claude.ai/cb");
+        let resource = format!("{}/mcp", ctx.issuer());
+        let code = issue_test_code(ctx, &client_id, "https://claude.ai/cb", &resource, "brain");
+        let resp = post_token(
+            router,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("client_id", &client_id),
+                ("redirect_uri", "https://claude.ai/cb"),
+                ("code_verifier", CODE_VERIFIER),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        (
+            client_id,
+            resource,
+            body["access_token"].as_str().unwrap().to_string(),
+            body["refresh_token"].as_str().unwrap().to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn token_exchange_binds_resource_and_refresh_keeps_it() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx.clone());
+        let (client_id, resource, access, refresh) = exchange_fresh_pair(&ctx, &router).await;
+        let rec = ctx
+            .store
+            .lock()
+            .unwrap()
+            .check_access(&access)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec.resource.as_deref(), Some(resource.as_str()));
+
+        let resp = post_token(
+            &router,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("client_id", &client_id),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let access2 = body_json(resp).await["access_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let rec2 = ctx
+            .store
+            .lock()
+            .unwrap()
+            .check_access(&access2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rec2.resource.as_deref(), Some(resource.as_str()));
+    }
+
+    /// OAuth 2.1 §4.3.1: a refresh presented under a DIFFERENT client_id is
+    /// `invalid_grant` — and does not spend the real holder's token.
+    #[tokio::test]
+    async fn token_refresh_with_another_clients_id_is_invalid_grant_and_leaves_the_token_usable() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = token_router(ctx.clone());
+        let (client_id, _resource, _access, refresh) = exchange_fresh_pair(&ctx, &router).await;
+
+        let resp = post_token(
+            &router,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("client_id", "some-other-client"),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await, json!({"error": "invalid_grant"}));
+
+        let resp = post_token(
+            &router,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", &refresh),
+                ("client_id", &client_id),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
