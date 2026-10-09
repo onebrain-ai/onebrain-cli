@@ -7,7 +7,7 @@ onebrain gateway run              # bind the configured (or default 7717) port
 onebrain gateway run --port 0     # let the OS assign an ephemeral port
 ```
 
-- Runs in the foreground until Ctrl-C.
+- Runs in the foreground until Ctrl-C or SIGTERM.
 - Binds **`127.0.0.1` only** — see [Loopback + no remote exposure yet](#loopback--no-remote-exposure-yet) below.
 - The bound URL prints once to stdout on startup: `gateway listening on http://<bound-addr>/mcp`.
 
@@ -36,6 +36,8 @@ So a bare `onebrain gateway run` launched from inside a vault directory serves t
 `gateway run` is a foreground process. Two lines go to **stdout** and are a stable contract, not log output: the pairing code, and `gateway listening on http://<addr>/mcp`. Everything else — startup warnings about your `gateway.yml`, a refused approval, a failed audit write, the full detail behind an error a client was only told a sanitized version of — goes to **stderr** at `info` and above.
 
 Set `RUST_LOG` to change that, exactly as for `onebrain daemon`: `RUST_LOG=debug onebrain gateway run`, or `RUST_LOG=onebrain=trace` to turn up only this crate. Redirect with `2>gateway.log`; colour is only emitted when stderr is a terminal, so a redirected log is plain text.
+
+`gateway run` stops cleanly on Ctrl-C or SIGTERM: any approval still pending is denied (the waiting client gets a "gateway is shutting down" error), and open requests get 5 seconds to finish. Native macOS approval dialogs are withdrawn, and the process exits within about 1 s after that. The Telegram message edit ("Denied via shutdown") can be cut off on a slow network, leaving an Approve button that points at a stopped gateway and does nothing.
 
 If a gated tool call is failing and you cannot tell why, this is the first place to look — most of the gateway's refusals deliberately tell the *client* very little, and tell the *operator* here instead.
 
@@ -78,7 +80,7 @@ policy:
   mutating: ask_once          # brain_capture
   destructive: ask_always     # no tool is classified destructive yet
   grant_ttl_minutes: 30       # how long an approval's resulting consent lasts
-  approval_wait_seconds: 300  # how long a blocked call waits for a decision
+  approval_wait_seconds: 240  # how long a blocked call waits (max 270)
 ```
 
 Every tool call is classified into one of three **risk classes**, and each class has its own **mode**:
@@ -92,7 +94,7 @@ Every tool call is classified into one of three **risk classes**, and each class
 
 The **defaults keep today's behavior safe with zero configuration**: every read-only tool defaults to `auto` (unchanged from before the policy engine existed), while any write tool defaults to `ask_once` and any future destructive tool defaults to `ask_always` — a config nobody wrote never silently auto-allows a write. `read_only`/`mutating`/`destructive` may each be set independently; a partial `policy:` block fills only the keys it omits with these defaults.
 
-A **grant** is recorded the moment a human approves an `ask_once` call — an in-memory `(client_id, vault, risk class) → expires-at` entry, scoped to `grant_ttl_minutes` (default 30). The **vault is part of the scope**: approving a write into one vault never authorizes writes into another, because that is the consent the human was actually shown (the dialog and the audit summary both name the vault). The **tool is deliberately not** part of it — the modes are named per risk class, and every tool in a class is by definition equally powerful, so consent is per class. An `ask_always` approval records nothing at all: "always ask" must never leave standing consent behind. It is **never persisted**: restarting `gateway run` clears every grant, same as it clears every pending approval — a grant is consent for THIS running gateway process, not a standing credential written to disk. `approval_wait_seconds` (default 300 — five minutes) bounds how long a BLOCKED call waits for a first decision before giving up; this is a separate knob from `grant_ttl_minutes`, since "ask me and wait up to five minutes" and "then remember it for a day" are independent choices an operator may want to make separately. **`approval_wait_seconds: 0` is legal and means "time out immediately"** — fail-CLOSED, so every call needing approval is refused and nothing is ever written. It exists because this repo's own tests set it deliberately; in a real config it is almost always a typo, so `gateway run` logs a startup warning naming the key when it loads one (on stderr — see [Logs](#logs)).
+A **grant** is recorded the moment a human approves an `ask_once` call — an in-memory `(client_id, vault, risk class) → expires-at` entry, scoped to `grant_ttl_minutes` (default 30). The **vault is part of the scope**: approving a write into one vault never authorizes writes into another, because that is the consent the human was actually shown (the dialog and the audit summary both name the vault). The **tool is deliberately not** part of it — the modes are named per risk class, and every tool in a class is by definition equally powerful, so consent is per class. An `ask_always` approval records nothing at all: "always ask" must never leave standing consent behind. It is **never persisted**: restarting `gateway run` clears every grant, same as it clears every pending approval — a grant is consent for THIS running gateway process, not a standing credential written to disk. `approval_wait_seconds` (default 240 s; values above 270 are clamped with a startup warning — Claude abandons a tool call at 300 s) bounds how long a BLOCKED call waits for a first decision before giving up. While a call waits, the gateway keeps its connection alive: the reply becomes an SSE stream carrying a "waiting for human approval" notice at once, then a keep-alive every 15 s, then the result. This is a separate knob from `grant_ttl_minutes`, since "ask me and wait a few minutes" and "then remember it for a day" are independent choices an operator may want to make separately. **`approval_wait_seconds: 0` is legal and means "time out immediately"** — fail-CLOSED, so every call needing approval is refused and nothing is ever written. It exists because this repo's own tests set it deliberately; in a real config it is almost always a typo, so `gateway run` logs a startup warning naming the key when it loads one (on stderr — see [Logs](#logs)).
 
 Every tool call is also checked against the OAuth token's own `scope` — a token whose scope doesn't cover the pack a tool belongs to (today, only the `"brain"` pack exists) is denied outright, before the mode above is even consulted, regardless of how permissive that mode is.
 
@@ -107,6 +109,8 @@ When a call needs approval (`ask_once` with no live grant, or `ask_always`), the
 | **Telegram bot** | Shipped — Gateway PR 5 | Inline Approve/Deny buttons delivered by a dedicated Telegram bot you set up once with `onebrain gateway telegram setup`. Its own auth model is unrelated to the pairing code below — see [Telegram approval channel](#telegram-approval-channel). |
 
 Every shipped channel resolves the SAME pending-approval registry — whichever answers first wins, and the others are simply a no-op from then on. If nothing answers within `approval_wait_seconds`, the call fails with a timeout error and no grant is recorded.
+
+If the client goes away while its call waits (the HTTP stream closes), the pending approval is denied (audit channel `disconnect`), any open prompt is withdrawn, and nothing is written; an approval that races the disconnect resolves as a denial. **Known gap:** cancellation is detected by transport close only. rmcp 3.0.1 in stateless mode ignores `notifications/cancelled`, so a client that sends it but keeps the stream open leaves its approval pending until `approval_wait_seconds` expires.
 
 **Wrong pairing codes on `/approvals` are rate-limited by the same budget as `/authorize`**: five consecutive wrong codes anywhere — the consent page, the approvals header, or a mix of both — lock *every* pairing-code check for 60 seconds, and a correct code inside that window is refused too. One credential, one budget: a second, separately-counted limiter would simply double the guess rate available to whoever is guessing. The visible consequence is that a burst of failed `/authorize` attempts can briefly lock you out of approving as well; that is the intended trade, and it matches the limiter's existing design (one global counter, not per-client or per-IP, because there is exactly one pairing code and one human).
 
@@ -189,8 +193,8 @@ Every tool call — allowed or not — is appended as one JSON line to `~/.onebr
 | `tool` | Tool name. |
 | `vault` | Named vault the call resolved, when one was resolvable. |
 | `args_summary` | A **redacted**, one-line description of the call's arguments — e.g. a `brain_capture` call's own note body NEVER appears here, only its character count. Bounded in length: a summary built from an oversized caller argument is cut and marked `[truncated, N bytes total]`, so one client cannot grow this file by sending large parameters. |
-| `decision` | `auto` (policy allowed it outright), `approved` (a human approved it), `denied` (refused — either a human answered "deny", or policy refused it with no human involved at all: a `deny` mode, an OAuth scope/pack mismatch, an unidentifiable caller, or the pending-approval cap being reached), or `timedout` (nothing answered within `approval_wait_seconds`). |
-| `channel` | Which approval channel produced a human decision: `"native"`, `"http"` (the `/approvals` surface), or `"telegram"`. `null` whenever no channel was ever consulted — `auto` (policy allowed it outright, no human involved), a policy `denied` with no human involved, and `timedout` (nothing ever answered) all report `null`; only `approved` and a human `denied` ever carry a channel name. |
+| `decision` | `auto` (policy allowed it outright), `approved` (a human approved it), `denied` (refused — either a human answered "deny", the gateway was shutting down, the client disconnected while the approval was pending, or policy refused it with no human involved at all: a `deny` mode, an OAuth scope/pack mismatch, an unidentifiable caller, or the pending-approval cap being reached), or `timedout` (nothing answered within `approval_wait_seconds`). |
+| `channel` | Which approval channel produced a human decision: `"native"`, `"http"` (the `/approvals` surface), `"telegram"`, or — for a denial the gateway itself caused — `"shutdown"` (the gateway was stopping) or `"disconnect"` (the client went away mid-wait). `null` whenever no channel was ever consulted — `auto` (policy allowed it outright, no human involved), a policy `denied` with no human involved, and `timedout` (nothing ever answered) all report `null`; only `approved` and a `denied` that a human, a shutdown, or a disconnect caused ever carry a channel name. |
 | `duration_ms` | Wall-clock time the call took, including any time spent blocked on approval. |
 | `outcome` | `ok` or `error` — whether the tool's own logic succeeded once it was allowed to run. |
 

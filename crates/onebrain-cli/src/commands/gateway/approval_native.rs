@@ -193,7 +193,7 @@
 //! reached.
 
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::approval::{Approvals, Decision, PendingApproval, ResolvedVia};
 use super::auth::core::now_epoch_secs;
@@ -357,16 +357,60 @@ fn decision_from_button_output(stdout: &str) -> Option<Decision> {
 /// modes" section. Blocking; only ever called from inside
 /// [`tokio::task::spawn_blocking`] by [`prompt`], never directly from an
 /// async context.
-fn run_dialog(script: &str) -> Option<Decision> {
-    let output = Command::new("osascript").arg("-e").arg(script).output();
-    let output = output.ok()?;
-    if !output.status.success() {
+fn run_dialog(script: &str, approvals: &Approvals, id: &str) -> Option<Decision> {
+    let mut cmd = Command::new("osascript");
+    cmd.arg("-e").arg(script);
+    let (status, stdout) = run_withdrawable(cmd, approvals, id)?;
+    if !status.success() {
         // Covers a dismissed dialog (AppleScript raises a user-cancelled
-        // error, non-zero exit) and any other `osascript`-side failure
+        // error, non-zero exit), a dialog withdrawn because another channel
+        // answered first (killed), and any other `osascript`-side failure
         // alike: no decision, no resolve.
         return None;
     }
-    decision_from_button_output(&String::from_utf8_lossy(&output.stdout))
+    decision_from_button_output(&stdout)
+}
+
+/// Spawn `cmd` (stdout piped) and wait for it, but register it with
+/// `approvals` first ([`Approvals::attach_prompt`]) so that resolving `id`
+/// by any other path kills it — the dialog leaves the screen and the
+/// blocking-pool thread this runs on is released at once instead of being
+/// pinned until the dialog's own `giving up after`. Polls `try_wait`
+/// rather than blocking in `wait` so the registry can take the child's lock
+/// to kill it. `None` only when the spawn itself failed. Blocking.
+fn run_withdrawable(
+    mut cmd: Command,
+    approvals: &Approvals,
+    id: &str,
+) -> Option<(std::process::ExitStatus, String)> {
+    use std::io::Read;
+
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        // A dismissed or killed dialog prints "User canceled. (-128)" —
+        // noise in the gateway log, not a signal (the exit status is).
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take();
+    let child = Arc::new(Mutex::new(child));
+    approvals.attach_prompt(id, child.clone());
+    let status = loop {
+        let polled = child.lock().unwrap_or_else(|e| e.into_inner()).try_wait();
+        match polled {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(_) => return None,
+        }
+    };
+    // The dialog prints one short line, far below any pipe buffer, so
+    // reading after exit can't deadlock.
+    let mut out = String::new();
+    if let Some(pipe) = stdout.as_mut() {
+        let _ = pipe.read_to_string(&mut out);
+    }
+    Some((status, out))
 }
 
 /// Resolve `id` with `d`, tagged [`ResolvedVia::Native`] — the ONLY way this
@@ -399,7 +443,9 @@ fn resolve_as_native(approvals: &Approvals, id: &str, d: Decision) -> bool {
 /// blocking task is guaranteed to end: the script carries a `giving up
 /// after` clause sized to `p`'s own remaining TTL
 /// ([`dialog_timeout_secs`]), so the dialog — and the pool thread it pins —
-/// is reclaimed no later than the waiter gives up on the same id. Every
+/// is reclaimed no later than the waiter gives up on the same id — and
+/// sooner, killed by [`Approvals::attach_prompt`]'s withdrawal, whenever
+/// the approval resolves any other way (HTTP, Telegram, shutdown). Every
 /// failure past that point (dismissed dialog, missing binary, killed
 /// process, unparseable output) is absorbed by [`run_dialog`] returning
 /// `None`, in which case `approvals.resolve` is simply never called — a
@@ -421,7 +467,7 @@ pub fn prompt(p: &PendingApproval, approvals: Arc<Approvals>) {
     let id = p.id.clone();
     let script = build_dialog_script(p, dialog_timeout_secs(p, now_epoch_secs()));
     tokio::task::spawn_blocking(move || {
-        if let Some(decision) = run_dialog(&script) {
+        if let Some(decision) = run_dialog(&script, &approvals, &id) {
             resolve_as_native(&approvals, &id, decision);
         }
     });
@@ -728,6 +774,45 @@ mod tests {
             WaitOutcome::Decided(Decision::Approve, ResolvedVia::Native),
             "the native dialog channel must resolve as ResolvedVia::Native, \
              not any other channel: {outcome:?}"
+        );
+    }
+
+    /// Ruling 8b: the prompt process [`prompt`] runs is withdrawn (killed)
+    /// the moment its approval resolves through ANY other channel, so the
+    /// blocking-pool thread it pins is released at once. Driven with a
+    /// `sleep 60` stand-in through the same [`run_withdrawable`] the dialog
+    /// uses — never a real GUI dialog.
+    #[cfg(unix)]
+    #[test]
+    fn a_prompt_process_is_withdrawn_when_another_channel_resolves_first() {
+        use std::time::{Duration, Instant};
+
+        let approvals = Arc::new(Approvals::new());
+        let p = sample();
+        let _rx = approvals.register(p.clone()).unwrap();
+        let (a, id) = (approvals.clone(), p.id.clone());
+        let started = Instant::now();
+        let runner = std::thread::spawn(move || {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("60");
+            run_withdrawable(cmd, &a, &id)
+        });
+        // Let the stand-in come up and attach before the other channel answers.
+        while !approvals.has_prompt(&p.id) {
+            assert!(started.elapsed() < Duration::from_secs(5), "never attached");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(approvals.resolve(&p.id, Decision::Approve, ResolvedVia::Http));
+        let out = runner.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        let (status, _) = out.expect("the stand-in spawned");
+        assert!(
+            !status.success(),
+            "the stand-in must have been killed: {status}"
         );
     }
 

@@ -328,7 +328,7 @@ pub struct GatewayCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum GatewayVerb {
-    /// Run the gateway in the foreground until Ctrl-C. Binds 127.0.0.1 only
+    /// Run the gateway in the foreground until Ctrl-C or SIGTERM. Binds 127.0.0.1 only
     /// (no bind flag — remote access isn't offered until auth lands).
     Run {
         /// Loopback port to bind. 0 = OS-assigned ephemeral port. Overrides

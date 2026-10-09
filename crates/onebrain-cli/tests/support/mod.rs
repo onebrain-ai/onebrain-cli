@@ -219,3 +219,37 @@ fn looks_like_pairing_code(token: &str) -> bool {
             .enumerate()
             .all(|(i, c)| i == 4 || c.is_ascii_uppercase() || c.is_ascii_digit())
 }
+
+/// Every `data:` event of an SSE body, each parsed as JSON, in order.
+/// Panics (with the event text — never a secret: these are MCP replies) on a
+/// data event that is not JSON.
+pub fn sse_data_events(body: &str) -> Vec<serde_json::Value> {
+    let body = body.replace("\r\n", "\n");
+    body.split("\n\n")
+        .filter_map(|event| {
+            let data: Vec<&str> = event
+                .lines()
+                .filter_map(|l| l.strip_prefix("data:"))
+                .map(str::trim_start)
+                .collect();
+            (!data.is_empty()).then(|| data.join("\n"))
+        })
+        .map(|d| {
+            serde_json::from_str(&d)
+                .unwrap_or_else(|e| panic!("SSE data event was not JSON ({e}): {d}"))
+        })
+        .collect()
+}
+
+/// The JSON-RPC reply of a gateway `/mcp` response: the body itself when it is
+/// plain JSON, else the LAST SSE data event (an approval-gated call streams a
+/// wait notice first — v3.5.0 T3). Panics when there is no reply at all.
+pub fn parse_mcp_reply(body: &str) -> serde_json::Value {
+    if body.trim_start().starts_with('{') {
+        return serde_json::from_str(body)
+            .unwrap_or_else(|e| panic!("MCP reply was not JSON ({e}): {body}"));
+    }
+    sse_data_events(body)
+        .pop()
+        .unwrap_or_else(|| panic!("MCP reply was neither JSON nor SSE with a data event: {body}"))
+}

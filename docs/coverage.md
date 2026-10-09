@@ -117,6 +117,12 @@ it is untestable.
 - `run_dialog`/`prompt`'s CORRECTNESS is still fully covered indirectly: `build_dialog_script` (the AppleScript text `run_dialog` would hand to `osascript`, including every escaping property and the `giving up after` clause that time-bounds the dialog), `dialog_timeout_secs` (that clause's value, including both clamps), and `decision_from_button_output` (the parse of `osascript`'s stdout `run_dialog` would perform, including the `button returned:, gave up:true` shape a self-dismissed dialog produces) are all unit-tested directly and exhaustively — the only untested seam is the literal `Command::new("osascript")...output()` I/O call gluing them together, which cannot be exercised without a live GUI session. The three `osascript` behaviors those tests encode (a gave-up dialog exits ZERO with an empty button label; `giving up after 0` means never expire; an operand above `i32::MAX` fails coercion and shows no dialog at all) were each established by running a real `/usr/bin/osascript` by hand during the round-2 fix wave, precisely because no automated test in this repository may pop a dialog.
 - `is_available`'s own `ONEBRAIN_GATEWAY_DISABLE_NATIVE_APPROVAL` short-circuit and the `osascript`-present branch are both unit-tested directly (`is_available_is_false_when_explicitly_disabled_via_env_var`, `is_available_is_true_on_macos_with_osascript_on_path`); only `osascript_on_path`'s defensive `$PATH`-unset arm (`let Some(path_var) = std::env::var_os("PATH") else { return false; }`) is untested — `$PATH` is always set in any environment these tests run in.
 
+#### Gateway approval keep-alive + SIGTERM (v3.5.0 T3a, #412 — NOT whole-file-excluded)
+
+- `mod.rs::shutdown_signal` runs only inside `run()` (subprocess-only); `with_shutdown_grace` and `Approvals::deny_all` are unit-tested, SIGTERM end-to-end by `gateway_http.rs` and `gateway_keepalive_e2e.rs`.
+- The `#[cfg(not(unix))]` arm of `shutdown_signal` is not compiled on macOS/Linux.
+- Known gap (not coverage, behaviour): `notifications/cancelled` is ignored by rmcp 3.0.1 stateless mode, so cancellation of a waiting approval is detected by transport close only; no test can cover a cancel that rmcp discards.
+
 ## Status (2026-07-05 · v3.4.6)
 
 - **Core (this initiative's target surface, exclusions applied): ~94.99% line** (`scripts/coverage.sh`,

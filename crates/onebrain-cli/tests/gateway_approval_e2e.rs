@@ -614,7 +614,7 @@ fn read_audit_entries(home: &Path) -> Vec<serde_json::Value> {
 /// naming it as the default vault, with `policy.mutating: ask_once` — the
 /// one config knob this whole test exists to drive `brain_capture` through.
 /// Every other `policy:` field is left at its default (`approval_wait_seconds:
-/// 300`, `grant_ttl_minutes: 30`) — comfortably long enough for this test's
+/// 240`, `grant_ttl_minutes: 30`) — comfortably long enough for this test's
 /// own poll-then-resolve loop, and long enough that the grant recorded by
 /// the first approval is still live for the second call.
 fn write_fixture_vault_and_config(home: &Path) -> tempfile::TempDir {
@@ -840,8 +840,7 @@ fn gateway_ask_once_approval_flow_completes_writes_and_reuses_the_grant() {
 
     let (status1, call1_body) = call_handle.join().expect("brain_capture thread panicked");
     assert_eq!(status1, 200, "{call1_body}");
-    let call1: serde_json::Value = serde_json::from_str(&call1_body)
-        .unwrap_or_else(|e| panic!("brain_capture response was not JSON ({e}): {call1_body}"));
+    let call1 = support::parse_mcp_reply(&call1_body);
     assert!(call1.get("error").is_none(), "{call1}");
     let path1 = call1["result"]["structuredContent"]["path"]
         .as_str()
@@ -883,9 +882,7 @@ fn gateway_ask_once_approval_flow_completes_writes_and_reuses_the_grant() {
         &standard_headers("tools/call", Some("brain_capture")),
     );
     assert_eq!(status2, 200, "{call2_body}");
-    let call2: serde_json::Value = serde_json::from_str(&call2_body).unwrap_or_else(|e| {
-        panic!("second brain_capture response was not JSON ({e}): {call2_body}")
-    });
+    let call2 = support::parse_mcp_reply(&call2_body);
     assert!(call2.get("error").is_none(), "{call2}");
     let path2 = call2["result"]["structuredContent"]["path"]
         .as_str()

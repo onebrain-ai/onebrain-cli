@@ -87,7 +87,8 @@
 //! for the end-to-end proof (not just a read-the-code assertion).
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -113,13 +114,17 @@ pub const MAX_PENDING_APPROVALS_PER_CLIENT: usize = 4;
 /// very different things for an operator: a global limit suggests several
 /// clients or a wedged gateway, a per-client one points at a single
 /// misbehaving connector. Never surfaced to the client, which only ever
-/// sees `server::await_approval`'s single fixed refusal message.
+/// sees `server::await_approval`'s single fixed refusal message — except
+/// [`Self::ShuttingDown`], which it maps to the shutdown denial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegisterRejected {
     /// [`MAX_PENDING_APPROVALS`] live entries already exist.
     Global,
     /// This `client_id` already has [`MAX_PENDING_APPROVALS_PER_CLIENT`].
     PerClient,
+    /// [`Approvals::deny_all`] already closed the registry: the gateway is
+    /// shutting down, so nothing would ever answer a new entry.
+    ShuttingDown,
 }
 
 /// One tool call awaiting a human operator's decision — the record surfaced
@@ -198,16 +203,24 @@ pub enum ResolvedVia {
     /// The Telegram approval channel (`telegram::TelegramChannel::ensure_polling`,
     /// Gateway PR 5, Task 5).
     Telegram,
+    /// The gateway itself, shutting down (`gateway run` got Ctrl-C/SIGTERM) —
+    /// [`Approvals::deny_all`].
+    Shutdown,
+    /// The client went away while its call waited (`server::await_approval`
+    /// saw the request's cancellation token fire) — smoke V F2.
+    Disconnect,
 }
 
 impl ResolvedVia {
     /// The exact lowercase string `audit::AuditEntry::channel` records —
-    /// `"http"`, `"native"`, or `"telegram"`.
+    /// `"http"`, `"native"`, `"telegram"`, `"shutdown"`, or `"disconnect"`.
     pub fn as_str(self) -> &'static str {
         match self {
             ResolvedVia::Http => "http",
             ResolvedVia::Native => "native",
             ResolvedVia::Telegram => "telegram",
+            ResolvedVia::Shutdown => "shutdown",
+            ResolvedVia::Disconnect => "disconnect",
         }
     }
 }
@@ -241,17 +254,32 @@ pub enum WaitOutcome {
 /// [`Decision`] and [`ResolvedVia`] stay the real, `pub`, importable types).
 type Resolution = (Decision, ResolvedVia);
 
+/// A running out-of-band prompt for one pending approval — today the native
+/// dialog's `osascript` child ([`super::approval_native`]). Shared so the
+/// registry can kill it while the prompt's own thread polls it.
+pub type PromptProcess = Arc<Mutex<std::process::Child>>;
+
 /// In-memory, per-process registry of pending approvals, keyed by
 /// [`PendingApproval::id`]. See the module docs for the full lifecycle and
 /// locking discipline.
 pub struct Approvals {
     pending: Mutex<HashMap<String, (PendingApproval, oneshot::Sender<Resolution>)>>,
+    /// Prompt processes still on screen, by approval id — see
+    /// [`Self::attach_prompt`]. Lock order: `pending` before `prompts`.
+    prompts: Mutex<HashMap<String, PromptProcess>>,
+    /// Set by [`Self::deny_all`]; [`Self::register`] refuses afterwards.
+    /// Only read or written while `pending` is locked, so a register racing
+    /// the shutdown either lands before the drain (and is denied by it) or
+    /// sees the flag.
+    closed: AtomicBool,
 }
 
 impl Approvals {
     pub fn new() -> Self {
         Self {
             pending: Mutex::new(HashMap::new()),
+            prompts: Mutex::new(HashMap::new()),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -295,24 +323,77 @@ impl Approvals {
     ) -> Result<oneshot::Receiver<Resolution>, RegisterRejected> {
         let (tx, rx) = oneshot::channel();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(RegisterRejected::ShuttingDown);
+        }
 
         let now = now_epoch_secs();
-        pending.retain(|_, (entry, _)| entry.expires > now);
-
-        if pending.len() >= MAX_PENDING_APPROVALS {
-            return Err(RegisterRejected::Global);
+        let expired: Vec<String> = pending
+            .iter()
+            .filter(|(_, (entry, _))| entry.expires <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &expired {
+            pending.remove(id);
         }
-        if pending
+
+        let verdict = if pending.len() >= MAX_PENDING_APPROVALS {
+            Err(RegisterRejected::Global)
+        } else if pending
             .values()
             .filter(|(entry, _)| entry.client_id == p.client_id)
             .count()
             >= MAX_PENDING_APPROVALS_PER_CLIENT
         {
-            return Err(RegisterRejected::PerClient);
+            Err(RegisterRejected::PerClient)
+        } else {
+            pending.insert(p.id.clone(), (p, tx));
+            Ok(rx)
+        };
+        drop(pending);
+        for id in &expired {
+            self.withdraw_prompt(id);
         }
+        verdict
+    }
 
-        pending.insert(p.id.clone(), (p, tx));
-        Ok(rx)
+    /// Record `child` as the on-screen prompt for pending approval `id`, so
+    /// that resolving `id` by ANY path — [`Self::resolve`] (HTTP, native,
+    /// Telegram), [`Self::deny_all`] (shutdown), a [`Self::wait`] timeout,
+    /// or expiry pruning in [`Self::register`] — kills it via
+    /// [`Self::withdraw_prompt`]. If `id` is no longer pending (a faster
+    /// channel already answered), `child` is killed at once and `false` is
+    /// returned.
+    pub fn attach_prompt(&self, id: &str, child: PromptProcess) -> bool {
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.contains_key(id) {
+            let mut prompts = self.prompts.lock().unwrap_or_else(|e| e.into_inner());
+            prompts.insert(id.to_string(), child);
+            return true;
+        }
+        drop(pending);
+        kill_prompt(&child);
+        false
+    }
+
+    /// Whether `id` currently has an attached prompt process.
+    #[cfg(all(test, unix))]
+    pub fn has_prompt(&self, id: &str) -> bool {
+        let prompts = self.prompts.lock().unwrap_or_else(|e| e.into_inner());
+        prompts.contains_key(id)
+    }
+
+    /// The ONE place a resolved approval's prompt is taken off screen: kill
+    /// `id`'s attached prompt process, if any. Called after `id` left
+    /// `pending`, never with the `pending` lock held.
+    fn withdraw_prompt(&self, id: &str) {
+        let child = {
+            let mut prompts = self.prompts.lock().unwrap_or_else(|e| e.into_inner());
+            prompts.remove(id)
+        };
+        if let Some(child) = child {
+            kill_prompt(&child);
+        }
     }
 
     /// Every currently-pending approval, in arbitrary (`HashMap` iteration)
@@ -358,9 +439,36 @@ impl Approvals {
             pending.remove(id)
         };
         match removed {
-            Some((_, tx)) => tx.send((d, via)).is_ok(),
+            Some((_, tx)) => {
+                self.withdraw_prompt(id);
+                tx.send((d, via)).is_ok()
+            }
             None => false,
         }
+    }
+
+    /// Deny EVERY pending approval at once (gateway shutdown, hub ruling):
+    /// each waiter wakes with `(Deny, via)` and its call answers with an
+    /// error on its own stream, instead of hanging until the shutdown grace
+    /// drops the connection. Same drain-then-send discipline as
+    /// [`Self::resolve`]: the lock is released before any send. Also closes
+    /// the registry ([`RegisterRejected::ShuttingDown`] from then on) and
+    /// withdraws every prompt. Returns how many waiters were still
+    /// listening.
+    pub fn deny_all(&self, via: ResolvedVia) -> usize {
+        let drained: Vec<(String, oneshot::Sender<Resolution>)> = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            self.closed.store(true, Ordering::Relaxed);
+            pending.drain().map(|(id, (_, tx))| (id, tx)).collect()
+        };
+        drained
+            .into_iter()
+            .map(|(id, tx)| {
+                self.withdraw_prompt(&id);
+                tx.send((Decision::Deny, via)).is_ok()
+            })
+            .filter(|delivered| *delivered)
+            .count()
     }
 
     /// Wait up to `ttl` for `id`'s registered receiver `rx` to resolve.
@@ -386,12 +494,21 @@ impl Approvals {
         match tokio::time::timeout(ttl, rx).await {
             Ok(Ok((decision, via))) => WaitOutcome::Decided(decision, via),
             Ok(Err(_)) | Err(_) => {
-                let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-                pending.remove(id);
+                {
+                    let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+                    pending.remove(id);
+                }
+                self.withdraw_prompt(id);
                 WaitOutcome::TimedOut
             }
         }
     }
+}
+
+/// Kill a prompt process. Its own thread still owns the wait/reap; an
+/// already-exited child makes this a harmless no-op.
+fn kill_prompt(child: &PromptProcess) {
+    let _ = child.lock().unwrap_or_else(|e| e.into_inner()).kill();
 }
 
 impl Default for Approvals {
@@ -474,6 +591,7 @@ mod tests {
             ResolvedVia::Http,
             ResolvedVia::Native,
             ResolvedVia::Telegram,
+            ResolvedVia::Shutdown,
         ] {
             let approvals = Approvals::new();
             let rx = approvals.register(sample("a1")).unwrap();
@@ -492,6 +610,8 @@ mod tests {
         assert_eq!(ResolvedVia::Http.as_str(), "http");
         assert_eq!(ResolvedVia::Native.as_str(), "native");
         assert_eq!(ResolvedVia::Telegram.as_str(), "telegram");
+        assert_eq!(ResolvedVia::Shutdown.as_str(), "shutdown");
+        assert_eq!(ResolvedVia::Disconnect.as_str(), "disconnect");
     }
 
     // ── timeout path: TimedOut + entry dropped from pending ─────────────
@@ -506,6 +626,135 @@ mod tests {
             outcome,
             WaitOutcome::Decided(Decision::Deny, ResolvedVia::Native)
         );
+    }
+
+    /// Hub ruling: at shutdown every pending approval is DENIED — each
+    /// waiter wakes with `(Deny, Shutdown)` instead of a dropped channel.
+    #[tokio::test]
+    async fn deny_all_wakes_every_waiter_with_a_shutdown_denial_and_empties_pending() {
+        let approvals = Approvals::new();
+        let rx1 = approvals.register(sample("a1")).unwrap();
+        let rx2 = approvals.register(sample("a2")).unwrap();
+        assert_eq!(approvals.deny_all(ResolvedVia::Shutdown), 2);
+        assert!(approvals.list().is_empty());
+        for (id, rx) in [("a1", rx1), ("a2", rx2)] {
+            assert_eq!(
+                approvals.wait(id, rx, Duration::from_secs(5)).await,
+                WaitOutcome::Decided(Decision::Deny, ResolvedVia::Shutdown)
+            );
+        }
+        assert_eq!(approvals.deny_all(ResolvedVia::Shutdown), 0, "idempotent");
+        assert_eq!(ResolvedVia::Shutdown.as_str(), "shutdown");
+    }
+
+    /// Ruling 9a: once [`Approvals::deny_all`] closed the registry, a call
+    /// that reaches `register` afterwards is refused — it can't slip in a
+    /// fresh entry that nothing will ever deny.
+    #[test]
+    fn register_is_refused_after_deny_all_closed_the_registry() {
+        let approvals = Approvals::new();
+        assert!(approvals.register(sample("a1")).is_ok());
+        approvals.deny_all(ResolvedVia::Shutdown);
+        assert_eq!(
+            approvals.register(sample("a2")).unwrap_err(),
+            RegisterRejected::ShuttingDown
+        );
+        assert!(approvals.list().is_empty());
+    }
+
+    // ── Ruling 8b: resolving an approval withdraws its prompt process ───
+
+    /// A stand-in for the native dialog's `osascript` child — `sleep 60`,
+    /// never a real GUI dialog.
+    #[cfg(unix)]
+    fn stand_in_prompt() -> PromptProcess {
+        Arc::new(Mutex::new(
+            std::process::Command::new("sleep")
+                .arg("60")
+                .spawn()
+                .expect("spawn sleep"),
+        ))
+    }
+
+    /// Bounded poll: has the stand-in prompt process exited (been killed)?
+    #[cfg(unix)]
+    fn exits_within(child: &PromptProcess, limit: Duration) -> bool {
+        let deadline = std::time::Instant::now() + limit;
+        while std::time::Instant::now() < deadline {
+            if child.lock().unwrap().try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = child.lock().unwrap().kill();
+        false
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolving_an_approval_kills_its_prompt_process() {
+        let approvals = Approvals::new();
+        let _rx = approvals.register(sample("a1")).unwrap();
+        let child = stand_in_prompt();
+        assert!(approvals.attach_prompt("a1", child.clone()));
+        assert!(approvals.resolve("a1", Decision::Approve, ResolvedVia::Http));
+        assert!(exits_within(&child, Duration::from_secs(5)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deny_all_kills_every_prompt_process() {
+        let approvals = Approvals::new();
+        let _rx1 = approvals.register(sample("a1")).unwrap();
+        let _rx2 = approvals.register(sample("a2")).unwrap();
+        let (c1, c2) = (stand_in_prompt(), stand_in_prompt());
+        assert!(approvals.attach_prompt("a1", c1.clone()));
+        assert!(approvals.attach_prompt("a2", c2.clone()));
+        approvals.deny_all(ResolvedVia::Shutdown);
+        assert!(exits_within(&c1, Duration::from_secs(5)));
+        assert!(exits_within(&c2, Duration::from_secs(5)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_wait_kills_its_prompt_process() {
+        let approvals = Approvals::new();
+        let rx = approvals.register(sample("a1")).unwrap();
+        let child = stand_in_prompt();
+        assert!(approvals.attach_prompt("a1", child.clone()));
+        assert_eq!(
+            approvals.wait("a1", rx, Duration::from_millis(20)).await,
+            WaitOutcome::TimedOut
+        );
+        assert!(exits_within(&child, Duration::from_secs(5)));
+    }
+
+    /// An entry pruned as expired by a later `register` takes its prompt
+    /// with it.
+    #[cfg(unix)]
+    #[test]
+    fn expiry_pruning_kills_the_pruned_entrys_prompt_process() {
+        let approvals = Approvals::new();
+        let mut stale = sample("a1");
+        stale.expires = now_epoch_secs();
+        let _rx = approvals.register(stale).unwrap();
+        let child = stand_in_prompt();
+        assert!(approvals.attach_prompt("a1", child.clone()));
+        let _rx2 = approvals.register(sample("a2")).unwrap();
+        assert!(exits_within(&child, Duration::from_secs(5)));
+    }
+
+    /// A prompt that comes up only after its approval was already resolved
+    /// (the dialog spawn raced a faster channel) is killed at once.
+    #[cfg(unix)]
+    #[test]
+    fn attaching_a_prompt_to_an_already_resolved_approval_kills_it() {
+        let approvals = Approvals::new();
+        let _rx = approvals.register(sample("a1")).unwrap();
+        assert!(approvals.resolve("a1", Decision::Deny, ResolvedVia::Http));
+        let child = stand_in_prompt();
+        assert!(!approvals.attach_prompt("a1", child.clone()));
+        assert!(exits_within(&child, Duration::from_secs(5)));
     }
 
     #[tokio::test]

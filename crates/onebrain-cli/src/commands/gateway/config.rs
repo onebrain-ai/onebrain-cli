@@ -178,7 +178,7 @@ mod tests {
         assert_eq!(cfg.policy.mutating, PolicyMode::AskOnce);
         assert_eq!(cfg.policy.destructive, PolicyMode::AskAlways);
         assert_eq!(cfg.policy.grant_ttl_minutes, 30);
-        assert_eq!(cfg.policy.approval_wait_seconds, 300);
+        assert_eq!(cfg.policy.approval_wait_seconds, 240);
         assert!(
             cfg.telegram.bot_token.is_empty(),
             "default telegram.bot_token must be empty (== not configured)"

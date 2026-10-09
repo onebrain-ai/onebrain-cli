@@ -1010,8 +1010,7 @@ fn a_capture_is_approved_from_telegram_end_to_end() {
 
     let (status1, call1_body) = call_handle.join().expect("brain_capture thread panicked");
     assert_eq!(status1, 200, "{call1_body}");
-    let call1: serde_json::Value = serde_json::from_str(&call1_body)
-        .unwrap_or_else(|e| panic!("brain_capture response was not JSON ({e}): {call1_body}"));
+    let call1 = support::parse_mcp_reply(&call1_body);
     assert!(call1.get("error").is_none(), "{call1}");
     let path1 = call1["result"]["structuredContent"]["path"]
         .as_str()
@@ -1127,8 +1126,7 @@ fn d_capture_is_denied_from_telegram_end_to_end() {
 
     let (status1, call1_body) = call_handle.join().expect("brain_capture thread panicked");
     assert_eq!(status1, 200, "{call1_body}");
-    let call1: serde_json::Value = serde_json::from_str(&call1_body)
-        .unwrap_or_else(|e| panic!("brain_capture response was not JSON ({e}): {call1_body}"));
+    let call1 = support::parse_mcp_reply(&call1_body);
     let message = call1["error"]["message"]
         .as_str()
         .unwrap_or_else(|| panic!("expected a JSON-RPC error for a denied call: {call1}"));
