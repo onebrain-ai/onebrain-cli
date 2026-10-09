@@ -2128,6 +2128,7 @@ fn doctor_fix_backfills_comments_on_legacy_vault_end_to_end() {
 }
 
 /// Walk any JSON and collect every object's `check` -> `status`.
+#[cfg(unix)]
 fn check_statuses(v: &serde_json::Value, out: &mut Vec<(String, String)>) {
     match v {
         serde_json::Value::Object(m) => {

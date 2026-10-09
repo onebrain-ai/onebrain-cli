@@ -157,8 +157,10 @@ mod tests {
     #[test]
     fn gateway_plist_golden() {
         let spec = gateway_agent(Path::new("/opt/homebrew/bin/onebrain"), Path::new(LOGS));
+        // Same join the renderer uses: `\` separator on Windows.
+        let log = Path::new(LOGS).join("gateway.log").display().to_string();
         let expected = format!(
-            "{HEAD}    <key>Label</key>\n    <string>com.onebrain.gateway</string>\n    <key>ProgramArguments</key>\n    <array>\n        <string>/opt/homebrew/bin/onebrain</string>\n        <string>gateway</string>\n        <string>run</string>\n    </array>\n    <key>KeepAlive</key>\n    <true/>\n    <key>RunAtLoad</key>\n    <true/>\n    <key>StandardOutPath</key>\n    <string>/Users/test/Library/Logs/onebrain/gateway.log</string>\n    <key>StandardErrorPath</key>\n    <string>/Users/test/Library/Logs/onebrain/gateway.log</string>\n</dict>\n</plist>\n"
+            "{HEAD}    <key>Label</key>\n    <string>com.onebrain.gateway</string>\n    <key>ProgramArguments</key>\n    <array>\n        <string>/opt/homebrew/bin/onebrain</string>\n        <string>gateway</string>\n        <string>run</string>\n    </array>\n    <key>KeepAlive</key>\n    <true/>\n    <key>RunAtLoad</key>\n    <true/>\n    <key>StandardOutPath</key>\n    <string>{log}</string>\n    <key>StandardErrorPath</key>\n    <string>{log}</string>\n</dict>\n</plist>\n"
         );
         assert_eq!(render_keepalive_plist(&spec).unwrap(), expected);
     }
@@ -170,8 +172,12 @@ mod tests {
             &TunnelAuth::TokenFile(PathBuf::from("/Users/test/.onebrain/gateway/tunnel.token")),
             Path::new(LOGS),
         );
+        let log = Path::new(LOGS)
+            .join("gateway-tunnel.log")
+            .display()
+            .to_string();
         let expected = format!(
-            "{HEAD}    <key>Label</key>\n    <string>com.onebrain.gateway-tunnel</string>\n    <key>ProgramArguments</key>\n    <array>\n        <string>/opt/homebrew/bin/cloudflared</string>\n        <string>tunnel</string>\n        <string>--no-autoupdate</string>\n        <string>--protocol</string>\n        <string>http2</string>\n        <string>run</string>\n        <string>--token-file</string>\n        <string>/Users/test/.onebrain/gateway/tunnel.token</string>\n    </array>\n    <key>KeepAlive</key>\n    <true/>\n    <key>RunAtLoad</key>\n    <true/>\n    <key>StandardOutPath</key>\n    <string>/Users/test/Library/Logs/onebrain/gateway-tunnel.log</string>\n    <key>StandardErrorPath</key>\n    <string>/Users/test/Library/Logs/onebrain/gateway-tunnel.log</string>\n</dict>\n</plist>\n"
+            "{HEAD}    <key>Label</key>\n    <string>com.onebrain.gateway-tunnel</string>\n    <key>ProgramArguments</key>\n    <array>\n        <string>/opt/homebrew/bin/cloudflared</string>\n        <string>tunnel</string>\n        <string>--no-autoupdate</string>\n        <string>--protocol</string>\n        <string>http2</string>\n        <string>run</string>\n        <string>--token-file</string>\n        <string>/Users/test/.onebrain/gateway/tunnel.token</string>\n    </array>\n    <key>KeepAlive</key>\n    <true/>\n    <key>RunAtLoad</key>\n    <true/>\n    <key>StandardOutPath</key>\n    <string>{log}</string>\n    <key>StandardErrorPath</key>\n    <string>{log}</string>\n</dict>\n</plist>\n"
         );
         assert_eq!(render_keepalive_plist(&spec).unwrap(), expected);
     }

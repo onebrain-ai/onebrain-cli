@@ -43,6 +43,7 @@ fn onebrain(home: &Path, path_dir: Option<&Path>) -> Command {
 
 /// The binary under test (kept in `onebrain`'s region: the cache-isolation
 /// sweep scans per fn, and every spawn goes through `onebrain` above).
+#[cfg(target_os = "macos")]
 const EXE: &str = env!("CARGO_BIN_EXE_onebrain");
 
 #[test]
