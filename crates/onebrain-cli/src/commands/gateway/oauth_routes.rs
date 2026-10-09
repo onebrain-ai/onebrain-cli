@@ -1644,12 +1644,39 @@ fn token_authorization_code_grant(ctx: &AuthCtx, req: &TokenRequest) -> Response
         return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
 
+    issue_pair_for_consumed_code(&store, &auth_code)
+}
+
+/// Mint the pair for an already-consumed, binding-checked code.
+///
+/// `consume_code` and the issue below are separate locked calls, so
+/// `AuthStore::remove_client` (another process) can run between them. After
+/// issuing we therefore re-check the client is still registered: a remove
+/// AFTER the re-check sees the new pair and revokes it, and a remove BEFORE
+/// it is caught here, so no live pair survives for a removed client.
+fn issue_pair_for_consumed_code(store: &AuthStore, auth_code: &super::auth::AuthCode) -> Response {
     match store.issue_token_pair_for_resource(
         &auth_code.client_id,
         &auth_code.scope,
         Some(&auth_code.resource),
     ) {
         Ok((access, refresh)) => {
+            match store.get_client(&auth_code.client_id) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    let _ = store.revoke_family(&refresh.family);
+                    return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "client re-check failed during /token");
+                    let _ = store.revoke_family(&refresh.family);
+                    return oauth_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "failed to issue tokens",
+                    );
+                }
+            }
             // Link this code to the family it minted so a LATER replay can
             // find and revoke it (see the doc comment above). Best-effort:
             // the tokens are already valid and returned to the caller either
@@ -2275,6 +2302,37 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    #[test]
+    fn code_exchange_refuses_a_pair_when_the_client_was_removed_mid_exchange() {
+        use super::super::auth::store::TokenStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::open_at(dir.path().join("auth")).unwrap();
+        store
+            .register_client(RegisteredClient {
+                client_id: "c1".to_string(),
+                client_name: None,
+                redirect_uris: vec!["https://cb".to_string()],
+                application_type: AppType::Web,
+                created: 0,
+            })
+            .unwrap();
+        let code = store
+            .issue_code("c1", "https://cb", "chal", "res", "brain")
+            .unwrap();
+        // Interleaving: the code is consumed, THEN the operator removes the
+        // client, THEN the handler issues the pair.
+        let consumed = store.consume_code(&code.code).unwrap().unwrap();
+        store.remove_client("c1").unwrap().unwrap();
+        let resp = issue_pair_for_consumed_code(&store, &consumed);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let views = store.list_tokens().unwrap();
+        assert!(!views.is_empty(), "the pair was minted then revoked");
+        assert!(
+            views.iter().all(|v| v.status == TokenStatus::Revoked),
+            "no live token may survive for a removed client"
+        );
     }
 
     #[test]

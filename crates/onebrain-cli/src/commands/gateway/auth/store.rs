@@ -1079,6 +1079,11 @@ impl AuthStore {
     /// exactly the set resolved. Like [`Self::revoke_token`], `Id` does NOT
     /// cascade to the family. `Family`/`Client` are the bulk cut-offs.
     pub fn revoke_tokens(&self, selector: &TokenSelector) -> Result<RevokeOutcome> {
+        debug_assert!(
+            matches!(selector, TokenSelector::Client(_))
+                || selector.value().len() >= MIN_ID_PREFIX_LEN,
+            "Id/Family selectors must be normalized by normalize_id_prefix"
+        );
         let _guard = self.lock_exclusive()?;
         let mut tokens = self.load_tokens()?;
         let keys: Vec<String> = match selector {
