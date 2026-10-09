@@ -157,12 +157,13 @@ pub struct AttemptState {
 ///
 /// `store` MUST stay `Mutex<AuthStore>` — NEVER cloned out of the mutex — so
 /// every access holds the lock across its full read-modify-write.
-/// `AuthStore`'s on-disk JSON files are plain read-then-write with no
-/// file-level locking of their own (see `store.rs`'s module docs), so two
-/// concurrent in-process axum requests without this discipline could
-/// double-spend a single-use auth code or race past refresh-token reuse
-/// detection. This task only adds a READ (`check_access`, in the Bearer
-/// gate) through the lock; Tasks 3-5's mutating `/authorize`/`/token`/
+/// `AuthStore`'s mutating methods take a cross-process advisory file lock
+/// (`auth.lock`) per call, which keeps the CLI's `tokens revoke` from being
+/// lost to this process. That lock covers ONE store call, not a sequence of
+/// them, so this mutex is still needed: two concurrent in-process axum
+/// requests could otherwise double-spend a single-use auth code or race past
+/// refresh-token reuse detection. This task only adds a READ (`check_access`,
+/// in the Bearer gate) through the lock; Tasks 3-5's mutating `/authorize`/`/token`/
 /// `/register` handlers share this SAME `store` field and MUST follow the
 /// same hold-the-lock-across-the-whole-operation discipline (Task 1 security
 /// review finding, binding requirement A on this task).
@@ -570,18 +571,15 @@ fn is_loopback_redirect_uri(uri: &str) -> bool {
 ///   owner frees a slot with `onebrain gateway clients remove <id>` — hub
 ///   ruling, accepted risk R2).
 ///
-/// Persists via [`AuthStore::register_client`] with `ctx.store`'s lock held
-/// across the ENTIRE call — never cloning `AuthStore` out of the mutex, per
-/// `AuthCtx`'s doc comment (binding requirement carried from the Task 1
-/// review) and mirroring [`super::auth::middleware::require_bearer`]'s own
-/// `check_access` call. `register_client` itself does the full
-/// load-clients → insert → save-clients sequence while that single lock
-/// acquisition is held, so this handler's one `store.register_client(..)`
-/// call already satisfies the "hold across the whole read-modify-write"
-/// discipline; there is no separate existence check to add on top, since
-/// `client_id` is a freshly `mint_secret_32()`-minted 256-bit value on every
-/// call (collision-free in practice) and `register_client` is documented as
-/// insert-or-overwrite by `client_id`.
+/// Persists via [`AuthStore::register_client_capped`] with `ctx.store`'s lock
+/// held across the ENTIRE call — never cloning `AuthStore` out of the mutex,
+/// per `AuthCtx`'s doc comment — and mirroring
+/// [`super::auth::middleware::require_bearer`]'s own `check_access` call.
+/// `register_client_capped` counts the stored clients and inserts under
+/// `auth.lock`, so the 50-client cap holds even against a concurrent
+/// `clients remove` or registration from another process. `client_id` is a
+/// freshly `mint_secret_32()`-minted 256-bit value on every call
+/// (collision-free in practice), so there is no separate existence check.
 async fn register_client_handler(
     State(ctx): State<Arc<AuthCtx>>,
     Json(req): Json<RegisterRequest>,

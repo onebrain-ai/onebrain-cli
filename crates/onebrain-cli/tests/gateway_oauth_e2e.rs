@@ -1094,7 +1094,7 @@ fn gateway_tokens_revoke_takes_effect_on_the_running_gateways_next_request() {
             .current_dir(cwd.path())
             .args(args)
             .output()
-            .unwrap_or_else(|e| panic!("spawn onebrain {args:?}: {e}"))
+            .unwrap_or_else(|e| panic!("spawn onebrain ({} args): {e}", args.len()))
     };
     let listed = cli(&["gateway", "tokens", "list", "--json"]);
     assert!(listed.status.success());
@@ -1124,7 +1124,8 @@ fn gateway_tokens_revoke_takes_effect_on_the_running_gateways_next_request() {
     let (status, body) = post_mcp(&agent, &mcp_url, TOKEN, &init_body(2), &headers);
     assert_eq!(
         status, 401,
-        "a CLI revoke must take effect on the next request: {body}"
+        "a CLI revoke must take effect on the next request ({} body bytes)",
+        body.len()
     );
     assert!(
         child.0.try_wait().expect("poll gateway child").is_none(),
