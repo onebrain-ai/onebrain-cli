@@ -267,3 +267,33 @@ fn tunnel_status_reports_a_missing_token_and_exits_non_zero() {
         "{text}"
     );
 }
+
+#[test]
+fn service_status_on_a_broken_gateway_yml_shows_the_config_error_and_fails() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".onebrain")).unwrap();
+    std::fs::write(home.path().join(".onebrain/gateway.yml"), "port: [\n").unwrap();
+    let out = onebrain(home.path(), None)
+        .args(["gateway", "service", "status"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    if cfg!(target_os = "macos") {
+        assert!(!out.status.success());
+        assert!(text.contains("✗ gateway-config"), "{text}");
+        assert!(!text.contains("gateway.yml missing"), "{text}");
+    }
+}
+
+#[test]
+fn service_status_with_no_gateway_yml_says_not_configured() {
+    let home = tempfile::tempdir().unwrap();
+    let out = onebrain(home.path(), None)
+        .args(["gateway", "service", "status"])
+        .output()
+        .unwrap();
+    if cfg!(target_os = "macos") {
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("gateway.yml missing"));
+    }
+}

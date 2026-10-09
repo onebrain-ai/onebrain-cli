@@ -482,6 +482,7 @@ pub fn service_status(_mode: &crate::output::OutputMode) -> anyhow::Result<()> {
         return Err(unsupported_os_error());
     }
     super::health::print_status(&[
+        super::health::CHECK_CONFIG,
         super::health::CHECK_SERVICE,
         super::health::CHECK_LOCAL,
         super::health::CHECK_TUNNEL,

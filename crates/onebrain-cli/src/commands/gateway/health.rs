@@ -42,7 +42,17 @@ pub(crate) fn plist_program(xml: &str) -> Option<PathBuf> {
     let rest = &xml[xml.find("<key>ProgramArguments</key>")?..];
     let start = rest.find("<string>")? + "<string>".len();
     let end = rest[start..].find("</string>")? + start;
-    Some(PathBuf::from(&rest[start..end]))
+    Some(PathBuf::from(unescape_xml(&rest[start..end])))
+}
+
+/// Inverse of the plist writer's escaping (`&amp;` last, so `&amp;lt;`
+/// decodes to the literal text `&lt;`).
+fn unescape_xml(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 /// Which macOS privacy-protected (TCC) folder `vault` sits in, if any: a
@@ -50,14 +60,41 @@ pub(crate) fn plist_program(xml: &str) -> Option<PathBuf> {
 /// `gateway run` works (red-team item 11). Component-wise, so
 /// `~/DocumentsX` is not `~/Documents`.
 pub(crate) fn protected_vault_folder(home: &Path, vault: &Path) -> Option<&'static str> {
+    // A literal `~/` in gateway.yml is not expanded by the YAML loader.
+    let vault = match vault.strip_prefix("~") {
+        Ok(rest) => home.join(rest),
+        Err(_) => vault.to_path_buf(),
+    };
+    let mut vaults = vec![vault.clone()];
+    vaults.extend(std::fs::canonicalize(&vault).ok());
     [
         ("Documents", "~/Documents"),
         ("Desktop", "~/Desktop"),
         ("Library/Mobile Documents", "iCloud Drive"),
     ]
     .into_iter()
-    .find(|(rel, _)| vault.starts_with(home.join(rel)))
+    .find(|(rel, _)| {
+        let root = home.join(rel);
+        let mut roots = vec![root.clone()];
+        roots.extend(std::fs::canonicalize(&root).ok());
+        vaults
+            .iter()
+            .any(|v| roots.iter().any(|r| path_starts_with(v, r)))
+    })
     .map(|(_, label)| label)
+}
+
+/// Component-wise `starts_with`; case-insensitive on macOS (APFS default).
+fn path_starts_with(path: &Path, root: &Path) -> bool {
+    if !cfg!(target_os = "macos") {
+        return path.starts_with(root);
+    }
+    let fold = |p: &Path| -> Vec<String> {
+        p.components()
+            .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+            .collect()
+    };
+    fold(path).starts_with(&fold(root))
 }
 
 pub(crate) struct HealthEnv<'a> {
@@ -121,7 +158,7 @@ pub(crate) fn collect(env: &HealthEnv) -> Option<Vec<DoctorResult>> {
             None
         }
     };
-    let service_installed = env.service.is_some_and(|p| p.plist(GATEWAY_LABEL).exists());
+    let service_installed = env.service.filter(|p| p.plist(GATEWAY_LABEL).exists());
     if let Some(cfg) = &config {
         if let Some(paths) = env.service {
             rows.push(service_row(paths, env.launcher, cfg));
@@ -190,10 +227,12 @@ fn service_row(paths: &ServicePaths, launcher: &dyn Launcher, cfg: &GatewayConfi
         .with_hint("onebrain gateway service install");
     }
     let mut worst = DoctorStatus::Ok;
+    let mut tunnel_missing = false;
     let mut parts = Vec::new();
     for label in labels {
         if !paths.plist(label).exists() {
             worst = DoctorStatus::Error;
+            tunnel_missing |= label == TUNNEL_LABEL;
             parts.push(format!("com.onebrain.{label} not installed"));
             continue;
         }
@@ -238,18 +277,32 @@ fn service_row(paths: &ServicePaths, launcher: &dyn Launcher, cfg: &GatewayConfi
     let msg = parts.join(" · ");
     match worst {
         DoctorStatus::Ok => DoctorResult::ok(CHECK_SERVICE, msg),
-        _ => DoctorResult::error(CHECK_SERVICE, msg).with_hint("onebrain gateway service install"),
+        _ => DoctorResult::error(CHECK_SERVICE, msg).with_hint(if tunnel_missing {
+            "onebrain gateway tunnel setup, then onebrain gateway service install"
+        } else {
+            "onebrain gateway service install"
+        }),
     }
 }
 
-fn local_row(http: &dyn HttpProbe, cfg: &GatewayConfig, service_installed: bool) -> DoctorResult {
+fn local_row(
+    http: &dyn HttpProbe,
+    cfg: &GatewayConfig,
+    service_installed: Option<&ServicePaths>,
+) -> DoctorResult {
     match http.get_json(&local_probe_url(cfg.port), PROBE_TIMEOUT) {
         Ok(_) => DoctorResult::ok(CHECK_LOCAL, format!("answering on 127.0.0.1:{}", cfg.port)),
-        Err(e) if service_installed => DoctorResult::error(
+        Err(e) if service_installed.is_some() => DoctorResult::error(
             CHECK_LOCAL,
             format!("not answering on 127.0.0.1:{} ({e})", cfg.port),
         )
-        .with_hint("see ~/Library/Logs/onebrain/gateway.log"),
+        .with_hint(format!(
+            "see {}",
+            service_installed
+                .map(|p| p.log_dir.join("gateway.log"))
+                .unwrap_or_default()
+                .display()
+        )),
         Err(_) => DoctorResult::warn(
             CHECK_LOCAL,
             format!("not running on 127.0.0.1:{}", cfg.port),
@@ -738,15 +791,123 @@ mod tests {
     #[test]
     fn no_row_ever_carries_the_tunnel_token() {
         let (_r, paths) = healthy_home();
+        std::fs::write(
+            paths.plist("gateway-tunnel"),
+            format!("<key>TUNNEL_TOKEN</key>\n<string>{TOKEN}</string>"),
+        )
+        .unwrap();
         let mut f = green_fakes();
         f.http.remove(PUBLIC);
-        f.loaded.clear();
-        for (status, msg) in rows(&paths, &f).values() {
-            assert!(
-                !msg.contains(TOKEN),
-                "a row leaked the tunnel token ({status:?})"
-            );
+        for loaded in [true, false] {
+            if !loaded {
+                f.loaded.clear();
+            }
+            let env = HealthEnv {
+                onebrain_dir: &paths.onebrain_dir,
+                service: Some(&paths),
+                launcher: &f,
+                http: &f,
+            };
+            for r in collect(&env).unwrap() {
+                let text = format!("{} {}", r.message, r.hint.unwrap_or_default());
+                assert!(!text.contains(TOKEN), "{} leaked the tunnel token", r.check);
+            }
         }
+    }
+
+    fn service_hint(paths: &ServicePaths, f: &Fakes, check: &str) -> String {
+        collect(&HealthEnv {
+            onebrain_dir: &paths.onebrain_dir,
+            service: Some(paths),
+            launcher: f,
+            http: f,
+        })
+        .unwrap()
+        .into_iter()
+        .find(|r| r.check == check)
+        .unwrap()
+        .hint
+        .unwrap()
+    }
+
+    #[test]
+    fn a_missing_tunnel_agent_hint_starts_with_tunnel_setup() {
+        let (_r, paths) = healthy_home();
+        std::fs::remove_file(paths.plist("gateway-tunnel")).unwrap();
+        let hint = service_hint(&paths, &green_fakes(), CHECK_SERVICE);
+        assert!(hint.starts_with("onebrain gateway tunnel setup"), "{hint}");
+    }
+
+    #[test]
+    fn local_down_hint_names_the_sandboxed_log_dir() {
+        let (_r, paths) = healthy_home();
+        let mut f = green_fakes();
+        f.http.remove(LOCAL);
+        let hint = service_hint(&paths, &f, CHECK_LOCAL);
+        assert!(
+            hint.contains(&paths.log_dir.display().to_string()),
+            "hint must use ServicePaths.log_dir: {hint}"
+        );
+    }
+
+    #[test]
+    fn plist_program_decodes_xml_entities() {
+        let xml = "<key>ProgramArguments</key><array><string>/opt/R&amp;D/onebrain</string>";
+        assert_eq!(plist_program(xml), Some(PathBuf::from("/opt/R&D/onebrain")));
+        let (r, paths) = healthy_home();
+        let dir = r.path().join("R&D");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("onebrain");
+        std::fs::write(&exe, "").unwrap();
+        std::fs::write(
+            paths.plist("gateway"),
+            format!(
+                "<key>ProgramArguments</key><array><string>{}</string>",
+                exe.display().to_string().replace('&', "&amp;")
+            ),
+        )
+        .unwrap();
+        let got = rows(&paths, &green_fakes());
+        assert_eq!(
+            got[CHECK_SERVICE].0,
+            DoctorStatus::Ok,
+            "{}",
+            got[CHECK_SERVICE].1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_or_tilde_vault_in_documents_is_a_warning() {
+        let (_r, paths) = healthy_home();
+        let docs = paths.home.join("Documents/real");
+        std::fs::create_dir_all(&docs).unwrap();
+        let link = paths.home.join("brain-link");
+        std::os::unix::fs::symlink(&docs, &link).unwrap();
+        assert_eq!(
+            protected_vault_folder(&paths.home, &link),
+            Some("~/Documents")
+        );
+        assert_eq!(
+            protected_vault_folder(&paths.home, Path::new("~/Documents/x")),
+            Some("~/Documents")
+        );
+        assert_eq!(
+            protected_vault_folder(&paths.home, Path::new("~/brain")),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_case_different_documents_path_is_still_protected_on_macos() {
+        assert_eq!(
+            protected_vault_folder(
+                Path::new("/Users/test"),
+                Path::new("/Users/test/documents/x")
+            ),
+            Some("~/Documents")
+        );
     }
 
     #[test]
