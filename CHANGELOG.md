@@ -108,7 +108,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 - **Breaking/Changed:** the default `policy.approval_wait_seconds` dropped from 300 s to 240 s, and values above 270 s are clamped to 270 s with a startup warning (Claude's tool timeout is 300 s).
-- Approval-gated tool calls now reply as SSE: an immediate "waiting for human approval" notice, 15 s keep-alives, then the result — so they survive Cloudflare's 125 s limit. Other calls stay plain JSON. The gateway declares the MCP `logging` capability for that notice.
+- Approval-gated tool calls now reply as SSE: an immediate "waiting for human approval" notice, 15 s keep-alives, then the result — so they survive Cloudflare's proxy response timeout (roughly 100–125 s). Other calls stay plain JSON. The gateway declares the MCP `logging` capability for that notice.
 - `gateway run` exits cleanly on SIGTERM as well as Ctrl-C: pending approvals are denied, native dialogs withdrawn, and open requests get 5 s.
 - A client disconnect while its call awaits approval denies that approval and writes nothing.
 - `onebrain gateway run` now installs a `tracing` subscriber (stderr, honouring

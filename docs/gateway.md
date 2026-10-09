@@ -7,7 +7,7 @@ onebrain gateway run              # bind the configured (or default 7717) port
 onebrain gateway run --port 0     # let the OS assign an ephemeral port
 ```
 
-- Runs in the foreground until Ctrl-C.
+- Runs in the foreground until Ctrl-C or SIGTERM.
 - Binds **`127.0.0.1` only** — see [Loopback + no remote exposure yet](#loopback--no-remote-exposure-yet) below.
 - The bound URL prints once to stdout on startup: `gateway listening on http://<bound-addr>/mcp`.
 
@@ -193,8 +193,8 @@ Every tool call — allowed or not — is appended as one JSON line to `~/.onebr
 | `tool` | Tool name. |
 | `vault` | Named vault the call resolved, when one was resolvable. |
 | `args_summary` | A **redacted**, one-line description of the call's arguments — e.g. a `brain_capture` call's own note body NEVER appears here, only its character count. Bounded in length: a summary built from an oversized caller argument is cut and marked `[truncated, N bytes total]`, so one client cannot grow this file by sending large parameters. |
-| `decision` | `auto` (policy allowed it outright), `approved` (a human approved it), `denied` (refused — either a human answered "deny", or policy refused it with no human involved at all: a `deny` mode, an OAuth scope/pack mismatch, an unidentifiable caller, or the pending-approval cap being reached), or `timedout` (nothing answered within `approval_wait_seconds`). |
-| `channel` | Which approval channel produced a human decision: `"native"`, `"http"` (the `/approvals` surface), or `"telegram"`. `null` whenever no channel was ever consulted — `auto` (policy allowed it outright, no human involved), a policy `denied` with no human involved, and `timedout` (nothing ever answered) all report `null`; only `approved` and a human `denied` ever carry a channel name. |
+| `decision` | `auto` (policy allowed it outright), `approved` (a human approved it), `denied` (refused — either a human answered "deny", the gateway was shutting down, the client disconnected while the approval was pending, or policy refused it with no human involved at all: a `deny` mode, an OAuth scope/pack mismatch, an unidentifiable caller, or the pending-approval cap being reached), or `timedout` (nothing answered within `approval_wait_seconds`). |
+| `channel` | Which approval channel produced a human decision: `"native"`, `"http"` (the `/approvals` surface), `"telegram"`, or — for a denial the gateway itself caused — `"shutdown"` (the gateway was stopping) or `"disconnect"` (the client went away mid-wait). `null` whenever no channel was ever consulted — `auto` (policy allowed it outright, no human involved), a policy `denied` with no human involved, and `timedout` (nothing ever answered) all report `null`; only `approved` and a `denied` that a human, a shutdown, or a disconnect caused ever carry a channel name. |
 | `duration_ms` | Wall-clock time the call took, including any time spent blocked on approval. |
 | `outcome` | `ok` or `error` — whether the tool's own logic succeeded once it was allowed to run. |
 
