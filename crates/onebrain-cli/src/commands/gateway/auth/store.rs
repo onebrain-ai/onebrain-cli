@@ -2179,10 +2179,6 @@ mod tests {
         ));
     }
 
-    /// The wrappers delegate to locked inner fns and must NOT lock
-    /// themselves: the lock is not re-entrant, so a locked wrapper would
-    /// block forever on its own inner call. A watchdog turns that hang into
-    /// a failure instead of a stuck test run.
     #[test]
     fn a_mutator_recreates_a_deleted_gateway_dir() {
         let (_dir, store) = open_temp();
@@ -2193,6 +2189,10 @@ mod tests {
         assert!(store.root.join("auth.lock").exists());
     }
 
+    /// The wrappers delegate to locked inner fns and must NOT lock
+    /// themselves: the lock is not re-entrant, so a locked wrapper would
+    /// block forever on its own inner call. A watchdog turns that hang into
+    /// a failure instead of a stuck test run.
     #[test]
     fn token_wrappers_do_not_deadlock_on_the_inner_lock() {
         let (_dir, store) = open_temp();
