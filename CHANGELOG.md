@@ -106,6 +106,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   or a `timedout` call, exactly as before. See
   [`docs/gateway.md#telegram-approval-channel`](docs/gateway.md#telegram-approval-channel).
 
+- `onebrain gateway tokens list [--all]` and `tokens revoke <id> | --client <client_id> | --family <family>`
+  (exactly one selector), plus `onebrain gateway clients list` and
+  `clients remove <client_id>` (deletes the registration, revokes its tokens,
+  deletes its pending codes). Token values are never printed: tokens and
+  families are shown by a 12-hex SHA-256 id, and a unique prefix of 4+ chars
+  works. Works with or without `gateway run`; a running gateway honours a
+  revoke on its next request. Revoking by id does not cascade (the output
+  points at `--family` / `clients remove`). See
+  [`docs/gateway.md#managing-access`](docs/gateway.md#managing-access).
+
 ### Changed
 - **Breaking/Changed:** the default `policy.approval_wait_seconds` dropped from 300 s to 240 s, and values above 270 s are clamped to 270 s with a startup warning (Claude's tool timeout is 300 s).
 - Approval-gated tool calls now reply as SSE: an immediate "waiting for human approval" notice, 15 s keep-alives, then the result — so they survive Cloudflare's proxy response timeout (roughly 100–125 s). Other calls stay plain JSON. The gateway declares the MCP `logging` capability for that notice.
@@ -131,6 +141,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - README roadmap re-synced to the 2026-08-28 renumber: Gateway v3.5 · Council
   v3.6 · Studio/Surfaces v3.7 · Terminal v3.8 · Bootstrap v3.9 · cleanup v3.10
   · bundles v3.11+.
+
+- Workspace declares `rust-version = "1.89"` (the cross-process store lock uses std `File::lock`).
 
 ### Security
 - The operator `/approvals` surface is now rate-limited by the SAME
@@ -171,6 +183,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   rejects path prefixes, userinfo, non-numeric ports and an empty host.
 - **Breaking:** `gateway run` prints the pairing code only when stdout is a
   terminal; under a service or redirect it points to `onebrain gateway pair`.
+- The gateway's token/client store takes a cross-process advisory lock
+  (`~/.onebrain/gateway/auth.lock`) around every read-modify-write. Previously
+  a `tokens revoke` from the CLI could be silently undone by a token refresh the
+  running gateway was writing at the same moment (both rewrote the same JSON).
+- `/authorize` and `/token` re-check that the client is still registered after
+  minting, so a client removed mid-exchange (`clients remove` from another
+  terminal) gets nothing usable. The 50-client cap on `/register` is now counted
+  and inserted under the same lock.
+
 
 ## [3.4.25] — 2026-08-28 — Keep Codex hooks alive
 
