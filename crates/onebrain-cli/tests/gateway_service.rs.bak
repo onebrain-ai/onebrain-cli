@@ -128,11 +128,17 @@ fn service_install_and_uninstall_round_trip_without_touching_launchd() {
     );
     let agents = home.join("Library/LaunchAgents");
     let gw = std::fs::read_to_string(agents.join("com.onebrain.gateway.plist")).unwrap();
-    assert!(gw.contains(&format!("<string>{}</string>", EXE)), "{gw}");
+    assert!(
+        gw.contains(&format!(
+            "<string>{}</string>",
+            env!("CARGO_BIN_EXE_onebrain")
+        )),
+        "{gw}"
+    );
     let tn = std::fs::read_to_string(agents.join("com.onebrain.gateway-tunnel.plist")).unwrap();
     assert!(tn.contains("<string>--token-file</string>"), "{tn}");
     // PATH here has no `onebrain`, so the plist names the build under test.
-    assert!(String::from_utf8_lossy(&out.stdout).contains(EXE));
+    assert!(String::from_utf8_lossy(&out.stdout).contains(env!("CARGO_BIN_EXE_onebrain")));
     let log = home.join("Library/Logs/onebrain/gateway.log");
     assert_eq!(
         std::fs::metadata(&log).unwrap().permissions().mode() & 0o777,
