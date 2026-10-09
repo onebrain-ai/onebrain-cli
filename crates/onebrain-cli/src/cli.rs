@@ -370,6 +370,8 @@ pub enum ServiceVerb {
     Install,
     /// Unload and remove both LaunchAgents. Never touches tokens or config.
     Uninstall,
+    /// Both agents loaded and running, local endpoint up, tunnel reaching this gateway.
+    Status,
 }
 
 #[derive(Args, Debug)]
@@ -383,6 +385,8 @@ pub enum TunnelVerb {
     /// Interactive: paste the tunnel token and hostname from the
     /// Cloudflare dashboard; stores the token (0600) and sets `public_url`.
     Setup,
+    /// Token present (0600), public_url set, cloudflared agent running, and the public hostname reaching THIS gateway.
+    Status,
 }
 
 #[derive(Args, Debug)]

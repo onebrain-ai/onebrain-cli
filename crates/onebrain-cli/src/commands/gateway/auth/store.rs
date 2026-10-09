@@ -1190,6 +1190,20 @@ impl AuthStore {
     }
 }
 
+/// Read-only health probe for `doctor`: parse every store file WITHOUT
+/// creating the directory (unlike [`AuthStore::open_at`]), taking `auth.lock`,
+/// or writing anything.
+pub(crate) fn check_files_parse(root: &Path) -> Result<()> {
+    let store = AuthStore {
+        root: root.to_path_buf(),
+    };
+    store.load_clients()?;
+    store.load_codes()?;
+    store.load_tokens()?;
+    store.load_pairing()?;
+    Ok(())
+}
+
 /// RAII guard returned by [`AuthStore::lock_exclusive`]. The OS releases the
 /// lock when the file handle closes, i.e. when this guard drops. Bind it as
 /// `let _guard = …` — `let _ = …` would drop (and unlock) immediately.
@@ -1281,6 +1295,27 @@ fn read_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T>
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn check_files_parse_is_read_only_and_names_the_broken_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("gateway");
+        check_files_parse(&root).unwrap();
+        assert!(!root.exists(), "a health check must not create the store");
+        std::fs::create_dir_all(&root).unwrap();
+        for file in ["clients.json", "codes.json", "tokens.json", "pairing.json"] {
+            std::fs::write(root.join(file), b"{ broken").unwrap();
+            assert!(
+                format!("{:#}", check_files_parse(&root).unwrap_err()).contains(file),
+                "{file}"
+            );
+            std::fs::remove_file(root.join(file)).unwrap();
+        }
+        assert!(
+            !root.join("auth.lock").exists(),
+            "a health check must not take the lock"
+        );
+    }
     use super::*;
 
     fn open_temp() -> (tempfile::TempDir, AuthStore) {

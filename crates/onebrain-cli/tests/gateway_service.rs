@@ -243,3 +243,27 @@ fn service_install_says_not_supported_yet_off_macos() {
     assert!(err.contains("not supported yet on"), "{err}");
     assert!(!home.path().join("Library").exists());
 }
+
+#[test]
+fn tunnel_status_reports_a_missing_token_and_exits_non_zero() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".onebrain")).unwrap();
+    std::fs::write(
+        home.path().join(".onebrain/gateway.yml"),
+        format!(
+            "port: {}\ndefault_vault: /v\npublic_url: 'https://brain.example.com'\n",
+            free_port()
+        ),
+    )
+    .unwrap();
+    let out = onebrain(home.path(), None)
+        .args(["gateway", "tunnel", "status"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("✗ gateway-tunnel") && text.contains("tunnel.token is missing"),
+        "{text}"
+    );
+}

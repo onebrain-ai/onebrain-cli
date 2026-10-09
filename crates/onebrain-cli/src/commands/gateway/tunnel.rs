@@ -384,6 +384,15 @@ pub fn tunnel_setup(_mode: &crate::output::OutputMode) -> anyhow::Result<()> {
     run_tunnel_setup(&mut input, &mut std::io::stdout(), &onebrain_dir, &host).map(|_| ())
 }
 
+/// `onebrain gateway tunnel status`.
+pub fn tunnel_status(_mode: &crate::output::OutputMode) -> anyhow::Result<()> {
+    super::health::print_status(&[
+        super::health::CHECK_CONFIG,
+        super::health::CHECK_SERVICE,
+        super::health::CHECK_TUNNEL,
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

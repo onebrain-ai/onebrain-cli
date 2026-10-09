@@ -49,9 +49,9 @@ pub mod tunnel;
 // Task 4's dead-code-allow removal).
 pub use config::{load_gateway_config, GatewayConfig};
 pub use server::{build_gateway_router, GatewayState};
-pub use service::{service_install, service_uninstall};
+pub use service::{service_install, service_status, service_uninstall};
 pub use telegram_setup::telegram_setup;
-pub use tunnel::tunnel_setup;
+pub use tunnel::{tunnel_setup, tunnel_status};
 
 use std::net::SocketAddr;
 use std::sync::Arc;

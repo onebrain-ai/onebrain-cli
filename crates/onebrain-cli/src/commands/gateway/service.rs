@@ -142,7 +142,7 @@ pub(crate) fn unsupported_os_error() -> anyhow::Error {
 }
 
 /// Per-request ceiling for health probes.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) fn local_probe_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/.well-known/oauth-authorization-server")
@@ -474,6 +474,18 @@ pub fn service_install(_mode: &crate::output::OutputMode) -> anyhow::Result<()> 
         &super::health::UreqProbe,
         &mut std::io::stdout(),
     )
+}
+
+/// `onebrain gateway service status`.
+pub fn service_status(_mode: &crate::output::OutputMode) -> anyhow::Result<()> {
+    if !service_supported() {
+        return Err(unsupported_os_error());
+    }
+    super::health::print_status(&[
+        super::health::CHECK_SERVICE,
+        super::health::CHECK_LOCAL,
+        super::health::CHECK_TUNNEL,
+    ])
 }
 
 /// `onebrain gateway service uninstall`.
