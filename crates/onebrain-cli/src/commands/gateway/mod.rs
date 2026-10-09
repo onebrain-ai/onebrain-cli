@@ -358,7 +358,7 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
         .build()
         .context("build tokio runtime for gateway")?;
 
-    runtime.block_on(async move {
+    let serve = async move {
         let (tx, rx) = tokio::sync::watch::channel(None);
         let shutdown = async move {
             let which = shutdown_signal().await;
@@ -397,7 +397,8 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
             SHUTDOWN_GRACE,
         )
         .await
-    })
+    };
+    block_on_bounded(runtime, serve, RUNTIME_TEARDOWN)
 }
 
 /// `onebrain gateway pair [--rotate]`.
@@ -443,6 +444,30 @@ pub fn pair(_mode: &OutputMode, rotate: bool) -> anyhow::Result<()> {
 /// hub ruling), so those calls answer at once; 5 s then lets ordinary calls
 /// finish and drops anything still open.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long `run` lets the runtime's blocking tasks finish once the server
+/// future has returned. Dropping a tokio runtime waits on its blocking pool
+/// with NO timeout, so one blocking task nobody ends (a native dialog
+/// whose prompt process outlived [`Approvals::deny_all`]'s withdrawal, a
+/// stuck file read) would hold the process past launchd's 20 s SIGKILL.
+/// `shutdown_timeout` rather than `shutdown_background`: a second lets a
+/// blocking task that is nearly done (a vault write mid-`fsync`) finish
+/// cleanly, and SHUTDOWN_GRACE + this still leaves launchd ~14 s of slack.
+///
+/// [`Approvals::deny_all`]: approval::Approvals::deny_all
+const RUNTIME_TEARDOWN: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// `runtime.block_on(fut)`, then tear the runtime down waiting at most
+/// `teardown` for blocking tasks still running — see [`RUNTIME_TEARDOWN`].
+fn block_on_bounded<F: std::future::Future>(
+    runtime: tokio::runtime::Runtime,
+    fut: F,
+    teardown: std::time::Duration,
+) -> F::Output {
+    let out = runtime.block_on(fut);
+    runtime.shutdown_timeout(teardown);
+    out
+}
 
 /// Resolves on Ctrl-C, or — on Unix — SIGTERM (what launchd sends to stop
 /// an agent). Returns which one, for the log line.
@@ -718,6 +743,32 @@ mod tests {
     }
 
     // ── shutdown grace (T3a Task 4) ───────────────────────────────────────
+
+    /// Ruling 8a: a blocking task still running when `run`'s future returns
+    /// (e.g. a native dialog nobody answered) must not hold up process exit
+    /// — dropping a runtime waits on its blocking pool with no timeout.
+    #[test]
+    fn block_on_bounded_returns_despite_a_still_running_blocking_task() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let out = block_on_bounded(
+            runtime,
+            async {
+                tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_secs(10)));
+                7
+            },
+            Duration::from_millis(200),
+        );
+        assert_eq!(out, 7);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
 
     #[tokio::test]
     async fn shutdown_grace_returns_once_the_grace_elapses_after_a_signal() {

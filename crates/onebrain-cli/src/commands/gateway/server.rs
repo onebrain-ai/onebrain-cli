@@ -1237,6 +1237,18 @@ async fn await_approval(
     let id = pending.id.clone();
     let rx = match state.approvals.register(pending.clone()) {
         Ok(rx) => rx,
+        Err(approval::RegisterRejected::ShuttingDown) => {
+            // `deny_all` already ran (ruling 9a): deny this call exactly as
+            // one that was pending at the signal.
+            return Err((
+                Decision::Denied,
+                Some(ResolvedVia::Shutdown),
+                ErrorData::invalid_request(
+                    format!("the gateway is shutting down; this call was denied [{tool}]"),
+                    None,
+                ),
+            ));
+        }
         Err(rejected) => {
             // Operator-facing only: which cap was hit tells an operator
             // whether this is one runaway connector or a wedged gateway.
@@ -5162,6 +5174,43 @@ mod tests {
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["decision"], "denied", "{entries:?}");
         assert_eq!(entries[0]["outcome"], "error", "{entries:?}");
+    }
+
+    /// Ruling 9a: a gated call that reaches the registry after shutdown's
+    /// `deny_all` closed it is denied as a shutdown — same message and audit
+    /// channel as one that was pending at the signal — not "at capacity".
+    #[tokio::test]
+    async fn a_gated_call_arriving_after_shutdown_is_denied_as_a_shutdown() {
+        let (dir, router, state, token) =
+            fixture_router_with_mutating_policy(policy::PolicyMode::AskOnce, 300, 30);
+        state.approvals.deny_all(ResolvedVia::Shutdown);
+
+        let body = call_body(
+            1,
+            "brain_capture",
+            serde_json::json!({"title": "Late", "text": "should never be written"}),
+        );
+        let resp = tokio::time::timeout(
+            Duration::from_secs(5),
+            post(
+                &router,
+                body,
+                &token,
+                &standard_headers("tools/call", Some("brain_capture")),
+            ),
+        )
+        .await
+        .expect("a call after shutdown must be refused immediately");
+
+        let message = resp["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a JSON-RPC error: {resp}"));
+        assert!(message.contains("shutting down"), "{message}");
+        assert_eq!(inbox_note_count(dir.path()), 0);
+        let entries = read_audit_entries(dir.path());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["decision"], "denied", "{entries:?}");
+        assert_eq!(entries[0]["channel"], "shutdown", "{entries:?}");
     }
 
     // ── Fix wave: grants are vault-scoped (F5) ───────────────────────────
