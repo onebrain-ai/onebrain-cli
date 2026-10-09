@@ -2198,3 +2198,36 @@ fn doctor_shows_gateway_checks_only_when_gateway_yml_exists() {
     );
     assert_eq!(status("gateway-local").as_deref(), Some("warn"), "{rows:?}");
 }
+
+#[cfg(unix)]
+#[test]
+fn doctor_reports_an_unparseable_gateway_yml_as_an_error_and_exits_1() {
+    let vault = tempdir().unwrap();
+    write_minimal_vault(vault.path());
+    let home = tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".onebrain")).unwrap();
+    std::fs::write(
+        home.path().join(".onebrain/gateway.yml"),
+        "port: [not, a, port\n",
+    )
+    .unwrap();
+    let out = Command::cargo_bin("onebrain")
+        .unwrap()
+        .current_dir(vault.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
+        .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mut rows = Vec::new();
+    check_statuses(&v, &mut rows);
+    assert!(
+        rows.contains(&("gateway-config".to_string(), "error".to_string())),
+        "{rows:?}"
+    );
+    assert_eq!(out.status.code(), Some(1), "{rows:?}");
+}
