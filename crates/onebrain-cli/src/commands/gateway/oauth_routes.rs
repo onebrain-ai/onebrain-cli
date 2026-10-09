@@ -44,7 +44,7 @@
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-use axum::extract::{Form, Query, State};
+use axum::extract::{DefaultBodyLimit, Form, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -82,6 +82,12 @@ const MAX_CLIENT_NAME_CHARS: usize = 100;
 
 /// Per-`redirect_uri` limit, in bytes.
 const MAX_REDIRECT_URI_BYTES: usize = 2048;
+
+/// Request-body cap for the unauthenticated `POST /register`, `/token` and
+/// `/authorize` routes (#404). A legitimate body is well under 8 KiB; without
+/// a cap axum's 2 MiB default lets an anonymous caller make the gateway
+/// buffer and parse 2 MiB per request. `/mcp` is deliberately not capped here.
+const MAX_OAUTH_BODY_BYTES: usize = 64 * 1024;
 
 /// Fixed-window `/register` rate limiter (#404 item 3) — same shape and
 /// rationale as [`AttemptState`]: global (single-user gateway), in-memory
@@ -752,6 +758,7 @@ async fn register_client_handler(
 pub fn register_router(ctx: Arc<AuthCtx>) -> Router {
     Router::new()
         .route("/register", post(register_client_handler))
+        .layer(DefaultBodyLimit::max(MAX_OAUTH_BODY_BYTES))
         .with_state(ctx)
 }
 
@@ -1214,6 +1221,8 @@ fn redirect_with_code(ctx: &AuthCtx, req: &ValidatedAuthorize, code: &str) -> Re
 /// are the two a caller fully controls (client_name via `/register`'s
 /// `client_name` field, state via this very request), so both are covered
 /// by the `xss_*` regression tests below.
+// The name sits in <bdi> so a right-to-left override (U+202E) inside it cannot
+// reorder the unverified label that follows.
 fn render_consent_form(req: &ValidatedAuthorize, notice: Option<&str>) -> Response {
     let client_name = req
         .client
@@ -1227,7 +1236,7 @@ fn render_consent_form(req: &ValidatedAuthorize, notice: Option<&str>) -> Respon
     let html = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
          <title>Authorize access</title></head><body>\
-         <h1>Authorize {client_name} <small>(name provided by the app — not verified)</small></h1>\
+         <h1>Authorize <bdi>{client_name}</bdi> <small>(name provided by the app — not verified)</small></h1>\
          <p>This application is requesting access to: <strong>{scope}</strong></p>\
          <p>After you approve, your browser will be sent to <strong>{host}</strong> at this exact address:</p>\
          <p><code>{redirect_uri}</code></p>\
@@ -1425,6 +1434,7 @@ pub fn authorize_router(ctx: Arc<AuthCtx>) -> Router {
             "/authorize",
             get(authorize_get_handler).post(authorize_post_handler),
         )
+        .layer(DefaultBodyLimit::max(MAX_OAUTH_BODY_BYTES))
         .with_state(ctx)
 }
 
@@ -1743,6 +1753,7 @@ async fn token_handler(State(ctx): State<Arc<AuthCtx>>, Form(req): Form<TokenReq
 pub fn token_router(ctx: Arc<AuthCtx>) -> Router {
     Router::new()
         .route("/token", post(token_handler))
+        .layer(DefaultBodyLimit::max(MAX_OAUTH_BODY_BYTES))
         .with_state(ctx)
 }
 
@@ -3345,7 +3356,7 @@ mod tests {
         );
         assert!(
             body.contains(
-                "<h1>Authorize Claude <small>(name provided by the app — not verified)</small></h1>"
+                "<h1>Authorize <bdi>Claude</bdi> <small>(name provided by the app — not verified)</small></h1>"
             ),
             "{body}"
         );
@@ -3357,6 +3368,52 @@ mod tests {
             !body.contains("<b>&"),
             "raw redirect_uri must never appear: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn consent_page_isolates_the_client_name_in_bdi_so_rtl_override_cannot_reach_the_label() {
+        let (_dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
+        let redirect = "https://claude.ai/cb";
+        let client_id = register_web_client(&ctx, Some("evil\u{202E}name"), redirect);
+        let resp = get_authorize(&router, &valid_params(&client_id, redirect, "s1")).await;
+        let body = body_text(resp).await;
+        assert!(
+            body.contains(
+                "<h1>Authorize <bdi>evil\u{202E}name</bdi> <small>(name provided by the app — not verified)</small></h1>"
+            ),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_post_routes_reject_a_body_over_64_kib_and_persist_nothing() {
+        let (dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let big = "a".repeat(MAX_OAUTH_BODY_BYTES + 1);
+        let register = register_router(ctx.clone());
+        let body = json!({"redirect_uris": ["https://claude.ai/cb"], "client_name": big});
+        let resp = post_register_raw(&register, body).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(ctx.store.lock().unwrap().client_count().unwrap(), 0);
+        let _ = dir;
+        for (router, uri) in [
+            (token_router(ctx.clone()), "/token"),
+            (authorize_router(ctx.clone()), "/authorize"),
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(
+                    axum::http::header::CONTENT_TYPE,
+                    "application/x-www-form-urlencoded",
+                )
+                .body(Body::from(format!("state={big}")))
+                .unwrap();
+            let resp = router.oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE, "{uri}");
+        }
+        // A normal registration still passes.
+        let ok = post_register_raw(&register, web_registration()).await;
+        assert_eq!(ok.status(), StatusCode::CREATED);
     }
 
     /// CSRF posture (#404 item 6): fetch metadata saying "another site
