@@ -176,7 +176,7 @@ pub struct PolicyConfig {
     /// (minutes-to-hours scale), while this one bounds how long the
     /// CURRENT, still-synchronous MCP tool call waits for a first decision
     /// (seconds-to-minutes scale) — conflating the two into one field would
-    /// make it impossible for an operator to want "ask me and wait up to 5
+    /// make it impossible for an operator to want "ask me and wait a few
     /// minutes" independently of "then remember it for a day". Default 240 s
     /// and never more than [`MAX_APPROVAL_WAIT_SECONDS`]: Claude's tool calls
     /// time out at 300 s, so a longer wait could only ever end in the

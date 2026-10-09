@@ -295,6 +295,10 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
             anyhow::bail!("gateway.yml `public_url` ({url:?}) is invalid: {reason}");
         }
     }
+    // `approval_wait_seconds` above the 270 s ceiling is lowered to it, with a warning.
+    if let Some(warning) = config.policy.clamp_approval_wait() {
+        tracing::warn!("gateway.yml: {warning}");
+    }
     // Legal-but-almost-certainly-unintended `policy:` values (today: only
     // `approval_wait_seconds: 0`, which silently refuses every gated call on
     // an instant timeout). Warnings, never a hard failure — each flagged
@@ -302,9 +306,6 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
     // The rules themselves live in `PolicyConfig::startup_warnings` and are
     // unit-tested there; this loop only logs them, because `run()` itself is
     // subprocess-only under coverage.
-    if let Some(warning) = config.policy.clamp_approval_wait() {
-        tracing::warn!("gateway.yml: {warning}");
-    }
     for warning in config.policy.startup_warnings() {
         tracing::warn!("gateway.yml: {warning}");
     }

@@ -275,7 +275,7 @@ A common question for tools like a future `reindex`: can an agent kick off long 
 onebrain gateway run [--port N]
 ```
 
-- An approval-gated call replies as an SSE stream (a wait notice, then 15 s keep-alives, then the result); every other call is plain JSON. The server declares the `logging` capability for that notice.
+- An approval-gated call replies as an SSE stream (a wait notice, then 15 s keep-alives, then the result); every other call is plain JSON. The server declares the `logging` capability for that notice; `logging/setLevel` is accepted but the level is ignored (stateless: the info notice is what opens the SSE stream, so it is never filtered).
 
 - **Endpoint**: `http://127.0.0.1:<port>/mcp` — Streamable HTTP (stateless/sessionless mode), protocol `2026-07-28` pinned as the negotiation fallback (an older KNOWN version a client legitimately requests, e.g. `2025-11-25`, is still echoed back). The bound URL prints once to stdout on startup: `gateway listening on http://<bound-addr>/mcp`.
 - **Tools** (the "Brain pack"):
