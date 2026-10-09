@@ -2172,9 +2172,8 @@ mod tests {
         assert_eq!(body["error"], json!("invalid_redirect_uri"));
     }
 
-    /// The happy-path loopback shapes must still all pass after the fix —
-    /// a regression guard that the stricter port parsing didn't collaterally
-    /// reject well-formed URIs.
+    /// `[::1]` is a loopback redirect host only at a host boundary (end, `/`,
+    /// or `:<digits>`); lookalike hosts and userinfo tricks stay rejected.
     #[test]
     fn is_loopback_redirect_uri_accepts_ipv6_loopback_with_a_host_boundary() {
         for ok in [
@@ -2233,6 +2232,9 @@ mod tests {
         ));
     }
 
+    /// The happy-path loopback shapes must still all pass after the fix —
+    /// a regression guard that the stricter port parsing didn't collaterally
+    /// reject well-formed URIs.
     #[tokio::test]
     async fn register_accepts_well_formed_loopback_shapes_after_userinfo_confusion_fix() {
         let (_dir, router) = register_router_with_issuer("http://127.0.0.1:7717");

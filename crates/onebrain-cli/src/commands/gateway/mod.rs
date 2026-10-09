@@ -249,9 +249,15 @@ fn validate_public_url(raw: &str) -> Result<(), String> {
         );
     }
 
+    // A `@` means userinfo: `http://localhost:80@evil.com` has host
+    // `evil.com`, not `localhost`.
+    if authority.contains('@') {
+        return Err("must not contain userinfo (user@host)".to_string());
+    }
+
     // Bracket-aware: an IPv6 literal (`[::1]:7717`) contains colons, so a
     // plain `split(':')` would yield `[` as the host.
-    let host = if authority.starts_with('[') {
+    let (host, port) = if authority.starts_with('[') {
         let Some(end) = authority.find(']') else {
             return Err("has an unterminated IPv6 address literal".to_string());
         };
@@ -259,10 +265,21 @@ fn validate_public_url(raw: &str) -> Result<(), String> {
         if !(after.is_empty() || after.starts_with(':')) {
             return Err("has a malformed host".to_string());
         }
-        &authority[..=end]
+        (&authority[..=end], after.strip_prefix(':'))
     } else {
-        authority.split(':').next().unwrap_or(authority)
+        match authority.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        }
     };
+    if let Some(port) = port {
+        let valid = !port.is_empty()
+            && port.bytes().all(|b| b.is_ascii_digit())
+            && port.parse::<u16>().is_ok_and(|n| n >= 1);
+        if !valid {
+            return Err("has an invalid port (must be 1-65535)".to_string());
+        }
+    }
     let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
 
     match scheme {
@@ -746,6 +763,50 @@ mod tests {
         assert!(validate_public_url("http://[::1]:7717").is_ok());
         assert!(validate_public_url("http://[::1]").is_ok());
         assert!(validate_public_url("https://[::1]:7717").is_ok());
+    }
+
+    /// Userinfo (`user@`) and malformed ports must be refused for EVERY host:
+    /// `http://localhost:80@evil.com` really has host `evil.com`, so reading
+    /// the host with `split(':')` would wave an insecure http issuer through.
+    #[test]
+    fn validate_public_url_rejects_userinfo_and_malformed_ports_for_all_hosts() {
+        for bad in [
+            "http://[::1]:80@evil.com",
+            "http://localhost:80@evil.com",
+            "http://127.0.0.1:80@evil.com",
+            "https://user@gw.example.com",
+            "https://user:pw@gw.example.com",
+            "http://[::1]:abc",
+            "http://localhost:",
+            "http://localhost:0",
+            "http://localhost:65536",
+            "https://gw.example.com:99999",
+            "https://gw.example.com:1:2",
+        ] {
+            let err = validate_public_url(bad).expect_err(bad);
+            assert!(!err.contains("pw"), "must not echo secrets: {err}");
+        }
+        assert!(validate_public_url("http://localhost:65535").is_ok());
+    }
+
+    /// Every public_url the validator accepts must yield the same host from
+    /// `host_guard::allowed_hosts` (bracket-stripped, lower-cased).
+    #[test]
+    fn validate_public_url_and_allowed_hosts_agree_on_the_host() {
+        for (url, host) in [
+            ("http://localhost:7717", "localhost"),
+            ("http://127.0.0.1", "127.0.0.1"),
+            ("http://[::1]:7717", "::1"),
+            ("https://gw.example.com", "gw.example.com"),
+            ("https://gw.example.com:8443/", "gw.example.com"),
+            ("https://[2001:db8::1]:8443", "2001:db8::1"),
+        ] {
+            assert!(validate_public_url(url).is_ok(), "{url}");
+            assert!(
+                host_guard::allowed_hosts(Some(url)).contains(&host.to_string()),
+                "{url}"
+            );
+        }
     }
 
     #[test]
