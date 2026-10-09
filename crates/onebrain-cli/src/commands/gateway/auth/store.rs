@@ -374,6 +374,71 @@ fn kind_rank(kind: TokenKind) -> u8 {
     }
 }
 
+/// Which tokens [`AuthStore::revoke_tokens`] targets. `Id`/`Family` carry a
+/// prefix ALREADY normalized by [`normalize_id_prefix`]. `Client` is an exact
+/// `client_id`. The CLI's clap `ArgGroup` guarantees exactly one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenSelector {
+    Id(String),
+    Client(String),
+    Family(String),
+}
+
+impl TokenSelector {
+    /// `"id" | "client" | "family"`: the JSON `selector` field and the noun
+    /// used in operator messages.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            TokenSelector::Id(_) => "id",
+            TokenSelector::Client(_) => "client",
+            TokenSelector::Family(_) => "family",
+        }
+    }
+
+    pub fn value(&self) -> &str {
+        match self {
+            TokenSelector::Id(v) | TokenSelector::Client(v) | TokenSelector::Family(v) => v,
+        }
+    }
+}
+
+/// Result of [`AuthStore::revoke_tokens`]. Every id here is a [`display_id`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevokeOutcome {
+    /// Matched. `newly_revoked` (sorted) were flipped by THIS call, and
+    /// `already_revoked` matched but were revoked before (idempotent re-run).
+    Revoked {
+        newly_revoked: Vec<String>,
+        already_revoked: usize,
+    },
+    /// Nothing matched. Nothing was written.
+    NotFound,
+    /// The prefix matched more than one distinct id (sorted, deduped).
+    /// Nothing was written.
+    Ambiguous(Vec<String>),
+}
+
+/// Result of [`AuthStore::remove_client`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedClient {
+    pub client_id: String,
+    pub tokens_revoked: usize,
+    pub codes_removed: usize,
+}
+
+/// `hits` = (display id, `tokens.json` key). Unique iff every hit shares ONE
+/// display id. A family prefix legitimately matches several tokens of the
+/// same family. Returns the keys, or `Err(Ambiguous)` naming the distinct ids.
+fn resolve_unique(hits: Vec<(String, String)>) -> std::result::Result<Vec<String>, RevokeOutcome> {
+    let mut ids: Vec<String> = hits.iter().map(|(id, _)| id.clone()).collect();
+    ids.sort();
+    ids.dedup();
+    if ids.len() > 1 {
+        return Err(RevokeOutcome::Ambiguous(ids));
+    }
+    Ok(hits.into_iter().map(|(_, key)| key).collect())
+}
+
 // ── Store ────────────────────────────────────────────────────────────────
 
 /// Handle onto the four JSON files under `root` (normally
@@ -1007,6 +1072,110 @@ impl AuthStore {
                 }
             })
             .collect())
+    }
+
+    /// Revoke the tokens `selector` names (operator `tokens revoke`).
+    /// Resolution happens INSIDE the store lock, so the set revoked is
+    /// exactly the set resolved. Like [`Self::revoke_token`], `Id` does NOT
+    /// cascade to the family. `Family`/`Client` are the bulk cut-offs.
+    pub fn revoke_tokens(&self, selector: &TokenSelector) -> Result<RevokeOutcome> {
+        let _guard = self.lock_exclusive()?;
+        let mut tokens = self.load_tokens()?;
+        let keys: Vec<String> = match selector {
+            TokenSelector::Client(client_id) => tokens
+                .iter()
+                .filter(|(_, t)| &t.client_id == client_id)
+                .map(|(k, _)| k.clone())
+                .collect(),
+            TokenSelector::Id(prefix) => {
+                let hits = tokens
+                    .keys()
+                    .map(|k| (display_id(k), k.clone()))
+                    .filter(|(id, _)| id.starts_with(prefix.as_str()))
+                    .collect();
+                match resolve_unique(hits) {
+                    Ok(keys) => keys,
+                    Err(ambiguous) => return Ok(ambiguous),
+                }
+            }
+            TokenSelector::Family(prefix) => {
+                let hits = tokens
+                    .iter()
+                    .map(|(k, t)| (display_id(&t.family), k.clone()))
+                    .filter(|(id, _)| id.starts_with(prefix.as_str()))
+                    .collect();
+                match resolve_unique(hits) {
+                    Ok(keys) => keys,
+                    Err(ambiguous) => return Ok(ambiguous),
+                }
+            }
+        };
+        if keys.is_empty() {
+            return Ok(RevokeOutcome::NotFound);
+        }
+        let mut newly_revoked = Vec::new();
+        let mut already_revoked = 0usize;
+        for key in &keys {
+            if let Some(t) = tokens.get_mut(key) {
+                if t.revoked {
+                    already_revoked += 1;
+                } else {
+                    t.revoked = true;
+                    newly_revoked.push(display_id(key));
+                }
+            }
+        }
+        if !newly_revoked.is_empty() {
+            self.save_tokens(&tokens)?;
+        }
+        newly_revoked.sort();
+        Ok(RevokeOutcome::Revoked {
+            newly_revoked,
+            already_revoked,
+        })
+    }
+
+    /// Remove `client_id`'s registration AND cut it off. Every token it holds
+    /// is revoked (kept on disk, so `tokens list --all` still shows them until
+    /// [`Self::purge_expired`] sweeps them). Every auth code issued to it is
+    /// deleted, so a code mid-flight can't mint a new pair afterwards.
+    /// `Ok(None)` (nothing written) if no such client is registered.
+    ///
+    /// Write order is tokens → codes → registration. A crash part-way leaves
+    /// the client still LISTED (re-run `clients remove`), never a client that
+    /// looks removed but still holds live tokens.
+    pub fn remove_client(&self, client_id: &str) -> Result<Option<RemovedClient>> {
+        let _guard = self.lock_exclusive()?;
+        let mut clients = self.load_clients()?;
+        if clients.remove(client_id).is_none() {
+            return Ok(None);
+        }
+
+        let mut tokens = self.load_tokens()?;
+        let mut tokens_revoked = 0usize;
+        for t in tokens.values_mut() {
+            if t.client_id == client_id && !t.revoked {
+                t.revoked = true;
+                tokens_revoked += 1;
+            }
+        }
+        let mut codes = self.load_codes()?;
+        let before = codes.len();
+        codes.retain(|_, c| c.client_id != client_id);
+        let codes_removed = before - codes.len();
+
+        if tokens_revoked > 0 {
+            self.save_tokens(&tokens)?;
+        }
+        if codes_removed > 0 {
+            self.save_codes(&codes)?;
+        }
+        self.save_clients(&clients)?;
+        Ok(Some(RemovedClient {
+            client_id: client_id.to_string(),
+            tokens_revoked,
+            codes_removed,
+        }))
     }
 }
 
@@ -2273,5 +2442,241 @@ mod tests {
         assert_eq!(clients[0].live_tokens, 3);
         assert_eq!(clients[1].client_id, "c2");
         assert_eq!(clients[1].live_tokens, 0);
+    }
+
+    /// Two distinct strings `"{tag}-{i}"` whose display ids share their first
+    /// MIN_ID_PREFIX_LEN hex chars, plus that shared prefix. Deterministic
+    /// (SHA-256) birthday search; pigeonhole guarantees a hit by 65 537.
+    fn colliding_pair(tag: &str) -> (String, String, String) {
+        let mut seen: BTreeMap<String, String> = BTreeMap::new();
+        for i in 0..70_000u32 {
+            let s = format!("{tag}-{i}");
+            let p = display_id(&s)[..MIN_ID_PREFIX_LEN].to_string();
+            if let Some(prev) = seen.get(&p) {
+                return (prev.clone(), s, p);
+            }
+            seen.insert(p, s);
+        }
+        unreachable!("pigeonhole: 65 536 four-hex-char prefixes");
+    }
+
+    #[test]
+    fn revoke_tokens_by_full_or_prefix_id_revokes_exactly_that_token() {
+        let (_dir, store) = open_temp();
+        let (a1, _r1) = store.issue_token_pair("c1", "brain").unwrap();
+        let (a2, _r2) = store.issue_token_pair("c1", "brain").unwrap();
+        let id = display_id(&a1.token);
+        let out = store
+            .revoke_tokens(&TokenSelector::Id(id[..6].to_string()))
+            .unwrap();
+        assert_eq!(
+            out,
+            RevokeOutcome::Revoked {
+                newly_revoked: vec![id.clone()],
+                already_revoked: 0
+            }
+        );
+        assert!(store.check_access(&a1.token).unwrap().is_none());
+        assert!(store.check_access(&a2.token).unwrap().is_some());
+        // Idempotent: the same id again reports it as already revoked.
+        assert_eq!(
+            store.revoke_tokens(&TokenSelector::Id(id)).unwrap(),
+            RevokeOutcome::Revoked {
+                newly_revoked: vec![],
+                already_revoked: 1
+            }
+        );
+    }
+
+    #[test]
+    fn revoke_tokens_by_id_does_not_cascade_to_the_family() {
+        let (_dir, store) = open_temp();
+        let (access, refresh) = store.issue_token_pair("c1", "brain").unwrap();
+        store
+            .revoke_tokens(&TokenSelector::Id(display_id(&access.token)))
+            .unwrap();
+        match store.rotate_refresh(&refresh.token).unwrap() {
+            RotateOutcome::Rotated { .. } => {}
+            other => panic!("the sibling refresh token must still rotate: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn revoke_tokens_with_an_ambiguous_id_prefix_changes_nothing() {
+        let (_dir, store) = open_temp();
+        let (t1, t2, prefix) = colliding_pair("tok");
+        plant(
+            &store,
+            &[
+                live_record(&t1, "fam-1", "c1"),
+                live_record(&t2, "fam-2", "c1"),
+            ],
+        );
+        let before = store.load_tokens().unwrap();
+        match store.revoke_tokens(&TokenSelector::Id(prefix)).unwrap() {
+            RevokeOutcome::Ambiguous(ids) => {
+                let mut want = vec![display_id(&t1), display_id(&t2)];
+                want.sort();
+                assert_eq!(ids, want);
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+        assert_eq!(store.load_tokens().unwrap(), before, "nothing may change");
+    }
+
+    #[test]
+    fn revoke_tokens_unknown_selector_is_not_found() {
+        let (_dir, store) = open_temp();
+        store.issue_token_pair("c1", "brain").unwrap();
+        assert_eq!(
+            store
+                .revoke_tokens(&TokenSelector::Client("nobody".into()))
+                .unwrap(),
+            RevokeOutcome::NotFound
+        );
+        let (_d, empty) = open_temp();
+        assert_eq!(
+            empty
+                .revoke_tokens(&TokenSelector::Id("abcd".into()))
+                .unwrap(),
+            RevokeOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn revoke_tokens_by_client_and_by_family_are_scoped() {
+        let (_dir, store) = open_temp();
+        let (c1a, c1r) = store.issue_token_pair("c1", "brain").unwrap();
+        let (c2a, _c2r) = store.issue_token_pair("c2", "brain").unwrap();
+        let (c2b, _) = store.issue_token_pair("c2", "brain").unwrap();
+
+        // --family: one family (2 tokens) is NOT ambiguous even though the
+        // prefix matches several tokens; they share one family id.
+        let fam = display_id(&c1a.family);
+        match store
+            .revoke_tokens(&TokenSelector::Family(fam[..5].to_string()))
+            .unwrap()
+        {
+            RevokeOutcome::Revoked {
+                newly_revoked,
+                already_revoked: 0,
+            } => {
+                let mut want = vec![display_id(&c1a.token), display_id(&c1r.token)];
+                want.sort();
+                assert_eq!(newly_revoked, want);
+            }
+            other => panic!("expected Revoked, got {other:?}"),
+        }
+        assert!(store.check_access(&c2a.token).unwrap().is_some());
+
+        // --client: every token of c2, nothing else.
+        match store
+            .revoke_tokens(&TokenSelector::Client("c2".into()))
+            .unwrap()
+        {
+            RevokeOutcome::Revoked { newly_revoked, .. } => assert_eq!(newly_revoked.len(), 4),
+            other => panic!("expected Revoked, got {other:?}"),
+        }
+        assert!(store.check_access(&c2b.token).unwrap().is_none());
+    }
+
+    #[test]
+    fn revoke_tokens_with_an_ambiguous_family_prefix_changes_nothing() {
+        let (_dir, store) = open_temp();
+        let (f1, f2, prefix) = colliding_pair("fam");
+        plant(
+            &store,
+            &[
+                live_record("tok-x", &f1, "c1"),
+                live_record("tok-y", &f2, "c1"),
+            ],
+        );
+        assert!(matches!(
+            store.revoke_tokens(&TokenSelector::Family(prefix)).unwrap(),
+            RevokeOutcome::Ambiguous(ids) if ids.len() == 2
+        ));
+        assert!(store.check_access("tok-x").unwrap().is_some());
+    }
+
+    #[test]
+    fn revoke_tokens_waits_for_the_store_lock() {
+        let (dir, store) = open_temp();
+        let (access, _r) = store.issue_token_pair("c1", "brain").unwrap();
+        let other = AuthStore::open_at(dir.path().join("gateway")).unwrap();
+        let guard = store.lock_exclusive().unwrap();
+        let sel = TokenSelector::Id(display_id(&access.token));
+        let handle = std::thread::spawn(move || other.revoke_tokens(&sel).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "revoke_tokens must wait for the lock"
+        );
+        drop(guard);
+        handle.join().unwrap();
+        assert!(store.check_access(&access.token).unwrap().is_none());
+    }
+
+    #[test]
+    fn remove_client_revokes_its_tokens_deletes_its_codes_and_unregisters_it() {
+        let (_dir, store) = open_temp();
+        store.register_client(client("c1")).unwrap();
+        store.register_client(client("c2")).unwrap();
+        let (a1, r1) = store.issue_token_pair("c1", "brain").unwrap();
+        let (a2, _r2) = store.issue_token_pair("c2", "brain").unwrap();
+        let pending = store
+            .issue_code("c1", "https://cb", "chal", "res", "brain")
+            .unwrap();
+        let other_code = store
+            .issue_code("c2", "https://cb", "chal", "res", "brain")
+            .unwrap();
+
+        let removed = store.remove_client("c1").unwrap().unwrap();
+        assert_eq!(
+            removed,
+            RemovedClient {
+                client_id: "c1".into(),
+                tokens_revoked: 2,
+                codes_removed: 1
+            }
+        );
+        assert!(store.get_client("c1").unwrap().is_none());
+        assert!(store.get_client("c2").unwrap().is_some());
+        assert!(store.check_access(&a1.token).unwrap().is_none());
+        assert_eq!(
+            store.rotate_refresh(&r1.token).unwrap(),
+            RotateOutcome::Invalid,
+            "a removed client's refresh token must not mint a new pair"
+        );
+        assert!(store.consume_code(&pending.code).unwrap().is_none());
+        assert!(store.check_access(&a2.token).unwrap().is_some());
+        assert!(store.find_code_record(&other_code.code).unwrap().is_some());
+    }
+
+    #[test]
+    fn remove_client_of_an_unknown_client_is_none_and_writes_nothing() {
+        let (_dir, store) = open_temp();
+        let (a, _r) = store.issue_token_pair("ghost", "brain").unwrap();
+        assert!(store.remove_client("ghost").unwrap().is_none());
+        assert!(
+            store.check_access(&a.token).unwrap().is_some(),
+            "an unregistered client id must not revoke anything"
+        );
+    }
+
+    #[test]
+    fn remove_client_waits_for_the_store_lock() {
+        let (dir, store) = open_temp();
+        store.register_client(client("c1")).unwrap();
+        let other = AuthStore::open_at(dir.path().join("gateway")).unwrap();
+        let guard = store.lock_exclusive().unwrap();
+        let handle = std::thread::spawn(move || other.remove_client("c1").unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "remove_client must wait for the lock"
+        );
+        drop(guard);
+        assert!(handle.join().unwrap().is_some());
+        assert!(store.get_client("c1").unwrap().is_none());
     }
 }
