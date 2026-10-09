@@ -1335,18 +1335,29 @@ async fn await_approval(
     // dropped (`CancelOnDisconnect`); denying through `resolve` withdraws
     // the native prompt like any other answer, and the Deny arm below
     // closes the Telegram message.
+    //
+    // Cancellation here means TRANSPORT CLOSE only: in rmcp's stateless
+    // mode each POST is its own oneshot serve loop, and a
+    // `notifications/cancelled` POST is answered 202 and dropped
+    // (streamable_http_server/tower.rs ~1900) without reaching this
+    // request's token — such a client's approval stays pending until TTL.
     let wait = state
         .approvals
         .wait(&id, rx, Duration::from_secs(wait_secs));
     let outcome = match ctx {
+        // `biased`, cancel first: an approve racing the disconnect resolves
+        // as the fail-safe denial. An approve landing after `ct` fires may
+        // still see a transient 200/✅; the final state is denied and
+        // nothing is written.
         Some(ctx) => tokio::select! {
-            outcome = wait => outcome,
+            biased;
             () = ctx.ct.cancelled() => {
                 state
                     .approvals
                     .resolve(&id, approval::Decision::Deny, ResolvedVia::Disconnect);
                 WaitOutcome::Decided(approval::Decision::Deny, ResolvedVia::Disconnect)
             }
+            outcome = wait => outcome,
         },
         None => wait.await,
     };

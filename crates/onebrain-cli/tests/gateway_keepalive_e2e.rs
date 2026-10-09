@@ -537,17 +537,30 @@ fn client_disconnect_mid_wait_cancels_the_pending_approval_and_writes_nothing() 
         !inbox.exists() || std::fs::read_dir(&inbox).unwrap().count() == 0,
         "a call whose client disconnected must write nothing"
     );
+    // The pending entry disappears inside the cancel arm, BEFORE the
+    // handler writes its audit line — so poll (5 s) rather than read once.
     let audit_dir = sb.home.join(".onebrain/gateway/audit");
-    let audit: String = std::fs::read_dir(&audit_dir)
-        .expect("audit dir")
-        .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
-        .collect();
-    let entry: serde_json::Value = audit
-        .lines()
-        .rev()
-        .map(|l| serde_json::from_str(l).expect("audit line is JSON"))
-        .find(|e: &serde_json::Value| e["tool"] == "brain_capture")
-        .unwrap_or_else(|| panic!("no brain_capture audit entry: {audit}"));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let entry: serde_json::Value = loop {
+        let audit: String = std::fs::read_dir(&audit_dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|e| std::fs::read_to_string(e.ok()?.path()).ok())
+            .collect();
+        let found = audit
+            .lines()
+            .rev()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|e| e["tool"] == "brain_capture");
+        if let Some(entry) = found {
+            break entry;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no brain_capture audit entry within 5s: {audit}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
     assert_eq!(entry["decision"], "denied", "{entry}");
     assert_eq!(entry["channel"], "disconnect", "{entry}");
 }
