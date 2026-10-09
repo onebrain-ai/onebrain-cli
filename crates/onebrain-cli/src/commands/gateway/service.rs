@@ -135,7 +135,7 @@ pub(crate) fn unsupported_os_error() -> anyhow::Error {
             "gateway service is not supported yet on {}",
             std::env::consts::OS
         ),
-        "keep `onebrain gateway run` and `cloudflared tunnel --no-autoupdate run --token-file \
+        "keep `onebrain gateway run` and `cloudflared tunnel --no-autoupdate --protocol http2 run --token-file \
          ~/.onebrain/gateway/tunnel.token` running under your own supervisor — see \
          docs/gateway.md#use-it-from-your-phone",
     )

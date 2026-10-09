@@ -231,7 +231,7 @@ impl TunnelHost for SystemTunnelHost {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // fields are read by tests; Task 4+ consume them
+#[allow(dead_code)] // only unit tests read these fields; the CLI wrapper ignores the outcome
 pub(crate) struct TunnelSetupOutcome {
     pub public_url: String,
     pub token_file_supported: bool,
@@ -358,7 +358,7 @@ pub(crate) fn run_tunnel_setup(
         writeln!(out, "  onebrain gateway run")?;
         writeln!(
             out,
-            "  {} tunnel --no-autoupdate run --token-file {}",
+            "  {} tunnel --no-autoupdate --protocol http2 run --token-file {}",
             cloudflared.display(),
             token_path.display()
         )?;
@@ -716,7 +716,7 @@ mod tests {
         );
         r.unwrap();
         assert!(
-            out.contains("cloudflared tunnel --no-autoupdate run --token-file"),
+            out.contains("cloudflared tunnel --no-autoupdate --protocol http2 run --token-file"),
             "{out}"
         );
         assert!(!out.contains("service install"), "{out}");

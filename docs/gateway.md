@@ -210,7 +210,7 @@ The gateway's first WRITE tool: creates a new inbox note (`<inbox-folder>/YYYY-M
 
 ## Use it from your phone
 
-Three commands on the Mac, one setting in the Claude app. The service part is macOS only (see the end of this section for other systems).
+Create the tunnel in Cloudflare, run two commands on the Mac, then change one setting in the Claude app. The service part is macOS only (see the end of this section for other systems).
 
 **1. Create the tunnel in Cloudflare** (your domain must already be on Cloudflare). Zero Trust → Networks → Tunnels → *Create a tunnel* → *Cloudflared* → name it. On the install screen, copy the command shown: it contains the tunnel token. Then add a *Public hostname*: pick a subdomain (e.g. `brain.example.com`), service type **HTTP**, URL **`http://127.0.0.1:7717`** (or your `port:`). Use `127.0.0.1`, not `localhost`: the gateway listens only on the IPv4 loopback address. Leave the origin's *HTTP Host Header* setting empty and do not rewrite `Host` anywhere: the gateway checks it (see [Exposure hardening](#exposure-hardening-pre-tunnel)).
 
