@@ -174,31 +174,42 @@ struct Timed {
 /// POST an approval-gated `brain_capture` and stream its reply line by line
 /// on a thread. Returns the reply's content-type, the instant the POST was
 /// sent, and the reader. `send()` returns once response HEADERS arrive —
-/// which, before T3, was only after the human decided.
+/// which, before T3, was only after the human decided — so it runs on the
+/// reader thread and the caller waits at most 5 s (the first-byte bound) for
+/// the headers. ureq's `timeout_recv_response` can't express this: it also
+/// caps the body read at headers + limit, and the body streams for minutes.
 fn open_capture_stream(sb: &Sandbox) -> (String, Instant, JoinHandle<Vec<Timed>>) {
     let body = serde_json::json!({
         "jsonrpc": "2.0", "id": 2, "method": "tools/call",
         "params": {"name": "brain_capture", "arguments": {"title": "keepalive", "text": "hello"}},
     });
+    let url = sb.mcp_url.clone();
+    let (headers_tx, headers_rx) = std::sync::mpsc::channel::<Result<(u16, String), String>>();
     let t0 = Instant::now();
-    let resp = agent(Duration::from_secs(300))
-        .post(&sb.mcp_url)
-        .header("content-type", "application/json")
-        .header("accept", "application/json, text/event-stream")
-        .header("authorization", format!("Bearer {TOKEN}"))
-        .header("MCP-Protocol-Version", PROTOCOL)
-        .header("Mcp-Method", "tools/call")
-        .header("Mcp-Name", "brain_capture")
-        .send(body.to_string())
-        .unwrap_or_else(|e| panic!("POST /mcp failed: {e}"));
-    assert_eq!(resp.status().as_u16(), 200);
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
     let reader = std::thread::spawn(move || {
+        let sent = agent(Duration::from_secs(300))
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("MCP-Protocol-Version", PROTOCOL)
+            .header("Mcp-Method", "tools/call")
+            .header("Mcp-Name", "brain_capture")
+            .send(body.to_string());
+        let resp = match sent {
+            Ok(resp) => resp,
+            Err(e) => {
+                let _ = headers_tx.send(Err(e.to_string()));
+                return Vec::new();
+            }
+        };
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let _ = headers_tx.send(Ok((resp.status().as_u16(), content_type)));
         std::io::BufReader::new(resp.into_body().into_reader())
             .lines()
             .map(|l| l.expect("read streamed line"))
@@ -209,6 +220,17 @@ fn open_capture_stream(sb: &Sandbox) -> (String, Instant, JoinHandle<Vec<Timed>>
             })
             .collect()
     });
+    let (status, content_type) = match headers_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(headers)) => headers,
+        Ok(Err(e)) => panic!("POST /mcp failed: {e}"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            panic!("first byte too late: no response headers within 5s")
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("stream thread died before response headers arrived")
+        }
+    };
+    assert_eq!(status, 200);
     (content_type, t0, reader)
 }
 
