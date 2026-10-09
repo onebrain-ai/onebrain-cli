@@ -336,6 +336,15 @@ impl AuthStore {
         Ok(self.load_clients()?.remove(client_id))
     }
 
+    /// Number of registered clients — `POST /register`'s
+    /// `MAX_REGISTERED_CLIENTS` cap check (#404 item 3). The caller MUST
+    /// hold `AuthCtx::store`'s lock across this AND the following
+    /// `register_client`, or two racing registrations could both pass the
+    /// cap.
+    pub fn client_count(&self) -> Result<usize> {
+        Ok(self.load_clients()?.len())
+    }
+
     // ── Authorization codes ─────────────────────────────────────────────
 
     /// Mint and persist a fresh, single-use auth code (>= 32 random bytes,
@@ -813,6 +822,16 @@ mod tests {
             application_type: AppType::Native,
             created: core::now_epoch_secs(),
         }
+    }
+
+    #[test]
+    fn client_count_tracks_registrations() {
+        let (_dir, store) = open_temp();
+        assert_eq!(store.client_count().unwrap(), 0);
+        store.register_client(client("a")).unwrap();
+        store.register_client(client("b")).unwrap();
+        store.register_client(client("a")).unwrap(); // overwrite, not a new entry
+        assert_eq!(store.client_count().unwrap(), 2);
     }
 
     // ── Clients ──────────────────────────────────────────────────────────

@@ -64,6 +64,54 @@ const MAX_PAIRING_FAILURES: u32 = 5;
 /// How long that lockout lasts, in seconds.
 const PAIRING_LOCKOUT_SECS: u64 = 60;
 
+/// Hard cap on stored client registrations (#404 item 3). `POST /register`
+/// is unauthenticated; without a cap, `clients.json` — fully re-serialized on
+/// every write and re-parsed under the global store mutex on every later
+/// `/authorize` — grows without bound and degrades `/mcp` too. A single-user
+/// gateway has a handful of real clients; 50 is generous headroom.
+const MAX_REGISTERED_CLIENTS: usize = 50;
+
+/// Global `/register` rate limit: at most this many registrations…
+const MAX_REGISTRATIONS_PER_WINDOW: u32 = 10;
+/// …per this many seconds (fixed window). Also the `Retry-After` value.
+const REGISTRATION_WINDOW_SECS: u64 = 60;
+
+/// `client_name` limit, in characters (it is rendered on the consent page).
+const MAX_CLIENT_NAME_CHARS: usize = 100;
+
+/// Per-`redirect_uri` limit, in bytes.
+const MAX_REDIRECT_URI_BYTES: usize = 2048;
+
+/// Fixed-window `/register` rate limiter (#404 item 3) — same shape and
+/// rationale as [`AttemptState`]: global (single-user gateway), in-memory
+/// (a restart resets it, which only helps the owner), and mutated only under
+/// [`AuthCtx::registrations`]'s lock. That lock is taken and released on its
+/// own — never while `store` is held — so it adds no lock-ordering edge.
+#[derive(Debug, Default)]
+pub struct RegistrationWindow {
+    /// Epoch second the current window opened.
+    window_start: u64,
+    /// Registrations admitted in the current window.
+    count: u32,
+}
+
+impl RegistrationWindow {
+    /// Admit one registration at `now` (epoch secs), or refuse it when the
+    /// current window's budget is spent. A window older than
+    /// [`REGISTRATION_WINDOW_SECS`] is replaced by a fresh one first.
+    fn try_admit(&mut self, now: u64) -> bool {
+        if now >= self.window_start.saturating_add(REGISTRATION_WINDOW_SECS) {
+            self.window_start = now;
+            self.count = 0;
+        }
+        if self.count >= MAX_REGISTRATIONS_PER_WINDOW {
+            return false;
+        }
+        self.count += 1;
+        true
+    }
+}
+
 /// Pairing-attempt rate-limiter state: [`MAX_PAIRING_FAILURES`] consecutive
 /// wrong pairing-code submissions → a [`PAIRING_LOCKOUT_SECS`] lockout,
 /// enforced by [`AuthCtx::check_pairing_code`] through [`AuthCtx::attempts`].
@@ -128,6 +176,8 @@ pub struct AuthCtx {
     /// See [`AttemptState`]'s doc comment for the field-level rate-limit
     /// semantics and the lock-ordering discipline shared with `store`.
     pub attempts: Mutex<AttemptState>,
+    /// `POST /register` rate limiter — see [`RegistrationWindow`].
+    pub registrations: Mutex<RegistrationWindow>,
 }
 
 /// Outcome of one rate-limited pairing-code submission
@@ -163,6 +213,7 @@ impl AuthCtx {
             store: Mutex::new(store),
             issuer: OnceLock::new(),
             attempts: Mutex::new(AttemptState::default()),
+            registrations: Mutex::new(RegistrationWindow::default()),
         }
     }
 
@@ -345,9 +396,9 @@ struct RegisterRequest {
 /// request. 10 is far above any real client's need (a legitimate
 /// integration registers a small, fixed handful of redirect targets) while
 /// still rejecting a deliberately-oversized payload outright. This bounds
-/// only the SIZE of one registration; the separate question of an overall
-/// client-COUNT limit or a rate limiter on `/register` itself is tracked as
-/// a pre-tunnel item, not fixed here.
+/// only the SIZE of one registration; the overall client-COUNT cap
+/// ([`MAX_REGISTERED_CLIENTS`]) and the global rate limit
+/// ([`RegistrationWindow`]) bound the rest (#404 item 3).
 const MAX_REDIRECT_URIS_PER_REGISTRATION: usize = 10;
 
 /// `POST {issuer}/register` success body — the exact RFC 7591 §3.2.1 shape
@@ -476,9 +527,9 @@ fn is_loopback_redirect_uri(uri: &str) -> bool {
 ///   `invalid_redirect_uri` otherwise (security review, Important: an
 ///   unauthenticated `POST /register` appending to `clients.json` with no
 ///   bound at all is unbounded on-disk growth — this caps the cost of a
-///   single pathological registration; the separate question of an overall
-///   client-COUNT limit / rate limiter is tracked as a pre-tunnel item, not
-///   fixed here).
+///   single pathological registration; the overall client-COUNT cap
+///   ([`MAX_REGISTERED_CLIENTS`]) and the global rate limit
+///   ([`RegistrationWindow`]) bound the rest (#404 item 3)).
 /// - `application_type` (SEP-837): absent defaults to `"web"`. `"web"` →
 ///   every URI must start with `https://` (host is intentionally
 ///   unchecked here — exact-match host allowlisting happens later, at
@@ -495,6 +546,16 @@ fn is_loopback_redirect_uri(uri: &str) -> bool {
 ///   or persist a client secret — [`RegisterResponse`] has no
 ///   `client_secret` field at all, so there is no code path that could
 ///   emit one even by accident.
+/// - `client_name` longer than [`MAX_CLIENT_NAME_CHARS`] characters →
+///   `invalid_client_metadata`; any `redirect_uri` longer than
+///   [`MAX_REDIRECT_URI_BYTES`] bytes → `invalid_redirect_uri` (the URI is
+///   NOT echoed in that error).
+/// - More than [`MAX_REGISTRATIONS_PER_WINDOW`] registrations in
+///   [`REGISTRATION_WINDOW_SECS`] → `429 temporarily_unavailable` with
+///   `Retry-After`. A store already holding [`MAX_REGISTERED_CLIENTS`] →
+///   `429 access_denied` with NO `Retry-After` (waiting cannot help; the
+///   owner frees a slot with `onebrain gateway clients remove <id>` — hub
+///   ruling, accepted risk R2).
 ///
 /// Persists via [`AuthStore::register_client`] with `ctx.store`'s lock held
 /// across the ENTIRE call — never cloning `AuthStore` out of the mutex, per
@@ -536,6 +597,16 @@ async fn register_client_handler(
         }
     }
 
+    if let Some(name) = req.client_name.as_deref() {
+        if name.chars().count() > MAX_CLIENT_NAME_CHARS {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_client_metadata",
+                format!("client_name must be at most {MAX_CLIENT_NAME_CHARS} characters"),
+            );
+        }
+    }
+
     if req.redirect_uris.is_empty() {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -553,6 +624,13 @@ async fn register_client_handler(
         );
     }
     for uri in &req.redirect_uris {
+        if uri.len() > MAX_REDIRECT_URI_BYTES {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_redirect_uri",
+                format!("each redirect_uri must be at most {MAX_REDIRECT_URI_BYTES} bytes"),
+            );
+        }
         let valid = match app_type {
             AppType::Web => uri.starts_with("https://"),
             AppType::Native => is_loopback_redirect_uri(uri),
@@ -580,18 +658,69 @@ async fn register_client_handler(
         created: now_epoch_secs(),
     };
 
-    // Lock held across the FULL store mutation — see the doc comment above.
-    let saved = {
-        let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
-        store.register_client(registered)
-    };
-    if let Err(e) = saved {
-        tracing::error!(error = %e, "failed to persist dynamically registered client");
-        return oauth_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            "failed to persist client registration",
+    let admitted = ctx
+        .registrations
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .try_admit(now_epoch_secs());
+    if !admitted {
+        tracing::warn!(
+            "rate-limited POST /register: more than {MAX_REGISTRATIONS_PER_WINDOW} registrations in {REGISTRATION_WINDOW_SECS}s"
         );
+        let mut resp = oauth_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "temporarily_unavailable",
+            format!(
+                "too many client registrations — at most {MAX_REGISTRATIONS_PER_WINDOW} per \
+                 {REGISTRATION_WINDOW_SECS} seconds; retry later"
+            ),
+        );
+        resp.headers_mut().insert(
+            header::RETRY_AFTER,
+            HeaderValue::from(REGISTRATION_WINDOW_SECS),
+        );
+        return resp;
+    }
+
+    // Lock held across the cap check AND the insert — see the doc comment
+    // above and `AuthStore::client_count`'s.
+    let saved: anyhow::Result<bool> = {
+        let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
+        store.client_count().and_then(|count| {
+            if count >= MAX_REGISTERED_CLIENTS {
+                Ok(false)
+            } else {
+                store.register_client(registered).map(|()| true)
+            }
+        })
+    };
+    match saved {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(
+                max = MAX_REGISTERED_CLIENTS,
+                "refused POST /register: client registration limit reached"
+            );
+            // Hub ruling: 429 + the removal hint; no auto-eviction, no
+            // Retry-After (accepted risk R2 — `clients remove` ships in T2).
+            return oauth_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "access_denied",
+                format!(
+                    "this gateway already has the maximum of {MAX_REGISTERED_CLIENTS} registered \
+                     clients; the owner can free a slot with \
+                     `onebrain gateway clients remove <id>`"
+                ),
+            );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to persist dynamically registered client");
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "failed to persist client registration",
+            );
+        }
     }
 
     let body = RegisterResponse {
@@ -2173,6 +2302,150 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED);
+    }
+
+    // ── /register caps (#404 item 3) ─────────────────────────────────────
+
+    async fn post_register_raw(router: &Router, body: Value) -> Response {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/register")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        router.clone().oneshot(req).await.unwrap()
+    }
+
+    fn web_registration() -> Value {
+        json!({"redirect_uris": ["https://claude.ai/api/mcp/auth_callback"]})
+    }
+
+    #[test]
+    fn registration_window_admits_ten_per_minute_then_resets() {
+        let mut window = RegistrationWindow::default();
+        let t0 = 1_000_000;
+        for i in 0..MAX_REGISTRATIONS_PER_WINDOW {
+            assert!(window.try_admit(t0 + u64::from(i)), "registration {i}");
+        }
+        assert!(!window.try_admit(t0 + 30), "11th inside the window");
+        assert!(!window.try_admit(t0 + 59), "still inside the window");
+        assert!(window.try_admit(t0 + 60), "a new window opens at +60s");
+    }
+
+    #[tokio::test]
+    async fn register_rate_limit_returns_429_with_retry_after_then_recovers() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = register_router(ctx.clone());
+        for i in 0..MAX_REGISTRATIONS_PER_WINDOW {
+            let resp = post_register_raw(&router, web_registration()).await;
+            assert_eq!(resp.status(), StatusCode::CREATED, "registration {i}");
+        }
+        let resp = post_register_raw(&router, web_registration()).await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).unwrap(),
+            &HeaderValue::from(REGISTRATION_WINDOW_SECS)
+        );
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "temporarily_unavailable");
+        assert_eq!(
+            ctx.store.lock().unwrap().client_count().unwrap(),
+            MAX_REGISTRATIONS_PER_WINDOW as usize,
+            "a rate-limited request must persist nothing"
+        );
+
+        // Move the window into the past: the next registration is admitted.
+        ctx.registrations.lock().unwrap().window_start =
+            now_epoch_secs() - REGISTRATION_WINDOW_SECS - 1;
+        let resp = post_register_raw(&router, web_registration()).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn register_refuses_once_the_store_holds_max_clients() {
+        let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
+        let router = register_router(ctx.clone());
+        // Seed directly (not via HTTP) — models a clients.json that was
+        // already full before upgrade, and stays clear of the rate limit.
+        for _ in 0..MAX_REGISTERED_CLIENTS {
+            register_native_client(&ctx, &["http://127.0.0.1/cb"]);
+        }
+        let resp = post_register_raw(&router, web_registration()).await;
+        // Hub ruling: 429 (not 400) — distinguishable from the rate limit by
+        // its `error` code and by carrying NO `Retry-After` (waiting cannot
+        // help; the owner has to free a slot).
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(resp.headers().get(header::RETRY_AFTER).is_none());
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "access_denied");
+        let description = body["error_description"].as_str().unwrap();
+        assert!(description.contains("50"), "{description}");
+        assert!(
+            description.contains("onebrain gateway clients remove <id>"),
+            "{description}"
+        );
+        assert_eq!(
+            ctx.store.lock().unwrap().client_count().unwrap(),
+            MAX_REGISTERED_CLIENTS
+        );
+    }
+
+    #[tokio::test]
+    async fn register_rejects_a_client_name_over_100_characters() {
+        let (_dir, router) = register_router_with_issuer("http://127.0.0.1:7717");
+        let (status, body) = post_json(
+            &router,
+            "/register",
+            json!({
+                "client_name": "x".repeat(MAX_CLIENT_NAME_CHARS + 1),
+                "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "invalid_client_metadata");
+    }
+
+    /// Review Focus 5: the limit counts CHARACTERS — 100 two-byte `é` is
+    /// 200 bytes and must still be accepted.
+    #[tokio::test]
+    async fn register_client_name_limit_counts_characters_not_bytes() {
+        let (_dir, router) = register_router_with_issuer("http://127.0.0.1:7717");
+        let (status, body) = post_json(
+            &router,
+            "/register",
+            json!({
+                "client_name": "é".repeat(MAX_CLIENT_NAME_CHARS),
+                "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    #[tokio::test]
+    async fn register_rejects_a_redirect_uri_over_2048_bytes_without_echoing_it() {
+        let (_dir, router) = register_router_with_issuer("http://127.0.0.1:7717");
+        // "https://claude.ai/" is 18 bytes.
+        let at_limit = format!(
+            "https://claude.ai/{}",
+            "a".repeat(MAX_REDIRECT_URI_BYTES - 18)
+        );
+        let over = format!("{at_limit}a");
+        assert_eq!(at_limit.len(), MAX_REDIRECT_URI_BYTES);
+
+        let (status, body) =
+            post_json(&router, "/register", json!({"redirect_uris": [over]})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], "invalid_redirect_uri");
+        assert!(
+            !body["error_description"].as_str().unwrap().contains("aaaa"),
+            "the oversized URI must not be echoed back"
+        );
+
+        let (status, body) =
+            post_json(&router, "/register", json!({"redirect_uris": [at_limit]})).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
     }
 
     // ── html_escape (Task 4) ─────────────────────────────────────────────
