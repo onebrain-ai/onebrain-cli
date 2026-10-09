@@ -9,8 +9,9 @@
 //! denied and in-flight requests get at most [`SHUTDOWN_GRACE`].
 //!
 //! OAuth: `run` opens the gateway's [`auth::AuthStore`], prints the current
-//! device-pairing code to stdout (the ONLY place it's ever shown — never
-//! logged, never returned over HTTP), and builds the
+//! device-pairing code to stdout **when stdout is a terminal** (the ONLY place
+//! it's ever shown — never logged, never returned over HTTP; otherwise it
+//! points to `onebrain gateway pair`), and builds the
 //! [`oauth_routes::AuthCtx`] every OAuth/resource-server route shares. The
 //! issuer is resolved (via [`resolve_issuer`]) and set exactly once inside
 //! `on_bind`, after the listener is confirmed up
@@ -168,8 +169,8 @@ fn log_filter_from(raw: Option<String>) -> tracing_subscriber::EnvFilter {
 /// - ANSI is enabled only when stderr is a real terminal (the crate's
 ///   existing `std::io::IsTerminal` convention — see `banner.rs`), so a
 ///   redirected `2>gateway.log` gets clean text and a terminal gets colour.
-/// - stdout is untouched. `run`'s pairing-code line and the
-///   `gateway listening on …` line are a deliberate plain-`println!` stdout
+/// - stdout is untouched. `run`'s pairing-code line (code shown only on a
+///   TTY) and the `gateway listening on …` line are a deliberate plain-`println!` stdout
 ///   contract that integration tests parse; routing logs to stderr keeps
 ///   them out of it entirely.
 fn init_tracing() -> bool {
@@ -294,6 +295,22 @@ fn validate_public_url(raw: &str) -> Result<(), String> {
     }
 }
 
+/// The startup line `run` prints about the pairing code. On a terminal it is
+/// the code itself (a human is watching); otherwise — launchd, a redirect,
+/// a pipe — stdout is a FILE that outlives the process (T3b's
+/// `~/Library/Logs/onebrain/gateway.log`), so the code is withheld and the
+/// operator is pointed at `onebrain gateway pair`, which reads it from the
+/// store on demand. Pure so both branches are unit-tested (`run` is
+/// subprocess-only under coverage).
+fn pairing_banner(code: &str, stdout_is_tty: bool) -> String {
+    if stdout_is_tty {
+        format!("pairing code: {code}  (rotate: onebrain gateway pair --rotate)")
+    } else {
+        "pairing code: not shown (stdout is not a terminal) — run `onebrain gateway pair` to see it"
+            .to_string()
+    }
+}
+
 /// `onebrain gateway run [--port N]`.
 ///
 /// Loopback hard-coded (`127.0.0.1`) — no bind flag or config key, unlike
@@ -372,16 +389,24 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
             tracing::warn!(error = %e, "failed to purge expired gateway auth-store records at startup; continuing");
         }
     }
-    // The pairing code is printed here — stdout of the foreground `gateway
-    // run` process — and NOWHERE else: never logged (the daemon/server log
-    // is a longer-lived, potentially shared file), never returned over HTTP.
-    // `pairing_code()` mints one on first call and is stable after, so
-    // restarting `gateway run` doesn't rotate it out from under an
-    // in-progress pairing.
+    // The pairing code is shown ONLY on an interactive terminal (red-team
+    // item 5, #404): under launchd (`gateway service`, v3.5.0) stdout is a
+    // long-lived log file, which must never hold a credential. It is never
+    // logged and never returned over HTTP either. `pairing_code()` still
+    // runs unconditionally: it mints the code on first start so `onebrain
+    // gateway pair` (the non-TTY way to read it) always has one, and it is
+    // stable after, so restarting `gateway run` doesn't rotate it out from
+    // under an in-progress pairing.
     let pairing_code = auth_store
         .pairing_code()
         .context("mint/read gateway pairing code")?;
-    println!("pairing code: {pairing_code}  (rotate: onebrain gateway pair --rotate)");
+    {
+        use std::io::IsTerminal;
+        println!(
+            "{}",
+            pairing_banner(&pairing_code, std::io::stdout().is_terminal())
+        );
+    }
     let auth_ctx = Arc::new(AuthCtx::new(auth_store));
 
     let router = build_gateway_router(state, auth_ctx.clone());
@@ -596,6 +621,26 @@ mod tests {
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
+    }
+
+    #[test]
+    fn pairing_banner_shows_the_code_on_a_terminal() {
+        let line = pairing_banner("ABCD-2345", true);
+        assert!(line.starts_with("pairing code: ABCD-2345"), "{line}");
+        assert!(line.contains("onebrain gateway pair --rotate"), "{line}");
+    }
+
+    /// Red-team item 5: under launchd stdout IS the service log — the code
+    /// must never land there; point the operator at `gateway pair` instead.
+    #[test]
+    fn pairing_banner_never_contains_the_code_when_stdout_is_not_a_terminal() {
+        let line = pairing_banner("ABCD-2345", false);
+        assert!(
+            !line.contains("ABCD-2345"),
+            "the code leaked into non-TTY stdout"
+        );
+        assert!(line.contains("onebrain gateway pair"), "{line}");
+        assert!(line.contains("not a terminal"), "{line}");
     }
 
     // ── tracing subscriber (round-2 finding D) ────────────────────────────

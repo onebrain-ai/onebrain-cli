@@ -113,9 +113,9 @@ fn spawn_gateway(
 /// leaves no way forward but to patch the test and re-run CI. But the
 /// streams cannot be interpolated raw either (CodeQL
 /// `rust/cleartext-logging`, and this branch's own "no host path or secret
-/// in any test message" rule): `out` already contains the real pairing code
-/// by this point — `gateway run` prints it before the "gateway listening"
-/// line — and `err` carries the gateway's tracing output, which
+/// in any test message" rule): `out` would contain the real pairing code
+/// if stdout were a terminal (it never is here: `gateway run` withholds it on
+/// a non-TTY stdout, #404) — and `err` carries the gateway's tracing output, which
 /// legitimately names host paths.
 ///
 /// So: stdout is never emitted in any form (it is the one place the pairing

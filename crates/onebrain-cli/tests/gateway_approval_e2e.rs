@@ -143,7 +143,7 @@ fn spawn_gateway(
 /// stderr, never with stdout in any form and never with either stream raw —
 /// see `gateway_http.rs::wait_for_gateway_url` for the full reasoning (the
 /// capture files are deleted during this panic's own unwind, so a byte count
-/// would leave no diagnostic anywhere; stdout carries the pairing code;
+/// would leave no diagnostic anywhere; stdout carries the pairing code when it is a terminal (never in these harnesses, which pipe it);
 /// stderr carries host paths). All three gateway harnesses share one
 /// redactor, [`support::redacted_capture_tail`], and
 /// `gateway_http.rs::gateway_startup_failure_panic_carries_a_redacted_stderr_tail`
