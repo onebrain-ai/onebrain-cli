@@ -38,6 +38,9 @@ pub mod server;
 pub mod telegram;
 pub mod telegram_api;
 pub mod telegram_setup;
+// Validators only until the setup/status commands (T3b Task 3+) consume them.
+#[allow(dead_code)]
+pub mod tunnel;
 
 // `gateway_config_path` / `DEFAULT_GATEWAY_PORT` stay module-internal to
 // `config.rs` (used there by `load_gateway_config` + its own tests) — no
@@ -224,7 +227,7 @@ fn resolve_issuer(public_url: Option<&str>, bound: SocketAddr) -> String {
 ///   `127.0.0.1` / `[::1]` — the same set
 ///   `oauth_routes::is_loopback_redirect_uri` uses); every other host must
 ///   use `https://`, or the resolved issuer would be silently insecure.
-fn validate_public_url(raw: &str) -> Result<(), String> {
+pub(crate) fn validate_public_url(raw: &str) -> Result<(), String> {
     if let Some(bad) = raw
         .chars()
         .find(|c| matches!(c, '"' | '\\') || c.is_control())
