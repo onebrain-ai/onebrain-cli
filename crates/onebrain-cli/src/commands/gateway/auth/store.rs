@@ -205,9 +205,19 @@ impl std::fmt::Debug for TokenRecord {
 /// on every request. `pub(crate)` (not private) so `/token`'s RFC 6749 §5.1
 /// `expires_in` response field can reference this SAME constant directly
 /// instead of duplicating the number and risking the two drifting apart.
+///
+/// ⚠ `TokenView::issued` (operator CLI, #406) is DERIVED as
+/// `expires − <this TTL>` — no issue time is stored. Changing this value
+/// makes every already-stored record of this kind report a wrong `issued`
+/// in `onebrain gateway tokens list` (expiry and validity are unaffected).
 pub(crate) const ACCESS_TTL_SECS: u64 = 60 * 60;
 /// 30 days — refresh tokens are long-lived by design (that's the point of
 /// having them); rotation + reuse detection is what keeps that safe.
+///
+/// ⚠ `TokenView::issued` (operator CLI, #406) is DERIVED as
+/// `expires − <this TTL>` — no issue time is stored. Changing this value
+/// makes every already-stored record of this kind report a wrong `issued`
+/// in `onebrain gateway tokens list` (expiry and validity are unaffected).
 const REFRESH_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// The current device-pairing code + when it was (re)minted. Persisted in
@@ -254,6 +264,114 @@ pub enum RotateOutcome {
     /// (without having been rotated) — nothing to rotate, no family-wide
     /// action taken.
     Invalid,
+}
+
+// ── Operator views (T2 / #406: `onebrain gateway tokens|clients`) ────────
+
+/// Hex chars in a [`display_id`] (6 bytes of SHA-256).
+pub(crate) const DISPLAY_ID_LEN: usize = 12;
+/// Shortest id prefix `tokens revoke <id>` / `--family` accept.
+pub(crate) const MIN_ID_PREFIX_LEN: usize = 4;
+
+/// Stable, non-reversible operator-facing id for a secret-bearing string (a
+/// token value or a family id): the first [`DISPLAY_ID_LEN`] lowercase hex
+/// chars of `SHA-256(value)`. This is the ONLY form in which the operator CLI
+/// ever names a token or a family. The raw values are bearer credentials (or,
+/// for `family`, correlate them) and are never printed.
+pub(crate) fn display_id(secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(secret.as_bytes());
+    let mut out = String::with_capacity(DISPLAY_ID_LEN);
+    for &b in &digest[..DISPLAY_ID_LEN / 2] {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Normalize an operator-typed id prefix: trim, lowercase, and accept only
+/// [`MIN_ID_PREFIX_LEN`]..=[`DISPLAY_ID_LEN`] hex chars. `None` for anything
+/// else. That notably includes a pasted raw token (43 base64url chars), which
+/// callers must reject WITHOUT echoing it back.
+pub(crate) fn normalize_id_prefix(input: &str) -> Option<String> {
+    let s = input.trim().to_ascii_lowercase();
+    let ok = (MIN_ID_PREFIX_LEN..=DISPLAY_ID_LEN).contains(&s.len())
+        && s.bytes().all(|b| b.is_ascii_hexdigit());
+    ok.then_some(s)
+}
+
+/// Lifecycle state shown by `tokens list`. `Revoked` wins over `Expired`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenStatus {
+    Live,
+    Expired,
+    Revoked,
+}
+
+/// Secret-free projection of a [`TokenRecord`], and the ONLY token shape the
+/// operator CLI ever handles. It deliberately has no field that could carry
+/// `token` or `rotated_to`, so no rendering bug downstream can print a
+/// credential. `issued` is derived as `expires − TTL(kind)`, which is exact
+/// for every record this store mints (`expires = now + TTL`), because
+/// `TokenRecord` stores no issue time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TokenView {
+    pub id: String,
+    pub kind: TokenKind,
+    pub client_id: String,
+    pub family_id: String,
+    pub scope: String,
+    pub issued: u64,
+    pub expires: u64,
+    pub status: TokenStatus,
+    pub rotated: bool,
+}
+
+impl TokenView {
+    fn from_record(rec: &TokenRecord, now: u64) -> TokenView {
+        let ttl = match rec.kind {
+            TokenKind::Access => ACCESS_TTL_SECS,
+            TokenKind::Refresh => REFRESH_TTL_SECS,
+        };
+        let status = if rec.revoked {
+            TokenStatus::Revoked
+        } else if rec.expires <= now {
+            TokenStatus::Expired
+        } else {
+            TokenStatus::Live
+        };
+        TokenView {
+            id: display_id(&rec.token),
+            kind: rec.kind,
+            client_id: rec.client_id.clone(),
+            family_id: display_id(&rec.family),
+            scope: rec.scope.clone(),
+            issued: rec.expires.saturating_sub(ttl),
+            expires: rec.expires,
+            status,
+            rotated: rec.rotated_to.is_some(),
+        }
+    }
+}
+
+/// A registered client plus how many LIVE tokens it currently holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClientView {
+    pub client_id: String,
+    pub client_name: Option<String>,
+    pub application_type: AppType,
+    pub redirect_uris: Vec<String>,
+    pub created: u64,
+    pub live_tokens: usize,
+}
+
+fn kind_rank(kind: TokenKind) -> u8 {
+    match kind {
+        TokenKind::Access => 0,
+        TokenKind::Refresh => 1,
+    }
 }
 
 // ── Store ────────────────────────────────────────────────────────────────
@@ -832,6 +950,63 @@ impl AuthStore {
         }
 
         Ok(dropped)
+    }
+
+    // ── Operator views (T2 / #406) ───────────────────────────────────────
+
+    /// Every token on disk as a secret-free [`TokenView`], sorted by
+    /// `(client_id, family_id, kind, expires, id)`. Read-only, so it takes
+    /// no lock (see [`Self::lock_exclusive`]).
+    pub fn list_tokens(&self) -> Result<Vec<TokenView>> {
+        let now = core::now_epoch_secs();
+        let mut views: Vec<TokenView> = self
+            .load_tokens()?
+            .values()
+            .map(|r| TokenView::from_record(r, now))
+            .collect();
+        views.sort_by(|a, b| {
+            (
+                &a.client_id,
+                &a.family_id,
+                kind_rank(a.kind),
+                a.expires,
+                &a.id,
+            )
+                .cmp(&(
+                    &b.client_id,
+                    &b.family_id,
+                    kind_rank(b.kind),
+                    b.expires,
+                    &b.id,
+                ))
+        });
+        Ok(views)
+    }
+
+    /// Every registered client (sorted by `client_id`) with its count of
+    /// live tokens (`!revoked && expires > now`, the same predicate as
+    /// [`Self::check_access`]). Read-only, so it takes no lock.
+    pub fn list_clients(&self) -> Result<Vec<ClientView>> {
+        let now = core::now_epoch_secs();
+        let tokens = self.load_tokens()?;
+        Ok(self
+            .load_clients()?
+            .into_values()
+            .map(|c| {
+                let live_tokens = tokens
+                    .values()
+                    .filter(|t| t.client_id == c.client_id && !t.revoked && t.expires > now)
+                    .count();
+                ClientView {
+                    client_id: c.client_id,
+                    client_name: c.client_name,
+                    application_type: c.application_type,
+                    redirect_uris: c.redirect_uris,
+                    created: c.created,
+                    live_tokens,
+                }
+            })
+            .collect())
     }
 }
 
@@ -1950,5 +2125,153 @@ mod tests {
         );
         drop(guard);
         assert!(handle.join().unwrap());
+    }
+
+    // ── Operator views (T2 / #406) ───────────────────────────────────────
+
+    fn live_record(token: &str, family: &str, client_id: &str) -> TokenRecord {
+        TokenRecord {
+            token: token.to_string(),
+            kind: TokenKind::Access,
+            family: family.to_string(),
+            client_id: client_id.to_string(),
+            scope: "brain".to_string(),
+            resource: None,
+            expires: core::now_epoch_secs() + 3600,
+            revoked: false,
+            rotated_to: None,
+        }
+    }
+
+    fn plant(store: &AuthStore, records: &[TokenRecord]) {
+        let mut tokens = store.load_tokens().unwrap();
+        for r in records {
+            tokens.insert(r.token.clone(), r.clone());
+        }
+        store.save_tokens(&tokens).unwrap();
+    }
+
+    #[test]
+    fn display_id_is_12_lowercase_hex_stable_and_not_the_input() {
+        let id = display_id("some-secret-token-value");
+        assert_eq!(id.len(), DISPLAY_ID_LEN);
+        assert!(id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert_eq!(
+            id,
+            display_id("some-secret-token-value"),
+            "must be deterministic"
+        );
+        assert_ne!(id, display_id("some-secret-token-valuf"));
+        // Pinned vector: sha256("abc") = ba7816bf8f01…
+        assert_eq!(display_id("abc"), "ba7816bf8f01");
+    }
+
+    #[test]
+    fn normalize_id_prefix_accepts_4_to_12_hex_any_case_and_rejects_everything_else() {
+        assert_eq!(normalize_id_prefix("ABCD").as_deref(), Some("abcd"));
+        assert_eq!(normalize_id_prefix("  a1b2c3 ").as_deref(), Some("a1b2c3"));
+        assert_eq!(
+            normalize_id_prefix("0123456789ab").as_deref(),
+            Some("0123456789ab")
+        );
+        assert_eq!(normalize_id_prefix("abc"), None, "too short");
+        assert_eq!(normalize_id_prefix("0123456789abc"), None, "too long");
+        assert_eq!(normalize_id_prefix("wxyz"), None, "not hex");
+        assert_eq!(normalize_id_prefix(""), None);
+        // A pasted raw token (43 base64url chars) must never be accepted.
+        assert_eq!(normalize_id_prefix(&core::mint_secret_32()), None);
+    }
+
+    #[test]
+    fn list_tokens_on_a_fresh_store_is_empty() {
+        let (_dir, store) = open_temp();
+        assert!(store.list_tokens().unwrap().is_empty());
+        assert!(store.list_clients().unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_tokens_never_exposes_a_token_rotated_to_or_family_value() {
+        let (_dir, store) = open_temp();
+        let (_access, refresh) = store.issue_token_pair("c1", "brain").unwrap();
+        let RotateOutcome::Rotated { .. } = store.rotate_refresh(&refresh.token).unwrap() else {
+            panic!("rotation should succeed");
+        };
+        let raw = store.load_tokens().unwrap();
+        let views = store.list_tokens().unwrap();
+        assert_eq!(views.len(), 4);
+        let json = serde_json::to_string(&views).unwrap();
+        let debug = format!("{views:?}");
+        for rec in raw.values() {
+            let mut secrets = vec![rec.token.as_str(), rec.family.as_str()];
+            if let Some(next) = &rec.rotated_to {
+                secrets.push(next);
+            }
+            for s in secrets {
+                assert!(
+                    !json.contains(s),
+                    "a raw secret leaked into list_tokens JSON"
+                );
+                assert!(
+                    !debug.contains(s),
+                    "a raw secret leaked into list_tokens Debug"
+                );
+            }
+            assert!(views.iter().any(|v| v.id == display_id(&rec.token)));
+        }
+    }
+
+    #[test]
+    fn list_tokens_reports_status_issued_and_rotation() {
+        let (_dir, store) = open_temp();
+        let now = core::now_epoch_secs();
+        let live = live_record("live-tok", "fam-a", "c1");
+        let mut revoked = live_record("revoked-tok", "fam-a", "c1");
+        revoked.revoked = true;
+        revoked.expires = now.saturating_sub(5); // revoked wins over expired
+        let mut expired = live_record("expired-tok", "fam-b", "c1");
+        expired.expires = now.saturating_sub(1);
+        let mut rotated = live_record("rotated-tok", "fam-b", "c2");
+        rotated.kind = TokenKind::Refresh;
+        rotated.revoked = true;
+        rotated.rotated_to = Some("next-tok".to_string());
+        plant(&store, &[live.clone(), revoked, expired, rotated]);
+
+        let views = store.list_tokens().unwrap();
+        let by = |t: &str| {
+            views
+                .iter()
+                .find(|v| v.id == display_id(t))
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by("live-tok").status, TokenStatus::Live);
+        assert_eq!(by("live-tok").issued, live.expires - ACCESS_TTL_SECS);
+        assert_eq!(by("live-tok").family_id, display_id("fam-a"));
+        assert_eq!(by("revoked-tok").status, TokenStatus::Revoked);
+        assert_eq!(by("expired-tok").status, TokenStatus::Expired);
+        let r = by("rotated-tok");
+        assert!(r.rotated);
+        assert_eq!(r.kind, TokenKind::Refresh);
+        assert_eq!(r.issued, r.expires.saturating_sub(REFRESH_TTL_SECS));
+        // Sorted by client_id first.
+        assert_eq!(views.last().unwrap().client_id, "c2");
+    }
+
+    #[test]
+    fn list_clients_counts_only_live_tokens_per_client() {
+        let (_dir, store) = open_temp();
+        store.register_client(client("c1")).unwrap();
+        store.register_client(client("c2")).unwrap();
+        store.issue_token_pair("c1", "brain").unwrap(); // 2 live
+        let (a, _r) = store.issue_token_pair("c1", "brain").unwrap();
+        store.revoke_token(&a.token).unwrap(); // 1 more live (its refresh)
+        let clients = store.list_clients().unwrap();
+        assert_eq!(clients.len(), 2);
+        assert_eq!(clients[0].client_id, "c1");
+        assert_eq!(clients[0].live_tokens, 3);
+        assert_eq!(clients[1].client_id, "c2");
+        assert_eq!(clients[1].live_tokens, 0);
     }
 }
