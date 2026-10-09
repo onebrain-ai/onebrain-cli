@@ -205,9 +205,19 @@ impl std::fmt::Debug for TokenRecord {
 /// on every request. `pub(crate)` (not private) so `/token`'s RFC 6749 §5.1
 /// `expires_in` response field can reference this SAME constant directly
 /// instead of duplicating the number and risking the two drifting apart.
+///
+/// ⚠ `TokenView::issued` (operator CLI, #406) is DERIVED as
+/// `expires − <this TTL>` — no issue time is stored. Changing this value
+/// makes every already-stored record of this kind report a wrong `issued`
+/// in `onebrain gateway tokens list` (expiry and validity are unaffected).
 pub(crate) const ACCESS_TTL_SECS: u64 = 60 * 60;
 /// 30 days — refresh tokens are long-lived by design (that's the point of
 /// having them); rotation + reuse detection is what keeps that safe.
+///
+/// ⚠ `TokenView::issued` (operator CLI, #406) is DERIVED as
+/// `expires − <this TTL>` — no issue time is stored. Changing this value
+/// makes every already-stored record of this kind report a wrong `issued`
+/// in `onebrain gateway tokens list` (expiry and validity are unaffected).
 const REFRESH_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 
 /// The current device-pairing code + when it was (re)minted. Persisted in
@@ -256,13 +266,188 @@ pub enum RotateOutcome {
     Invalid,
 }
 
+// ── Operator views (T2 / #406: `onebrain gateway tokens|clients`) ────────
+
+/// Hex chars in a [`display_id`] (6 bytes of SHA-256).
+pub(crate) const DISPLAY_ID_LEN: usize = 12;
+/// Shortest id prefix `tokens revoke <id>` / `--family` accept.
+pub(crate) const MIN_ID_PREFIX_LEN: usize = 4;
+
+/// Stable, non-reversible operator-facing id for a secret-bearing string (a
+/// token value or a family id): the first [`DISPLAY_ID_LEN`] lowercase hex
+/// chars of `SHA-256(value)`. This is the ONLY form in which the operator CLI
+/// ever names a token or a family. The raw values are bearer credentials (or,
+/// for `family`, correlate them) and are never printed.
+pub(crate) fn display_id(secret: &str) -> String {
+    use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(secret.as_bytes());
+    let mut out = String::with_capacity(DISPLAY_ID_LEN);
+    for &b in &digest[..DISPLAY_ID_LEN / 2] {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+/// Normalize an operator-typed id prefix: trim, lowercase, and accept only
+/// [`MIN_ID_PREFIX_LEN`]..=[`DISPLAY_ID_LEN`] hex chars. `None` for anything
+/// else. That notably includes a pasted raw token (43 base64url chars), which
+/// callers must reject WITHOUT echoing it back.
+pub(crate) fn normalize_id_prefix(input: &str) -> Option<String> {
+    let s = input.trim().to_ascii_lowercase();
+    let ok = (MIN_ID_PREFIX_LEN..=DISPLAY_ID_LEN).contains(&s.len())
+        && s.bytes().all(|b| b.is_ascii_hexdigit());
+    ok.then_some(s)
+}
+
+/// Lifecycle state shown by `tokens list`. `Revoked` wins over `Expired`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenStatus {
+    Live,
+    Expired,
+    Revoked,
+}
+
+/// Secret-free projection of a [`TokenRecord`], and the ONLY token shape the
+/// operator CLI ever handles. It deliberately has no field that could carry
+/// `token` or `rotated_to`, so no rendering bug downstream can print a
+/// credential. `issued` is derived as `expires − TTL(kind)`, which is exact
+/// for every record this store mints (`expires = now + TTL`), because
+/// `TokenRecord` stores no issue time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TokenView {
+    pub id: String,
+    pub kind: TokenKind,
+    pub client_id: String,
+    pub family_id: String,
+    pub scope: String,
+    pub issued: u64,
+    pub expires: u64,
+    pub status: TokenStatus,
+    pub rotated: bool,
+}
+
+impl TokenView {
+    fn from_record(rec: &TokenRecord, now: u64) -> TokenView {
+        let ttl = match rec.kind {
+            TokenKind::Access => ACCESS_TTL_SECS,
+            TokenKind::Refresh => REFRESH_TTL_SECS,
+        };
+        let status = if rec.revoked {
+            TokenStatus::Revoked
+        } else if rec.expires <= now {
+            TokenStatus::Expired
+        } else {
+            TokenStatus::Live
+        };
+        TokenView {
+            id: display_id(&rec.token),
+            kind: rec.kind,
+            client_id: rec.client_id.clone(),
+            family_id: display_id(&rec.family),
+            scope: rec.scope.clone(),
+            issued: rec.expires.saturating_sub(ttl),
+            expires: rec.expires,
+            status,
+            rotated: rec.rotated_to.is_some(),
+        }
+    }
+}
+
+/// A registered client plus how many LIVE tokens it currently holds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ClientView {
+    pub client_id: String,
+    pub client_name: Option<String>,
+    pub application_type: AppType,
+    pub redirect_uris: Vec<String>,
+    pub created: u64,
+    pub live_tokens: usize,
+}
+
+fn kind_rank(kind: TokenKind) -> u8 {
+    match kind {
+        TokenKind::Access => 0,
+        TokenKind::Refresh => 1,
+    }
+}
+
+/// Which tokens [`AuthStore::revoke_tokens`] targets. `Id`/`Family` carry a
+/// prefix ALREADY normalized by [`normalize_id_prefix`]. `Client` is an exact
+/// `client_id`. The CLI's clap `ArgGroup` guarantees exactly one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenSelector {
+    Id(String),
+    Client(String),
+    Family(String),
+}
+
+impl TokenSelector {
+    /// `"id" | "client" | "family"`: the JSON `selector` field and the noun
+    /// used in operator messages.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            TokenSelector::Id(_) => "id",
+            TokenSelector::Client(_) => "client",
+            TokenSelector::Family(_) => "family",
+        }
+    }
+
+    pub fn value(&self) -> &str {
+        match self {
+            TokenSelector::Id(v) | TokenSelector::Client(v) | TokenSelector::Family(v) => v,
+        }
+    }
+}
+
+/// Result of [`AuthStore::revoke_tokens`]. Every id here is a [`display_id`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevokeOutcome {
+    /// Matched. `newly_revoked` (sorted) were flipped by THIS call, and
+    /// `already_revoked` matched but were revoked before (idempotent re-run).
+    Revoked {
+        newly_revoked: Vec<String>,
+        already_revoked: usize,
+    },
+    /// Nothing matched. Nothing was written.
+    NotFound,
+    /// The prefix matched more than one distinct id (sorted, deduped).
+    /// Nothing was written.
+    Ambiguous(Vec<String>),
+}
+
+/// Result of [`AuthStore::remove_client`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedClient {
+    pub client_id: String,
+    pub tokens_revoked: usize,
+    pub codes_removed: usize,
+}
+
+/// `hits` = (display id, `tokens.json` key). Unique iff every hit shares ONE
+/// display id. A family prefix legitimately matches several tokens of the
+/// same family. Returns the keys, or `Err(Ambiguous)` naming the distinct ids.
+fn resolve_unique(hits: Vec<(String, String)>) -> std::result::Result<Vec<String>, RevokeOutcome> {
+    let mut ids: Vec<String> = hits.iter().map(|(id, _)| id.clone()).collect();
+    ids.sort();
+    ids.dedup();
+    if ids.len() > 1 {
+        return Err(RevokeOutcome::Ambiguous(ids));
+    }
+    Ok(hits.into_iter().map(|(_, key)| key).collect())
+}
+
 // ── Store ────────────────────────────────────────────────────────────────
 
 /// Handle onto the four JSON files under `root` (normally
 /// `~/.onebrain/gateway/`). Cheap to construct — holds only the root path;
-/// every op re-reads its file fresh (single-process, low-frequency local
-/// auth traffic; no in-memory cache to keep coherent with the on-disk
-/// source of truth).
+/// every op re-reads its file fresh (no in-memory cache), so a change made by
+/// another process (e.g. `onebrain gateway tokens revoke` while `gateway run`
+/// is up) is seen on the very next call. Every read-modify-write op holds the
+/// store-wide `auth.lock` (see [`Self::lock_exclusive`]) so two processes can
+/// never lose each other's writes.
 pub struct AuthStore {
     root: PathBuf,
 }
@@ -288,6 +473,45 @@ impl AuthStore {
         Ok(AuthStore { root })
     }
 
+    /// Take the store-wide advisory EXCLUSIVE lock (`<root>/auth.lock`,
+    /// created 0600 on first use), blocking until it is free. Every method
+    /// that does load → modify → save holds this for its whole critical
+    /// section, so a `onebrain gateway tokens revoke` in one process can
+    /// never be lost to a concurrent `rotate_refresh_for_client`/
+    /// `issue_token_pair_for_resource` in the running gateway (both used to
+    /// read the same JSON, modify their copy, and atomically rename it back —
+    /// last rename silently won).
+    ///
+    /// Advisory: only `AuthStore` honours it, which is all that matters
+    /// because nothing else writes these files. Read-only methods do NOT take
+    /// it: writers replace files by atomic tmp+rename, so a reader always
+    /// sees one whole file. The lock is NOT re-entrant (a second handle on
+    /// the lock file conflicts even in-process), so a locked method must
+    /// never call another locked public method. It must use the private
+    /// `load_*`/`save_*` helpers instead. Corollary: the delegating wrappers
+    /// `issue_token_pair` / `rotate_refresh` take NO lock — only the inner
+    /// `*_for_resource` / `*_for_client` bodies do.
+    pub(crate) fn lock_exclusive(&self) -> Result<StoreLock> {
+        // The gateway dir may have been deleted while `gateway run` is up;
+        // recreate it (as `write_json_atomic` does) rather than failing every
+        // mutator until a restart.
+        ensure_private_dir(&self.root)?;
+        let path = self.lock_path();
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts
+            .open(&path)
+            .with_context(|| format!("open gateway auth lock {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("lock gateway auth store ({})", path.display()))?;
+        Ok(StoreLock { _file: file })
+    }
+
     fn clients_path(&self) -> PathBuf {
         self.root.join("clients.json")
     }
@@ -296,6 +520,9 @@ impl AuthStore {
     }
     fn tokens_path(&self) -> PathBuf {
         self.root.join("tokens.json")
+    }
+    fn lock_path(&self) -> PathBuf {
+        self.root.join("auth.lock")
     }
     fn pairing_path(&self) -> PathBuf {
         self.root.join("pairing.json")
@@ -333,6 +560,7 @@ impl AuthStore {
 
     /// Insert or overwrite a client registration, keyed by its `client_id`.
     pub fn register_client(&self, client: RegisteredClient) -> Result<()> {
+        let _guard = self.lock_exclusive()?;
         let mut clients = self.load_clients()?;
         clients.insert(client.client_id.clone(), client);
         self.save_clients(&clients)
@@ -343,11 +571,28 @@ impl AuthStore {
         Ok(self.load_clients()?.remove(client_id))
     }
 
-    /// Number of registered clients — `POST /register`'s
-    /// `MAX_REGISTERED_CLIENTS` cap check (#404 item 3). The caller MUST
-    /// hold `AuthCtx::store`'s lock across this AND the following
-    /// `register_client`, or two racing registrations could both pass the
-    /// cap.
+    /// Insert `client` unless that would push the store past `max`
+    /// registrations: returns `Ok(false)` and writes nothing when
+    /// `clients.len() >= max` AND the `client_id` is not already present.
+    /// Overwriting an existing id always succeeds, matching
+    /// [`Self::register_client`]. The count and the insert happen under one
+    /// hold of the store lock, so a concurrent remove/register in another
+    /// process cannot slip between them (`POST /register`'s
+    /// `MAX_REGISTERED_CLIENTS` cap, #404 item 3).
+    pub fn register_client_capped(&self, client: RegisteredClient, max: usize) -> Result<bool> {
+        let _guard = self.lock_exclusive()?;
+        let mut clients = self.load_clients()?;
+        if clients.len() >= max && !clients.contains_key(&client.client_id) {
+            return Ok(false);
+        }
+        clients.insert(client.client_id.clone(), client);
+        self.save_clients(&clients)?;
+        Ok(true)
+    }
+
+    /// Number of registered clients. A plain read — NOT a cap check (use
+    /// [`Self::register_client_capped`], which counts and inserts under the
+    /// store lock).
     pub fn client_count(&self) -> Result<usize> {
         Ok(self.load_clients()?.len())
     }
@@ -366,6 +611,7 @@ impl AuthStore {
         resource: &str,
         scope: &str,
     ) -> Result<AuthCode> {
+        let _guard = self.lock_exclusive()?;
         let code_value = core::mint_secret_32();
         let auth_code = AuthCode {
             code: code_value.clone(),
@@ -390,6 +636,7 @@ impl AuthStore {
     /// second redemption of the SAME code always fails, even mid-expiry
     /// window) and returned.
     pub fn consume_code(&self, code: &str) -> Result<Option<AuthCode>> {
+        let _guard = self.lock_exclusive()?;
         let mut codes = self.load_codes()?;
         let now = core::now_epoch_secs();
         let Some(entry) = codes.get_mut(code) else {
@@ -416,6 +663,7 @@ impl AuthStore {
     /// this link only weakens the replay-hardening for a code that's already
     /// gone, it never wrongly trusts anything.
     pub fn mark_code_minted_family(&self, code: &str, family: &str) -> Result<()> {
+        let _guard = self.lock_exclusive()?;
         let mut codes = self.load_codes()?;
         if let Some(entry) = codes.get_mut(code) {
             entry.minted_family = Some(family.to_string());
@@ -458,6 +706,7 @@ impl AuthStore {
         scope: &str,
         resource: Option<&str>,
     ) -> Result<(TokenRecord, TokenRecord)> {
+        let _guard = self.lock_exclusive()?;
         let family = core::mint_secret_32();
         let now = core::now_epoch_secs();
         let resource = resource.map(str::to_string);
@@ -545,6 +794,7 @@ impl AuthStore {
         refresh: &str,
         client_id: Option<&str>,
     ) -> Result<RotateOutcome> {
+        let _guard = self.lock_exclusive()?;
         let mut tokens = self.load_tokens()?;
         let now = core::now_epoch_secs();
 
@@ -626,6 +876,7 @@ impl AuthStore {
     /// intentional revoke (e.g. a future logout route) only has the caller's
     /// say-so for the ONE token it names; a no-op on an unknown token.
     pub fn revoke_token(&self, token: &str) -> Result<()> {
+        let _guard = self.lock_exclusive()?;
         let mut tokens = self.load_tokens()?;
         if let Some(rec) = tokens.get_mut(token) {
             rec.revoked = true;
@@ -643,6 +894,7 @@ impl AuthStore {
     /// [`Self::mark_code_minted_family`]/[`Self::find_code_record`] for how
     /// that path finds the family to pass in here.
     pub fn revoke_family(&self, family: &str) -> Result<()> {
+        let _guard = self.lock_exclusive()?;
         let mut tokens = self.load_tokens()?;
         let mut changed = false;
         for t in tokens.values_mut() {
@@ -663,6 +915,7 @@ impl AuthStore {
     /// call. Idempotent after that — repeated calls return the SAME code
     /// until [`Self::rotate_pairing_code`] replaces it.
     pub fn pairing_code(&self) -> Result<String> {
+        let _guard = self.lock_exclusive()?;
         if let Some(state) = self.load_pairing()? {
             return Ok(state.code);
         }
@@ -678,6 +931,7 @@ impl AuthStore {
     /// there — the old code stops verifying immediately (verification only
     /// ever checks the CURRENT record).
     pub fn rotate_pairing_code(&self) -> Result<String> {
+        let _guard = self.lock_exclusive()?;
         let code = core::mint_pairing_code();
         self.save_pairing(&PairingState {
             code: code.clone(),
@@ -735,6 +989,7 @@ impl AuthStore {
     /// Returns the total number of dropped records (codes + tokens) so the
     /// startup caller can log a debug line naming the count.
     pub fn purge_expired(&self) -> Result<usize> {
+        let _guard = self.lock_exclusive()?;
         let now = core::now_epoch_secs();
         let mut dropped = 0usize;
 
@@ -765,6 +1020,182 @@ impl AuthStore {
 
         Ok(dropped)
     }
+
+    // ── Operator views (T2 / #406) ───────────────────────────────────────
+
+    /// Every token on disk as a secret-free [`TokenView`], sorted by
+    /// `(client_id, family_id, kind, expires, id)`. Read-only, so it takes
+    /// no lock (see [`Self::lock_exclusive`]).
+    pub fn list_tokens(&self) -> Result<Vec<TokenView>> {
+        let now = core::now_epoch_secs();
+        let mut views: Vec<TokenView> = self
+            .load_tokens()?
+            .values()
+            .map(|r| TokenView::from_record(r, now))
+            .collect();
+        views.sort_by(|a, b| {
+            (
+                &a.client_id,
+                &a.family_id,
+                kind_rank(a.kind),
+                a.expires,
+                &a.id,
+            )
+                .cmp(&(
+                    &b.client_id,
+                    &b.family_id,
+                    kind_rank(b.kind),
+                    b.expires,
+                    &b.id,
+                ))
+        });
+        Ok(views)
+    }
+
+    /// Every registered client (sorted by `client_id`) with its count of
+    /// live tokens (`!revoked && expires > now`, the same predicate as
+    /// [`Self::check_access`]). Read-only, so it takes no lock.
+    pub fn list_clients(&self) -> Result<Vec<ClientView>> {
+        let now = core::now_epoch_secs();
+        let tokens = self.load_tokens()?;
+        Ok(self
+            .load_clients()?
+            .into_values()
+            .map(|c| {
+                let live_tokens = tokens
+                    .values()
+                    .filter(|t| t.client_id == c.client_id && !t.revoked && t.expires > now)
+                    .count();
+                ClientView {
+                    client_id: c.client_id,
+                    client_name: c.client_name,
+                    application_type: c.application_type,
+                    redirect_uris: c.redirect_uris,
+                    created: c.created,
+                    live_tokens,
+                }
+            })
+            .collect())
+    }
+
+    /// Revoke the tokens `selector` names (operator `tokens revoke`).
+    /// Resolution happens INSIDE the store lock, so the set revoked is
+    /// exactly the set resolved. Like [`Self::revoke_token`], `Id` does NOT
+    /// cascade to the family. `Family`/`Client` are the bulk cut-offs.
+    pub fn revoke_tokens(&self, selector: &TokenSelector) -> Result<RevokeOutcome> {
+        debug_assert!(
+            matches!(selector, TokenSelector::Client(_))
+                || selector.value().len() >= MIN_ID_PREFIX_LEN,
+            "Id/Family selectors must be normalized by normalize_id_prefix"
+        );
+        let _guard = self.lock_exclusive()?;
+        let mut tokens = self.load_tokens()?;
+        let keys: Vec<String> = match selector {
+            TokenSelector::Client(client_id) => tokens
+                .iter()
+                .filter(|(_, t)| &t.client_id == client_id)
+                .map(|(k, _)| k.clone())
+                .collect(),
+            TokenSelector::Id(prefix) => {
+                let hits = tokens
+                    .keys()
+                    .map(|k| (display_id(k), k.clone()))
+                    .filter(|(id, _)| id.starts_with(prefix.as_str()))
+                    .collect();
+                match resolve_unique(hits) {
+                    Ok(keys) => keys,
+                    Err(ambiguous) => return Ok(ambiguous),
+                }
+            }
+            TokenSelector::Family(prefix) => {
+                let hits = tokens
+                    .iter()
+                    .map(|(k, t)| (display_id(&t.family), k.clone()))
+                    .filter(|(id, _)| id.starts_with(prefix.as_str()))
+                    .collect();
+                match resolve_unique(hits) {
+                    Ok(keys) => keys,
+                    Err(ambiguous) => return Ok(ambiguous),
+                }
+            }
+        };
+        if keys.is_empty() {
+            return Ok(RevokeOutcome::NotFound);
+        }
+        let mut newly_revoked = Vec::new();
+        let mut already_revoked = 0usize;
+        for key in &keys {
+            if let Some(t) = tokens.get_mut(key) {
+                if t.revoked {
+                    already_revoked += 1;
+                } else {
+                    t.revoked = true;
+                    newly_revoked.push(display_id(key));
+                }
+            }
+        }
+        if !newly_revoked.is_empty() {
+            self.save_tokens(&tokens)?;
+        }
+        newly_revoked.sort();
+        Ok(RevokeOutcome::Revoked {
+            newly_revoked,
+            already_revoked,
+        })
+    }
+
+    /// Remove `client_id`'s registration AND cut it off. Every token it holds
+    /// is revoked (kept on disk, so `tokens list --all` still shows them until
+    /// [`Self::purge_expired`] sweeps them). Every auth code issued to it is
+    /// deleted. This only covers what exists when it runs: the `/authorize`
+    /// and `/token` handlers re-check registration after minting a code or a
+    /// pair, which closes the window where a mint races this call.
+    /// `Ok(None)` (nothing written) if no such client is registered.
+    ///
+    /// Write order is tokens → codes → registration. A crash part-way leaves
+    /// the client still LISTED (re-run `clients remove`), never a client that
+    /// looks removed but still holds live tokens.
+    pub fn remove_client(&self, client_id: &str) -> Result<Option<RemovedClient>> {
+        let _guard = self.lock_exclusive()?;
+        let mut clients = self.load_clients()?;
+        if clients.remove(client_id).is_none() {
+            return Ok(None);
+        }
+
+        let mut tokens = self.load_tokens()?;
+        let mut tokens_revoked = 0usize;
+        for t in tokens.values_mut() {
+            if t.client_id == client_id && !t.revoked {
+                t.revoked = true;
+                tokens_revoked += 1;
+            }
+        }
+        let mut codes = self.load_codes()?;
+        let before = codes.len();
+        codes.retain(|_, c| c.client_id != client_id);
+        let codes_removed = before - codes.len();
+
+        if tokens_revoked > 0 {
+            self.save_tokens(&tokens)?;
+        }
+        if codes_removed > 0 {
+            self.save_codes(&codes)?;
+        }
+        self.save_clients(&clients)?;
+        Ok(Some(RemovedClient {
+            client_id: client_id.to_string(),
+            tokens_revoked,
+            codes_removed,
+        }))
+    }
+}
+
+/// RAII guard returned by [`AuthStore::lock_exclusive`]. The OS releases the
+/// lock when the file handle closes, i.e. when this guard drops. Bind it as
+/// `let _guard = …` — `let _ = …` would drop (and unlock) immediately.
+#[must_use = "the auth store lock is released as soon as this guard is dropped"]
+pub(crate) struct StoreLock {
+    _file: std::fs::File,
 }
 
 // ── File I/O helpers (mirrors `daemon_client::DaemonInfo`) ────────────────
@@ -1659,7 +2090,13 @@ mod tests {
             "gateway auth dir must be 0700, was {dir_mode:o}"
         );
 
-        for name in ["clients.json", "codes.json", "tokens.json", "pairing.json"] {
+        for name in [
+            "clients.json",
+            "codes.json",
+            "tokens.json",
+            "pairing.json",
+            "auth.lock",
+        ] {
             let mode = std::fs::metadata(root.join(name))
                 .unwrap()
                 .permissions()
@@ -1685,5 +2122,582 @@ mod tests {
             mode, 0o700,
             "open_at must re-assert 0700 on a pre-existing looser dir"
         );
+    }
+
+    // ── Cross-process advisory lock (T2 / #406) ─────────────────────────
+
+    /// A SECOND `AuthStore` handle on the same root stands in for a second
+    /// process (the CLI vs. a running gateway): `flock`/`LockFileEx` locks
+    /// conflict across distinct open file handles even inside one process,
+    /// so two handles reproduce the cross-process race faithfully.
+    /// Also covers the INNER token mutators directly (red-team blocker 1):
+    /// `rotate_refresh_for_client` must wait on a lock held elsewhere.
+    #[test]
+    fn a_mutator_blocks_while_another_handle_holds_the_store_lock() {
+        let (dir, store) = open_temp();
+        let (access, _refresh) = store.issue_token_pair("c1", "brain").unwrap();
+        let other = AuthStore::open_at(dir.path().join("gateway")).unwrap();
+
+        let guard = store.lock_exclusive().unwrap();
+        let token = access.token.clone();
+        let handle = std::thread::spawn(move || other.revoke_token(&token).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "revoke_token must wait while another handle holds the store lock"
+        );
+        assert!(
+            store.check_access(&access.token).unwrap().is_some(),
+            "nothing may be written while another handle holds the lock"
+        );
+        drop(guard);
+        handle.join().unwrap();
+        assert!(
+            store.check_access(&access.token).unwrap().is_none(),
+            "the revoke must land once the lock is released"
+        );
+
+        let (_a2, refresh2) = store
+            .issue_token_pair_for_resource("c1", "brain", None)
+            .unwrap();
+        let other = AuthStore::open_at(dir.path().join("gateway")).unwrap();
+        let guard = store.lock_exclusive().unwrap();
+        let handle = std::thread::spawn(move || {
+            other
+                .rotate_refresh_for_client(&refresh2.token, Some("c1"))
+                .unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "rotate_refresh_for_client must wait while another handle holds the store lock"
+        );
+        drop(guard);
+        assert!(matches!(
+            handle.join().unwrap(),
+            RotateOutcome::Rotated { .. }
+        ));
+    }
+
+    #[test]
+    fn a_mutator_recreates_a_deleted_gateway_dir() {
+        let (_dir, store) = open_temp();
+        std::fs::remove_dir_all(&store.root).unwrap();
+        store
+            .issue_token_pair("c1", "brain")
+            .expect("mutator must heal a deleted gateway dir");
+        assert!(store.root.join("auth.lock").exists());
+    }
+
+    /// The wrappers delegate to locked inner fns and must NOT lock
+    /// themselves: the lock is not re-entrant, so a locked wrapper would
+    /// block forever on its own inner call. A watchdog turns that hang into
+    /// a failure instead of a stuck test run.
+    #[test]
+    fn token_wrappers_do_not_deadlock_on_the_inner_lock() {
+        let (_dir, store) = open_temp();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (_a, r) = store.issue_token_pair("c1", "brain").unwrap();
+            let outcome = store.rotate_refresh(&r.token).unwrap();
+            let _ = tx.send(matches!(outcome, RotateOutcome::Rotated { .. }));
+        });
+        let rotated = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("issue_token_pair/rotate_refresh deadlocked on auth.lock");
+        assert!(rotated);
+    }
+
+    /// The lost-update race #406 is about: one handle hammers the INNER
+    /// `issue_token_pair_for_resource` (load → insert → save of the whole `tokens.json`)
+    /// while another revokes tokens one by one. Without the lock, a revoke
+    /// landing between the issuer's load and save is overwritten (last rename
+    /// wins), and an issuer insert can likewise be lost to the revoker's
+    /// save. Both effects are asserted.
+    #[test]
+    fn concurrent_mutators_on_two_handles_never_lose_a_revoke_or_an_insert() {
+        const TARGETS: usize = 40;
+        const ISSUES: usize = 150;
+        let (dir, store) = open_temp();
+        let targets: Vec<String> = (0..TARGETS)
+            .map(|_| {
+                store
+                    .issue_token_pair_for_resource("victim", "brain", None)
+                    .unwrap()
+                    .0
+                    .token
+            })
+            .collect();
+        let root = dir.path().join("gateway");
+        let issuer = AuthStore::open_at(root.clone()).unwrap();
+        let revoker = AuthStore::open_at(root).unwrap();
+
+        let a = std::thread::spawn(move || {
+            for _ in 0..ISSUES {
+                issuer
+                    .issue_token_pair_for_resource("busy", "brain", None)
+                    .unwrap();
+            }
+        });
+        let to_revoke = targets.clone();
+        let b = std::thread::spawn(move || {
+            for t in &to_revoke {
+                revoker.revoke_token(t).unwrap();
+            }
+        });
+        a.join().unwrap();
+        b.join().unwrap();
+
+        let tokens = store.load_tokens().unwrap();
+        assert_eq!(
+            tokens.len(),
+            TARGETS * 2 + ISSUES * 2,
+            "an issue_token_pair_for_resource insert was lost to a concurrent write"
+        );
+        let lost = targets.iter().filter(|t| !tokens[*t].revoked).count();
+        assert_eq!(
+            lost, 0,
+            "{lost} revoke(s) were lost to a concurrent read-modify-write"
+        );
+    }
+
+    // ── register_client_capped (T2 / #406, hub Ruling 1) ────────────────
+
+    #[test]
+    fn register_client_capped_refuses_a_new_client_at_the_cap_and_writes_nothing() {
+        let (_dir, store) = open_temp();
+        store.register_client(client("a")).unwrap();
+        store.register_client(client("b")).unwrap();
+        assert!(!store.register_client_capped(client("c"), 2).unwrap());
+        assert_eq!(store.client_count().unwrap(), 2);
+        assert!(store.get_client("c").unwrap().is_none());
+    }
+
+    #[test]
+    fn register_client_capped_still_overwrites_an_existing_id_at_the_cap() {
+        let (_dir, store) = open_temp();
+        store.register_client(client("a")).unwrap();
+        store.register_client(client("b")).unwrap();
+        let mut again = client("a");
+        again.client_name = Some("renamed".to_string());
+        assert!(store.register_client_capped(again, 2).unwrap());
+        assert_eq!(store.client_count().unwrap(), 2);
+        assert_eq!(
+            store
+                .get_client("a")
+                .unwrap()
+                .unwrap()
+                .client_name
+                .as_deref(),
+            Some("renamed")
+        );
+    }
+
+    #[test]
+    fn register_client_capped_inserts_under_the_cap() {
+        let (_dir, store) = open_temp();
+        store.register_client(client("a")).unwrap();
+        assert!(store.register_client_capped(client("b"), 2).unwrap());
+        assert_eq!(store.client_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn register_client_capped_blocks_while_another_handle_holds_the_lock() {
+        let (dir, store) = open_temp();
+        let other = AuthStore::open_at(dir.path().join("gateway")).unwrap();
+        let guard = store.lock_exclusive().unwrap();
+        let handle =
+            std::thread::spawn(move || other.register_client_capped(client("x"), 5).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "capped register must wait on the lock"
+        );
+        drop(guard);
+        assert!(handle.join().unwrap());
+    }
+
+    // ── Operator views (T2 / #406) ───────────────────────────────────────
+
+    fn live_record(token: &str, family: &str, client_id: &str) -> TokenRecord {
+        TokenRecord {
+            token: token.to_string(),
+            kind: TokenKind::Access,
+            family: family.to_string(),
+            client_id: client_id.to_string(),
+            scope: "brain".to_string(),
+            resource: None,
+            expires: core::now_epoch_secs() + 3600,
+            revoked: false,
+            rotated_to: None,
+        }
+    }
+
+    fn plant(store: &AuthStore, records: &[TokenRecord]) {
+        let mut tokens = store.load_tokens().unwrap();
+        for r in records {
+            tokens.insert(r.token.clone(), r.clone());
+        }
+        store.save_tokens(&tokens).unwrap();
+    }
+
+    #[test]
+    fn display_id_is_12_lowercase_hex_stable_and_not_the_input() {
+        let id = display_id("some-secret-token-value");
+        assert_eq!(id.len(), DISPLAY_ID_LEN);
+        assert!(id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+        assert_eq!(
+            id,
+            display_id("some-secret-token-value"),
+            "must be deterministic"
+        );
+        assert_ne!(id, display_id("some-secret-token-valuf"));
+        // Pinned vector: sha256("abc") = ba7816bf8f01…
+        assert_eq!(display_id("abc"), "ba7816bf8f01");
+    }
+
+    #[test]
+    fn normalize_id_prefix_accepts_4_to_12_hex_any_case_and_rejects_everything_else() {
+        assert_eq!(normalize_id_prefix("ABCD").as_deref(), Some("abcd"));
+        assert_eq!(normalize_id_prefix("  a1b2c3 ").as_deref(), Some("a1b2c3"));
+        assert_eq!(
+            normalize_id_prefix("0123456789ab").as_deref(),
+            Some("0123456789ab")
+        );
+        assert_eq!(normalize_id_prefix("abc"), None, "too short");
+        assert_eq!(normalize_id_prefix("0123456789abc"), None, "too long");
+        assert_eq!(normalize_id_prefix("wxyz"), None, "not hex");
+        assert_eq!(normalize_id_prefix(""), None);
+        // A pasted raw token (43 base64url chars) must never be accepted.
+        assert_eq!(normalize_id_prefix(&core::mint_secret_32()), None);
+    }
+
+    #[test]
+    fn list_tokens_on_a_fresh_store_is_empty() {
+        let (_dir, store) = open_temp();
+        assert!(store.list_tokens().unwrap().is_empty());
+        assert!(store.list_clients().unwrap().is_empty());
+    }
+
+    #[test]
+    fn list_tokens_never_exposes_a_token_rotated_to_or_family_value() {
+        let (_dir, store) = open_temp();
+        let (_access, refresh) = store.issue_token_pair("c1", "brain").unwrap();
+        let RotateOutcome::Rotated { .. } = store.rotate_refresh(&refresh.token).unwrap() else {
+            panic!("rotation should succeed");
+        };
+        let raw = store.load_tokens().unwrap();
+        let views = store.list_tokens().unwrap();
+        assert_eq!(views.len(), 4);
+        let json = serde_json::to_string(&views).unwrap();
+        let debug = format!("{views:?}");
+        for rec in raw.values() {
+            let mut secrets = vec![rec.token.as_str(), rec.family.as_str()];
+            if let Some(next) = &rec.rotated_to {
+                secrets.push(next);
+            }
+            for s in secrets {
+                assert!(
+                    !json.contains(s),
+                    "a raw secret leaked into list_tokens JSON"
+                );
+                assert!(
+                    !debug.contains(s),
+                    "a raw secret leaked into list_tokens Debug"
+                );
+            }
+            assert!(views.iter().any(|v| v.id == display_id(&rec.token)));
+        }
+    }
+
+    #[test]
+    fn list_tokens_reports_status_issued_and_rotation() {
+        let (_dir, store) = open_temp();
+        let now = core::now_epoch_secs();
+        let live = live_record("live-tok", "fam-a", "c1");
+        let mut revoked = live_record("revoked-tok", "fam-a", "c1");
+        revoked.revoked = true;
+        revoked.expires = now.saturating_sub(5); // revoked wins over expired
+        let mut expired = live_record("expired-tok", "fam-b", "c1");
+        expired.expires = now.saturating_sub(1);
+        let mut rotated = live_record("rotated-tok", "fam-b", "c2");
+        rotated.kind = TokenKind::Refresh;
+        rotated.revoked = true;
+        rotated.rotated_to = Some("next-tok".to_string());
+        plant(&store, &[live.clone(), revoked, expired, rotated]);
+
+        let views = store.list_tokens().unwrap();
+        let by = |t: &str| {
+            views
+                .iter()
+                .find(|v| v.id == display_id(t))
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by("live-tok").status, TokenStatus::Live);
+        assert_eq!(by("live-tok").issued, live.expires - ACCESS_TTL_SECS);
+        assert_eq!(by("live-tok").family_id, display_id("fam-a"));
+        assert_eq!(by("revoked-tok").status, TokenStatus::Revoked);
+        assert_eq!(by("expired-tok").status, TokenStatus::Expired);
+        let r = by("rotated-tok");
+        assert!(r.rotated);
+        assert_eq!(r.kind, TokenKind::Refresh);
+        assert_eq!(r.issued, r.expires.saturating_sub(REFRESH_TTL_SECS));
+        // Sorted by client_id first.
+        assert_eq!(views.last().unwrap().client_id, "c2");
+    }
+
+    #[test]
+    fn list_clients_counts_only_live_tokens_per_client() {
+        let (_dir, store) = open_temp();
+        store.register_client(client("c1")).unwrap();
+        store.register_client(client("c2")).unwrap();
+        store.issue_token_pair("c1", "brain").unwrap(); // 2 live
+        let (a, _r) = store.issue_token_pair("c1", "brain").unwrap();
+        store.revoke_token(&a.token).unwrap(); // 1 more live (its refresh)
+        let clients = store.list_clients().unwrap();
+        assert_eq!(clients.len(), 2);
+        assert_eq!(clients[0].client_id, "c1");
+        assert_eq!(clients[0].live_tokens, 3);
+        assert_eq!(clients[1].client_id, "c2");
+        assert_eq!(clients[1].live_tokens, 0);
+    }
+
+    /// Two distinct strings `"{tag}-{i}"` whose display ids share their first
+    /// MIN_ID_PREFIX_LEN hex chars, plus that shared prefix. Deterministic
+    /// (SHA-256) birthday search; pigeonhole guarantees a hit by 65 537.
+    fn colliding_pair(tag: &str) -> (String, String, String) {
+        let mut seen: BTreeMap<String, String> = BTreeMap::new();
+        for i in 0..70_000u32 {
+            let s = format!("{tag}-{i}");
+            let p = display_id(&s)[..MIN_ID_PREFIX_LEN].to_string();
+            if let Some(prev) = seen.get(&p) {
+                return (prev.clone(), s, p);
+            }
+            seen.insert(p, s);
+        }
+        unreachable!("pigeonhole: 65 536 four-hex-char prefixes");
+    }
+
+    #[test]
+    fn revoke_tokens_by_full_or_prefix_id_revokes_exactly_that_token() {
+        let (_dir, store) = open_temp();
+        let (a1, _r1) = store.issue_token_pair("c1", "brain").unwrap();
+        let (a2, _r2) = store.issue_token_pair("c1", "brain").unwrap();
+        let id = display_id(&a1.token);
+        let out = store
+            .revoke_tokens(&TokenSelector::Id(id[..6].to_string()))
+            .unwrap();
+        assert_eq!(
+            out,
+            RevokeOutcome::Revoked {
+                newly_revoked: vec![id.clone()],
+                already_revoked: 0
+            }
+        );
+        assert!(store.check_access(&a1.token).unwrap().is_none());
+        assert!(store.check_access(&a2.token).unwrap().is_some());
+        // Idempotent: the same id again reports it as already revoked.
+        assert_eq!(
+            store.revoke_tokens(&TokenSelector::Id(id)).unwrap(),
+            RevokeOutcome::Revoked {
+                newly_revoked: vec![],
+                already_revoked: 1
+            }
+        );
+    }
+
+    #[test]
+    fn revoke_tokens_by_id_does_not_cascade_to_the_family() {
+        let (_dir, store) = open_temp();
+        let (access, refresh) = store.issue_token_pair("c1", "brain").unwrap();
+        store
+            .revoke_tokens(&TokenSelector::Id(display_id(&access.token)))
+            .unwrap();
+        match store.rotate_refresh(&refresh.token).unwrap() {
+            RotateOutcome::Rotated { .. } => {}
+            other => panic!("the sibling refresh token must still rotate: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn revoke_tokens_with_an_ambiguous_id_prefix_changes_nothing() {
+        let (_dir, store) = open_temp();
+        let (t1, t2, prefix) = colliding_pair("tok");
+        plant(
+            &store,
+            &[
+                live_record(&t1, "fam-1", "c1"),
+                live_record(&t2, "fam-2", "c1"),
+            ],
+        );
+        let before = store.load_tokens().unwrap();
+        match store.revoke_tokens(&TokenSelector::Id(prefix)).unwrap() {
+            RevokeOutcome::Ambiguous(ids) => {
+                let mut want = vec![display_id(&t1), display_id(&t2)];
+                want.sort();
+                assert_eq!(ids, want);
+            }
+            other => panic!("expected Ambiguous, got {other:?}"),
+        }
+        assert_eq!(store.load_tokens().unwrap(), before, "nothing may change");
+    }
+
+    #[test]
+    fn revoke_tokens_unknown_selector_is_not_found() {
+        let (_dir, store) = open_temp();
+        store.issue_token_pair("c1", "brain").unwrap();
+        assert_eq!(
+            store
+                .revoke_tokens(&TokenSelector::Client("nobody".into()))
+                .unwrap(),
+            RevokeOutcome::NotFound
+        );
+        let (_d, empty) = open_temp();
+        assert_eq!(
+            empty
+                .revoke_tokens(&TokenSelector::Id("abcd".into()))
+                .unwrap(),
+            RevokeOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn revoke_tokens_by_client_and_by_family_are_scoped() {
+        let (_dir, store) = open_temp();
+        let (c1a, c1r) = store.issue_token_pair("c1", "brain").unwrap();
+        let (c2a, _c2r) = store.issue_token_pair("c2", "brain").unwrap();
+        let (c2b, _) = store.issue_token_pair("c2", "brain").unwrap();
+
+        // --family: one family (2 tokens) is NOT ambiguous even though the
+        // prefix matches several tokens; they share one family id.
+        let fam = display_id(&c1a.family);
+        match store
+            .revoke_tokens(&TokenSelector::Family(fam[..5].to_string()))
+            .unwrap()
+        {
+            RevokeOutcome::Revoked {
+                newly_revoked,
+                already_revoked: 0,
+            } => {
+                let mut want = vec![display_id(&c1a.token), display_id(&c1r.token)];
+                want.sort();
+                assert_eq!(newly_revoked, want);
+            }
+            other => panic!("expected Revoked, got {other:?}"),
+        }
+        assert!(store.check_access(&c2a.token).unwrap().is_some());
+
+        // --client: every token of c2, nothing else.
+        match store
+            .revoke_tokens(&TokenSelector::Client("c2".into()))
+            .unwrap()
+        {
+            RevokeOutcome::Revoked { newly_revoked, .. } => assert_eq!(newly_revoked.len(), 4),
+            other => panic!("expected Revoked, got {other:?}"),
+        }
+        assert!(store.check_access(&c2b.token).unwrap().is_none());
+    }
+
+    #[test]
+    fn revoke_tokens_with_an_ambiguous_family_prefix_changes_nothing() {
+        let (_dir, store) = open_temp();
+        let (f1, f2, prefix) = colliding_pair("fam");
+        plant(
+            &store,
+            &[
+                live_record("tok-x", &f1, "c1"),
+                live_record("tok-y", &f2, "c1"),
+            ],
+        );
+        assert!(matches!(
+            store.revoke_tokens(&TokenSelector::Family(prefix)).unwrap(),
+            RevokeOutcome::Ambiguous(ids) if ids.len() == 2
+        ));
+        assert!(store.check_access("tok-x").unwrap().is_some());
+    }
+
+    #[test]
+    fn revoke_tokens_waits_for_the_store_lock() {
+        let (dir, store) = open_temp();
+        let (access, _r) = store.issue_token_pair("c1", "brain").unwrap();
+        let other = AuthStore::open_at(dir.path().join("gateway")).unwrap();
+        let guard = store.lock_exclusive().unwrap();
+        let sel = TokenSelector::Id(display_id(&access.token));
+        let handle = std::thread::spawn(move || other.revoke_tokens(&sel).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "revoke_tokens must wait for the lock"
+        );
+        drop(guard);
+        handle.join().unwrap();
+        assert!(store.check_access(&access.token).unwrap().is_none());
+    }
+
+    #[test]
+    fn remove_client_revokes_its_tokens_deletes_its_codes_and_unregisters_it() {
+        let (_dir, store) = open_temp();
+        store.register_client(client("c1")).unwrap();
+        store.register_client(client("c2")).unwrap();
+        let (a1, r1) = store.issue_token_pair("c1", "brain").unwrap();
+        let (a2, _r2) = store.issue_token_pair("c2", "brain").unwrap();
+        let pending = store
+            .issue_code("c1", "https://cb", "chal", "res", "brain")
+            .unwrap();
+        let other_code = store
+            .issue_code("c2", "https://cb", "chal", "res", "brain")
+            .unwrap();
+
+        let removed = store.remove_client("c1").unwrap().unwrap();
+        assert_eq!(
+            removed,
+            RemovedClient {
+                client_id: "c1".into(),
+                tokens_revoked: 2,
+                codes_removed: 1
+            }
+        );
+        assert!(store.get_client("c1").unwrap().is_none());
+        assert!(store.get_client("c2").unwrap().is_some());
+        assert!(store.check_access(&a1.token).unwrap().is_none());
+        assert_eq!(
+            store.rotate_refresh(&r1.token).unwrap(),
+            RotateOutcome::Invalid,
+            "a removed client's refresh token must not mint a new pair"
+        );
+        assert!(store.consume_code(&pending.code).unwrap().is_none());
+        assert!(store.check_access(&a2.token).unwrap().is_some());
+        assert!(store.find_code_record(&other_code.code).unwrap().is_some());
+    }
+
+    #[test]
+    fn remove_client_of_an_unknown_client_is_none_and_writes_nothing() {
+        let (_dir, store) = open_temp();
+        let (a, _r) = store.issue_token_pair("ghost", "brain").unwrap();
+        assert!(store.remove_client("ghost").unwrap().is_none());
+        assert!(
+            store.check_access(&a.token).unwrap().is_some(),
+            "an unregistered client id must not revoke anything"
+        );
+    }
+
+    #[test]
+    fn remove_client_waits_for_the_store_lock() {
+        let (dir, store) = open_temp();
+        store.register_client(client("c1")).unwrap();
+        let other = AuthStore::open_at(dir.path().join("gateway")).unwrap();
+        let guard = store.lock_exclusive().unwrap();
+        let handle = std::thread::spawn(move || other.remove_client("c1").unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "remove_client must wait for the lock"
+        );
+        drop(guard);
+        assert!(handle.join().unwrap().is_some());
+        assert!(store.get_client("c1").unwrap().is_none());
     }
 }

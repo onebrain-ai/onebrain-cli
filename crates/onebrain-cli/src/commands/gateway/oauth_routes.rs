@@ -157,12 +157,13 @@ pub struct AttemptState {
 ///
 /// `store` MUST stay `Mutex<AuthStore>` — NEVER cloned out of the mutex — so
 /// every access holds the lock across its full read-modify-write.
-/// `AuthStore`'s on-disk JSON files are plain read-then-write with no
-/// file-level locking of their own (see `store.rs`'s module docs), so two
-/// concurrent in-process axum requests without this discipline could
-/// double-spend a single-use auth code or race past refresh-token reuse
-/// detection. This task only adds a READ (`check_access`, in the Bearer
-/// gate) through the lock; Tasks 3-5's mutating `/authorize`/`/token`/
+/// `AuthStore`'s mutating methods take a cross-process advisory file lock
+/// (`auth.lock`) per call, which keeps the CLI's `tokens revoke` from being
+/// lost to this process. That lock covers ONE store call, not a sequence of
+/// them, so this mutex is still needed: two concurrent in-process axum
+/// requests could otherwise double-spend a single-use auth code or race past
+/// refresh-token reuse detection. This task only adds a READ (`check_access`,
+/// in the Bearer gate) through the lock; Tasks 3-5's mutating `/authorize`/`/token`/
 /// `/register` handlers share this SAME `store` field and MUST follow the
 /// same hold-the-lock-across-the-whole-operation discipline (Task 1 security
 /// review finding, binding requirement A on this task).
@@ -570,18 +571,15 @@ fn is_loopback_redirect_uri(uri: &str) -> bool {
 ///   owner frees a slot with `onebrain gateway clients remove <id>` — hub
 ///   ruling, accepted risk R2).
 ///
-/// Persists via [`AuthStore::register_client`] with `ctx.store`'s lock held
-/// across the ENTIRE call — never cloning `AuthStore` out of the mutex, per
-/// `AuthCtx`'s doc comment (binding requirement carried from the Task 1
-/// review) and mirroring [`super::auth::middleware::require_bearer`]'s own
-/// `check_access` call. `register_client` itself does the full
-/// load-clients → insert → save-clients sequence while that single lock
-/// acquisition is held, so this handler's one `store.register_client(..)`
-/// call already satisfies the "hold across the whole read-modify-write"
-/// discipline; there is no separate existence check to add on top, since
-/// `client_id` is a freshly `mint_secret_32()`-minted 256-bit value on every
-/// call (collision-free in practice) and `register_client` is documented as
-/// insert-or-overwrite by `client_id`.
+/// Persists via [`AuthStore::register_client_capped`] with `ctx.store`'s lock
+/// held across the ENTIRE call — never cloning `AuthStore` out of the mutex,
+/// per `AuthCtx`'s doc comment — and mirroring
+/// [`super::auth::middleware::require_bearer`]'s own `check_access` call.
+/// `register_client_capped` counts the stored clients and inserts under
+/// `auth.lock`, so the 50-client cap holds even against a concurrent
+/// `clients remove` or registration from another process. `client_id` is a
+/// freshly `mint_secret_32()`-minted 256-bit value on every call
+/// (collision-free in practice), so there is no separate existence check.
 async fn register_client_handler(
     State(ctx): State<Arc<AuthCtx>>,
     Json(req): Json<RegisterRequest>,
@@ -695,17 +693,12 @@ async fn register_client_handler(
         return resp;
     }
 
-    // Lock held across the cap check AND the insert — see the doc comment
-    // above and `AuthStore::client_count`'s.
+    // The cap check and the insert happen under the store's cross-process
+    // file lock inside `register_client_capped`, so a concurrent
+    // `gateway clients remove` in another process cannot race the count.
     let saved: anyhow::Result<bool> = {
         let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
-        store.client_count().and_then(|count| {
-            if count >= MAX_REGISTERED_CLIENTS {
-                Ok(false)
-            } else {
-                store.register_client(registered).map(|()| true)
-            }
-        })
+        store.register_client_capped(registered, MAX_REGISTERED_CLIENTS)
     };
     match saved {
         Ok(true) => {}
@@ -1403,16 +1396,11 @@ async fn authorize_post_handler(
     // auth code.
     let issued = {
         let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
-        store.issue_code(
-            &validated.client.client_id,
-            &validated.redirect_uri,
-            &validated.code_challenge,
-            &validated.resource,
-            &validated.scope,
-        )
+        issue_authorize_code(&store, &validated)
     };
     match issued {
-        Ok(auth_code) => redirect_with_code(&ctx, &validated, &auth_code.code),
+        Ok(Some(auth_code)) => redirect_with_code(&ctx, &validated, &auth_code.code),
+        Ok(None) => error_page(StatusCode::BAD_REQUEST, "unknown client_id"),
         Err(e) => {
             tracing::error!(error = %e, "failed to persist minted authorization code");
             error_page(
@@ -1421,6 +1409,32 @@ async fn authorize_post_handler(
             )
         }
     }
+}
+
+/// Mint the auth code for a validated request. `Ok(None)` = the client was
+/// removed meanwhile (the code was burned, nothing may redirect with it).
+///
+/// Validation (`get_client`) and `issue_code` are separate locked calls, so
+/// `AuthStore::remove_client` (another process) can run between them. After
+/// issuing we re-check registration: a remove AFTER the re-check deletes the
+/// new code itself, and a remove BEFORE it is caught here, so no redeemable
+/// code survives for a removed client.
+fn issue_authorize_code(
+    store: &AuthStore,
+    validated: &ValidatedAuthorize,
+) -> anyhow::Result<Option<super::auth::AuthCode>> {
+    let auth_code = store.issue_code(
+        &validated.client.client_id,
+        &validated.redirect_uri,
+        &validated.code_challenge,
+        &validated.resource,
+        &validated.scope,
+    )?;
+    if store.get_client(&validated.client.client_id)?.is_none() {
+        let _ = store.consume_code(&auth_code.code);
+        return Ok(None);
+    }
+    Ok(Some(auth_code))
 }
 
 /// The `/authorize` GET+POST route as its own small `Router` — mirrors
@@ -1649,12 +1663,45 @@ fn token_authorization_code_grant(ctx: &AuthCtx, req: &TokenRequest) -> Response
         return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
 
+    issue_pair_for_consumed_code(&store, &auth_code)
+}
+
+/// Mint the pair for an already-consumed, binding-checked code.
+///
+/// `consume_code` and the issue below are separate locked calls, so
+/// `AuthStore::remove_client` (another process) can run between them. After
+/// issuing we therefore re-check the client is still registered: a remove
+/// AFTER the re-check sees the new pair and revokes it, and a remove BEFORE
+/// it is caught here, so no live pair survives for a removed client.
+fn issue_pair_for_consumed_code(store: &AuthStore, auth_code: &super::auth::AuthCode) -> Response {
     match store.issue_token_pair_for_resource(
         &auth_code.client_id,
         &auth_code.scope,
         Some(&auth_code.resource),
     ) {
         Ok((access, refresh)) => {
+            match store.get_client(&auth_code.client_id) {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    if let Err(e) = store.revoke_family(&refresh.family) {
+                        tracing::warn!(error = %e, client_id = %auth_code.client_id,
+                            "failed to revoke family after client re-check");
+                    }
+                    return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "client re-check failed during /token");
+                    if let Err(e) = store.revoke_family(&refresh.family) {
+                        tracing::warn!(error = %e, client_id = %auth_code.client_id,
+                            "failed to revoke family after client re-check");
+                    }
+                    return oauth_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "failed to issue tokens",
+                    );
+                }
+            }
             // Link this code to the family it minted so a LATER replay can
             // find and revoke it (see the doc comment above). Best-effort:
             // the tokens are already valid and returned to the caller either
@@ -2280,6 +2327,73 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    #[test]
+    fn authorize_burns_the_code_when_the_client_was_removed_before_the_recheck() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::open_at(dir.path().join("auth")).unwrap();
+        let client = RegisteredClient {
+            client_id: "c1".to_string(),
+            client_name: None,
+            redirect_uris: vec!["https://cb".to_string()],
+            application_type: AppType::Web,
+            created: 0,
+        };
+        store.register_client(client.clone()).unwrap();
+        let validated = ValidatedAuthorize {
+            client,
+            redirect_uri: "https://cb".to_string(),
+            code_challenge: "chal".to_string(),
+            resource: "res".to_string(),
+            scope: "brain".to_string(),
+            state: None,
+        };
+        // Interleaving: the client is already gone when issue_code runs
+        // (validation had passed before the remove).
+        store.remove_client("c1").unwrap().unwrap();
+        assert!(issue_authorize_code(&store, &validated).unwrap().is_none());
+        // The freshly issued code must not be redeemable.
+        let raw = std::fs::read_to_string(dir.path().join("auth").join("codes.json")).unwrap();
+        let codes: Value = serde_json::from_str(&raw).unwrap();
+        let redeemable = codes
+            .as_object()
+            .unwrap()
+            .values()
+            .filter(|c| c["used"] == json!(false))
+            .count();
+        assert_eq!(redeemable, 0, "no redeemable code may survive");
+    }
+
+    #[test]
+    fn code_exchange_refuses_a_pair_when_the_client_was_removed_mid_exchange() {
+        use super::super::auth::store::TokenStatus;
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::open_at(dir.path().join("auth")).unwrap();
+        store
+            .register_client(RegisteredClient {
+                client_id: "c1".to_string(),
+                client_name: None,
+                redirect_uris: vec!["https://cb".to_string()],
+                application_type: AppType::Web,
+                created: 0,
+            })
+            .unwrap();
+        let code = store
+            .issue_code("c1", "https://cb", "chal", "res", "brain")
+            .unwrap();
+        // Interleaving: the code is consumed, THEN the operator removes the
+        // client, THEN the handler issues the pair.
+        let consumed = store.consume_code(&code.code).unwrap().unwrap();
+        store.remove_client("c1").unwrap().unwrap();
+        let resp = issue_pair_for_consumed_code(&store, &consumed);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let views = store.list_tokens().unwrap();
+        assert!(!views.is_empty(), "the pair was minted then revoked");
+        assert!(
+            views.iter().all(|v| v.status == TokenStatus::Revoked),
+            "no live token may survive for a removed client"
+        );
     }
 
     #[test]

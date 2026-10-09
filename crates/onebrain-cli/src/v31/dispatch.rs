@@ -355,6 +355,20 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             GatewayVerb::Telegram(TelegramCmd { verb }) => match verb {
                 TelegramVerb::Setup => commands::gateway::telegram_setup(&mode),
             },
+            GatewayVerb::Tokens(GatewayTokensCmd { verb }) => match verb {
+                GatewayTokensVerb::List { all } => {
+                    commands::gateway::access::tokens_list(&mode, all)
+                }
+                GatewayTokensVerb::Revoke(args) => {
+                    commands::gateway::access::tokens_revoke(&mode, &args)
+                }
+            },
+            GatewayVerb::Clients(GatewayClientsCmd { verb }) => match verb {
+                GatewayClientsVerb::List => commands::gateway::access::clients_list(&mode),
+                GatewayClientsVerb::Remove { client_id } => {
+                    commands::gateway::access::clients_remove(&mode, &client_id)
+                }
+            },
         },
         Cmd::Note(NoteCmd { verb }) => match verb {
             NoteVerb::Search(args) => commands::note_search::run(vault_flag.clone(), &mode, &args),

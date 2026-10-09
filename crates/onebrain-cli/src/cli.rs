@@ -346,6 +346,11 @@ pub enum GatewayVerb {
     },
     /// Manage the Telegram approval channel (`gateway.yml`'s `telegram:` block).
     Telegram(TelegramCmd),
+    /// List or revoke the OAuth tokens this gateway has issued. Token values
+    /// are never printed — each token is named by a short id.
+    Tokens(GatewayTokensCmd),
+    /// List or remove registered OAuth clients (connectors).
+    Clients(GatewayClientsCmd),
 }
 
 #[derive(Args, Debug)]
@@ -363,6 +368,63 @@ pub enum TelegramVerb {
     /// resulting chat id and writes it (with the token) into
     /// `~/.onebrain/gateway.yml`'s `telegram:` block.
     Setup,
+}
+
+#[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
+pub struct GatewayTokensCmd {
+    #[command(subcommand)]
+    pub verb: GatewayTokensVerb,
+}
+#[derive(Subcommand, Debug)]
+pub enum GatewayTokensVerb {
+    /// List issued tokens — live ones only unless `--all`.
+    List {
+        /// Also show expired and revoked tokens still on disk.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Revoke one token by id, or in bulk with `--client` / `--family`.
+    /// Takes effect on the running gateway's next request — no restart.
+    Revoke(GatewayTokensRevokeArgs),
+}
+
+#[derive(Args, Debug)]
+#[command(group(
+    clap::ArgGroup::new("selector")
+        .required(true)
+        .multiple(false)
+        .args(["id", "client", "family"])
+))]
+pub struct GatewayTokensRevokeArgs {
+    /// Token id from `onebrain gateway tokens list` (or a unique prefix of at
+    /// least 4 characters).
+    pub id: Option<String>,
+    /// Revoke every token issued to this client id.
+    #[arg(long, value_name = "CLIENT_ID")]
+    pub client: Option<String>,
+    /// Revoke every token in this family (id or unique prefix, as shown by
+    /// `tokens list`) — cuts off one login completely.
+    #[arg(long, value_name = "FAMILY_ID")]
+    pub family: Option<String>,
+}
+
+#[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
+pub struct GatewayClientsCmd {
+    #[command(subcommand)]
+    pub verb: GatewayClientsVerb,
+}
+#[derive(Subcommand, Debug)]
+pub enum GatewayClientsVerb {
+    /// List registered OAuth clients and how many live tokens each holds.
+    List,
+    /// Remove a client: revokes all its tokens and deletes its pending
+    /// authorization codes.
+    Remove {
+        /// The client id, exactly as shown by `onebrain gateway clients list`.
+        client_id: String,
+    },
 }
 // ─────────────────────────────────────────────────────────────────────────
 // harness (1-verb · documented exception · wired to legacy)
@@ -1519,6 +1581,71 @@ mod tests {
             "expected missing-subcommand or display-help kind, got {:?}",
             err.kind()
         );
+    }
+
+    #[test]
+    fn gateway_tokens_and_clients_verbs_parse() {
+        let cli = Cli::try_parse_from(["onebrain", "gateway", "tokens", "list", "--all"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Cmd::Gateway(GatewayCmd {
+                verb: GatewayVerb::Tokens(GatewayTokensCmd {
+                    verb: GatewayTokensVerb::List { all: true }
+                })
+            })
+        ));
+        let cli = Cli::try_parse_from(["onebrain", "gateway", "tokens", "revoke", "abcd"]).unwrap();
+        match cli.command {
+            Cmd::Gateway(GatewayCmd {
+                verb:
+                    GatewayVerb::Tokens(GatewayTokensCmd {
+                        verb: GatewayTokensVerb::Revoke(a),
+                    }),
+            }) => {
+                assert_eq!(a.id.as_deref(), Some("abcd"));
+                assert!(a.client.is_none() && a.family.is_none());
+            }
+            _ => panic!("expected gateway tokens revoke"),
+        }
+        for (flag, val) in [("--client", "c1"), ("--family", "abcd")] {
+            assert!(
+                Cli::try_parse_from(["onebrain", "gateway", "tokens", "revoke", flag, val]).is_ok(),
+                "{flag} must parse"
+            );
+        }
+        let cli = Cli::try_parse_from(["onebrain", "gateway", "clients", "remove", "c1"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Cmd::Gateway(GatewayCmd {
+                verb: GatewayVerb::Clients(GatewayClientsCmd {
+                    verb: GatewayClientsVerb::Remove { ref client_id }
+                })
+            }) if client_id == "c1"
+        ));
+        assert!(Cli::try_parse_from(["onebrain", "gateway", "clients", "list"]).is_ok());
+    }
+
+    #[test]
+    fn gateway_tokens_revoke_requires_exactly_one_selector() {
+        use clap::error::ErrorKind;
+        let base = ["onebrain", "gateway", "tokens", "revoke"];
+        let cases: [&[&str]; 3] = [
+            &[],
+            &["abcd", "--client", "c1"],
+            &["--client", "c1", "--family", "abcd"],
+        ];
+        for extra in cases {
+            let args: Vec<&str> = base.iter().chain(extra.iter()).copied().collect();
+            let err = Cli::try_parse_from(&args).unwrap_err();
+            assert!(
+                matches!(
+                    err.kind(),
+                    ErrorKind::MissingRequiredArgument | ErrorKind::ArgumentConflict
+                ),
+                "{args:?} must be a usage error, got {:?}",
+                err.kind()
+            );
+        }
     }
 
     #[test]

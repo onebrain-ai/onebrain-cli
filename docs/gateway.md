@@ -235,6 +235,28 @@ Every credential this authorization server mints — authorization codes, access
 | Access token | 1 hour | Presented as `Authorization: Bearer <token>` on every `/mcp` call. |
 | Refresh token | 30 days | **Rotates on every use** (RFC 6749 §6 / OAuth 2.1 §4.14.3): each `grant_type=refresh_token` exchange invalidates the presented token and mints a new pair. Presenting an already-rotated refresh token again is treated as a leaked-token signal — the entire token family it descended from (every access/refresh token minted since the original code exchange) is revoked immediately, not just the reused token. |
 
+### Managing access
+
+Every client that completed the pairing flow holds tokens in `~/.onebrain/gateway/tokens.json`. You can see and cut off that access from any terminal, whether or not `gateway run` is up. The running gateway re-reads the store on every request, so a revocation takes effect on the client's **next** call, with no restart.
+
+Tokens are never printed. Each one is shown by a 12-character **id**: the first 12 hex digits of its SHA-256 hash. Its **family** (every token descended from one login) is shown the same way. For a token id or a family, a unique prefix of at least 4 characters also works. An ambiguous prefix changes nothing and lists the candidates. `--client` takes the exact client id from `clients list`.
+
+| Command | What it does |
+|---|---|
+| `onebrain gateway tokens list` | Live tokens: id, kind (access/refresh), client, family, status, issued, expires. |
+| `onebrain gateway tokens list --all` | Also expired and revoked tokens still on disk, with `status` live, expired or revoked (the gateway purges expired ones at startup). |
+| `onebrain gateway tokens revoke <id>` | Revokes **that one token only**. It does not cascade: revoking an access token does not stop a client that still holds a live refresh token. The output hints at the two rows below. |
+| `onebrain gateway tokens revoke --family <family>` | Revokes every token from one login (access and refresh). The client must pair again. |
+| `onebrain gateway tokens revoke --client <client_id>` | Revokes every token held by one client, but not its pending authorization codes (600 s TTL), so a code exchange already in flight can still mint a pair. For a full cut-off use `clients remove`. A client id that matches nothing is reported without echoing the value. |
+| `onebrain gateway clients list` | Registered clients, with how many live tokens each holds. |
+| `onebrain gateway clients remove <client_id>` | Deletes the registration, revokes all its tokens, and deletes its pending authorization codes. |
+
+`tokens revoke` takes exactly one of `<id>`, `--client`, or `--family`. When `/register` refuses a new client because 50 are already registered (`429`, see [Exposure hardening](#exposure-hardening-pre-tunnel)), `clients list` + `clients remove <client_id>` is how you free a slot. Clients are never evicted automatically.
+
+All of these accept `--json` (envelope commands `gateway.tokens.list`, `gateway.tokens.revoke`, `gateway.clients.list`, `gateway.clients.remove`). An unknown or ambiguous id exits `1` without changing anything. A client removed while it is mid-pairing gets nothing usable: `/authorize` and `/token` re-check that the client is still registered after minting. If you think the pairing code itself leaked, also run `onebrain gateway pair --rotate`, so a removed client cannot simply pair again.
+
+Writes to the store take an advisory lock (`~/.onebrain/gateway/auth.lock`). That lock keeps a revoke from being lost to a token refresh the gateway is processing at the same moment. Don't delete the lock file while the gateway is running.
+
 ### Exposure hardening (pre-tunnel)
 
 These protections are in place so the gateway can safely sit behind a tunnel. Each one also applies on loopback.
@@ -255,7 +277,7 @@ These protections are in place so the gateway can safely sit behind a tunnel. Ea
 
 Because registration needs no credentials, anyone who can reach a tunnelled gateway can use up the 10-per-minute window or fill the 50-client cap, which stops *new* clients from registering. Existing clients and `/mcp` are unaffected — their tokens keep working and refreshing. The caps bound the damage (`clients.json` cannot grow without limit); they do not authenticate callers.
 
-**Recovering when the 50-client limit is reached:** run `onebrain gateway clients list`, then `onebrain gateway clients remove <id>` for each client you don't recognise. Removing a client also revokes its tokens. The error a refused registration gets names that command. Clients are never evicted automatically. (The `clients` command lands with the next track of the same v3.5.0 release.) If the rate-limit window is being exhausted, pause the tunnel, or restart the gateway — the window is in memory and resets on restart.
+**Recovering when the 50-client limit is reached:** run `onebrain gateway clients list`, then `onebrain gateway clients remove <id>` for each client you don't recognise. Removing a client also revokes its tokens (see [Managing access](#managing-access)). The error a refused registration gets names that command. Clients are never evicted automatically. If the rate-limit window is being exhausted, pause the tunnel, or restart the gateway — the window is in memory and resets on restart.
 
 #### Onboarding lockout: a deliberate tradeoff
 
