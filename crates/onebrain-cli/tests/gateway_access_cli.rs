@@ -25,7 +25,13 @@ fn onebrain(home: &Path, args: &[&str]) -> Output {
         .current_dir(home)
         .args(args)
         .output()
-        .unwrap_or_else(|e| panic!("spawn onebrain ({} args, verb `{}`): {e}", args.len(), args.get(2).copied().unwrap_or("")))
+        .unwrap_or_else(|e| {
+            panic!(
+                "spawn onebrain ({} args, verb `{}`): {e}",
+                args.len(),
+                args.get(2).copied().unwrap_or("")
+            )
+        })
 }
 
 fn gateway_dir(home: &Path) -> PathBuf {

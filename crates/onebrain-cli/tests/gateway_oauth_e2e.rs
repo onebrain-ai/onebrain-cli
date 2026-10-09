@@ -1123,7 +1123,8 @@ fn gateway_tokens_revoke_takes_effect_on_the_running_gateways_next_request() {
 
     let (status, body) = post_mcp(&agent, &mcp_url, TOKEN, &init_body(2), &headers);
     assert_eq!(
-        status, 401,
+        status,
+        401,
         "a CLI revoke must take effect on the next request ({} body bytes)",
         body.len()
     );
