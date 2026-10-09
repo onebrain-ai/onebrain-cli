@@ -222,12 +222,16 @@ fn open_capture_stream(sb: &Sandbox) -> (String, Instant, JoinHandle<Vec<Timed>>
     });
     let (status, content_type) = match headers_rx.recv_timeout(Duration::from_secs(5)) {
         Ok(Ok(headers)) => headers,
+        // Message wrapper only (no test forces a send error): reports a
+        // refused connection etc. instead of a 5 s "first byte" timeout.
         Ok(Err(e)) => panic!("POST /mcp failed: {e}"),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             panic!("first byte too late: no response headers within 5s")
         }
+        // Unreachable in practice: the thread sends on both send() outcomes
+        // before it can return, so this needs a panic before send().
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            panic!("stream thread died before response headers arrived")
+            panic!("unreachable: stream thread ended without reporting send()")
         }
     };
     assert_eq!(status, 200);
@@ -263,6 +267,20 @@ fn resolve(sb: &Sandbox, code: &str, id: &str, decision: &str) {
         .status()
         .as_u16();
     assert_eq!(status, 200);
+}
+
+/// Join the stream reader, but fail fast (instead of blocking until ureq's
+/// 300 s global timeout) if the gateway never closes the stream.
+fn join_within(reader: JoinHandle<Vec<Timed>>, limit: Duration) -> Vec<Timed> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(reader.join());
+    });
+    match rx.recv_timeout(limit) {
+        Ok(Ok(lines)) => lines,
+        Ok(Err(_)) => panic!("stream reader panicked"),
+        Err(_) => panic!("stream did not close within {limit:?} after the decision"),
+    }
 }
 
 /// Wait up to `limit` for `child` to exit; panic otherwise. Used by the
@@ -354,14 +372,12 @@ fn approve_after(hold: Duration) {
     let id = wait_for_one_pending(&sb, &code);
     std::thread::sleep(hold);
     resolve(&sb, &code, &id, "approve");
-    let lines = reader.join().expect("stream reader panicked");
+    let lines = join_within(reader, Duration::from_secs(10));
     assert_keepalive_stream(&lines, hold);
-    assert!(
-        std::fs::read_dir(sb.vault.path().join("00-inbox"))
-            .unwrap()
-            .count()
-            == 1
-    );
+    let notes = std::fs::read_dir(sb.vault.path().join("00-inbox"))
+        .unwrap()
+        .count();
+    assert_eq!(notes, 1, "expected exactly one captured note in 00-inbox");
 }
 
 /// D1 acceptance (design §4): first byte < 5 s, `:` keep-alives while
