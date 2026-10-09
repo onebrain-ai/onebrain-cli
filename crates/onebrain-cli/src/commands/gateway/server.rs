@@ -1133,6 +1133,30 @@ async fn policy_gate(
     }
 }
 
+/// The outcome of a call whose client disconnected mid-wait (Ruling 10):
+/// always a denial — but if another path had already denied it (shutdown's
+/// `deny_all` won the race), that path's channel is kept for the audit and
+/// Telegram, instead of being relabelled "disconnect". An approve that won
+/// the race is still turned into a Disconnect denial (fail-safe: nobody is
+/// left to receive the result).
+async fn outcome_on_disconnect(
+    approvals: &Approvals,
+    id: &str,
+    wait: impl std::future::Future<Output = WaitOutcome>,
+) -> WaitOutcome {
+    let disconnect = WaitOutcome::Decided(approval::Decision::Deny, ResolvedVia::Disconnect);
+    // Whoever took `id` out of `pending` — this resolve, or a path that got
+    // there first — has put (or is about to put) its answer in the channel
+    // `wait` reads, so this await returns at once.
+    approvals.resolve(id, approval::Decision::Deny, ResolvedVia::Disconnect);
+    match wait.await {
+        WaitOutcome::Decided(approval::Decision::Deny, via) => {
+            WaitOutcome::Decided(approval::Decision::Deny, via)
+        }
+        _ => disconnect,
+    }
+}
+
 /// The `NeedApproval` arm of [`policy_gate`] (Gateway PR 4, Task 5): the
 /// wiring that finally connects [`policy::decide`] to Task 3's
 /// [`Approvals`] registry and Task 4's native macOS dialog channel.
@@ -1209,30 +1233,6 @@ async fn policy_gate(
 ///    timeout still closes the Telegram message's loop, just with a
 ///    different outcome string (see the call sites below for the three
 ///    exact strings).
-/// The outcome of a call whose client disconnected mid-wait (Ruling 10):
-/// always a denial — but if another path had already denied it (shutdown's
-/// `deny_all` won the race), that path's channel is kept for the audit and
-/// Telegram, instead of being relabelled "disconnect". An approve that won
-/// the race is still turned into a Disconnect denial (fail-safe: nobody is
-/// left to receive the result).
-async fn outcome_on_disconnect(
-    approvals: &Approvals,
-    id: &str,
-    wait: impl std::future::Future<Output = WaitOutcome>,
-) -> WaitOutcome {
-    let disconnect = WaitOutcome::Decided(approval::Decision::Deny, ResolvedVia::Disconnect);
-    // Whoever took `id` out of `pending` — this resolve, or a path that got
-    // there first — has put (or is about to put) its answer in the channel
-    // `wait` reads, so this await returns at once.
-    approvals.resolve(id, approval::Decision::Deny, ResolvedVia::Disconnect);
-    match wait.await {
-        WaitOutcome::Decided(approval::Decision::Deny, via) => {
-            WaitOutcome::Decided(approval::Decision::Deny, via)
-        }
-        _ => disconnect,
-    }
-}
-
 async fn await_approval(
     state: &Arc<GatewayState>,
     principal: &Principal,
