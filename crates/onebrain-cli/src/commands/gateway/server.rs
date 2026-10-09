@@ -3796,6 +3796,109 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
     }
 
+    /// Fix round 1 (Ruling 4): a tunnel that rewrites `Host` to the loopback
+    /// origin still adds a proxy header — `/approvals` answers 403 even on a
+    /// loopback `Host` with the right pairing code, while the same request
+    /// without the header reaches the pairing check (401 with no code).
+    #[tokio::test]
+    async fn approvals_with_a_proxy_header_is_403_even_on_a_loopback_host_on_the_real_router() {
+        let (dir, router, _token) = fixture_router();
+        let code = AuthStore::open_at(dir.path().join("gateway-auth"))
+            .unwrap()
+            .pairing_code()
+            .unwrap();
+        let (status, text) = raw_request(
+            &router,
+            "GET",
+            "/approvals",
+            &[
+                ("host", "127.0.0.1:7717"),
+                ("x-forwarded-for", "203.0.113.7"),
+                ("x-onebrain-pairing", code.as_str()),
+            ],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+        assert_eq!(text, "Forbidden: /approvals is loopback-only");
+
+        let (status, text) = raw_request(
+            &router,
+            "GET",
+            "/approvals",
+            &[("host", "127.0.0.1:7717")],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{text}");
+    }
+
+    /// cloudflared adds proxy headers to EVERY tunnelled request: discovery,
+    /// `/authorize`, `/token` and `/mcp` must still work through the tunnel
+    /// host with all of them present.
+    #[tokio::test]
+    async fn proxy_headers_do_not_block_the_public_routes_on_the_real_router() {
+        let (_dir, router, token) = fixture_router_with_public_url("https://gw.example.com");
+        let proxied: [(&str, &str); 6] = [
+            ("host", "gw.example.com"),
+            ("forwarded", "for=203.0.113.7;proto=https"),
+            ("x-forwarded-for", "203.0.113.7"),
+            ("x-forwarded-host", "gw.example.com"),
+            ("x-real-ip", "203.0.113.7"),
+            ("cf-connecting-ip", "203.0.113.7"),
+        ];
+        let (status, text) = raw_request(
+            &router,
+            "GET",
+            "/.well-known/oauth-authorization-server",
+            &proxied,
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+
+        // Unknown client / unsupported grant still 400 — the point is the
+        // handler ran (not the guard's 403).
+        let (status, text) = raw_request(
+            &router,
+            "GET",
+            REAL_ROUTER_AUTHORIZE_URI,
+            &proxied,
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+        let mut token_headers = proxied.to_vec();
+        token_headers.push(("content-type", "application/x-www-form-urlencoded"));
+        let (status, text) = raw_request(
+            &router,
+            "POST",
+            "/token",
+            &token_headers,
+            Body::from("grant_type=client_credentials"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+
+        let auth = format!("Bearer {token}");
+        let mut mcp_headers = proxied.to_vec();
+        mcp_headers.extend([
+            ("content-type", "application/json"),
+            ("accept", "application/json, text/event-stream"),
+            ("authorization", auth.as_str()),
+        ]);
+        let (status, text) = raw_request(
+            &router,
+            "POST",
+            "/mcp",
+            &mcp_headers,
+            Body::from(init_body(1, PROTOCOL)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert!(text.contains("\"result\""), "{text}");
+    }
+
     // ── Gateway PR 4, Task 2: policy engine + Principal wiring ───────────
 
     /// Like [`fixture_router`], but lets the caller override

@@ -17,7 +17,12 @@
 //!    host — else **403**.
 //! 3. `/approvals` and `/approvals/…` (the pairing-code-gated operator
 //!    surface) additionally require a LOOPBACK host — the `public_url` host
-//!    gets **403**, so the tunnel never exposes it (red-team item 5).
+//!    gets **403**, so the tunnel never exposes it (red-team item 5). Any
+//!    reverse-proxy header ([`PROXY_HEADERS`]) on an `/approvals` request is
+//!    **403** too: a tunnel or proxy that rewrites `Host` to the loopback
+//!    origin would otherwise deliver internet requests as `Host: localhost`.
+//!    Other routes ignore these headers (cloudflared adds them to every
+//!    request).
 //! 4. On a state-changing method (anything but GET/HEAD/OPTIONS) outside
 //!    `/mcp`, [`request_origin_allowed`] must hold — else **403**:
 //!    an `Origin` header, when present, must be the issuer's exact origin
@@ -127,6 +132,41 @@ pub(crate) fn request_origin_allowed(headers: &HeaderMap, issuer: &str) -> bool 
     }
 }
 
+/// Headers a tunnel or reverse proxy adds to a forwarded request. Presence of
+/// any one marks an `/approvals` request as not-really-loopback, whatever its
+/// `Host` says. (`HeaderMap` names are lower-case, so matching is
+/// case-insensitive.)
+const PROXY_HEADERS: [&str; 5] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-real-ip",
+    "cf-connecting-ip",
+];
+
+fn has_proxy_header(headers: &HeaderMap) -> bool {
+    PROXY_HEADERS.iter().any(|name| headers.contains_key(*name))
+}
+
+/// Longest caller-supplied value the guard writes to a log line, in bytes.
+const MAX_LOGGED_BYTES: usize = 128;
+
+/// A caller-supplied header value made safe to log: lossy UTF-8, cut to
+/// [`MAX_LOGGED_BYTES`] on a char boundary with a trailing `…` when cut — the
+/// Origin branch is reachable unauthenticated, so an uncapped value would let
+/// anyone write header-sized warn lines.
+fn capped_for_log(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    if text.len() <= MAX_LOGGED_BYTES {
+        return text.into_owned();
+    }
+    let mut end = MAX_LOGGED_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
 /// `/mcp` or anything under it (not `/mcpx`).
 fn is_mcp_path(path: &str) -> bool {
     path == "/mcp" || path.starts_with("/mcp/")
@@ -186,7 +226,7 @@ fn plain(status: StatusCode, message: &'static str) -> Response {
         .into_response()
 }
 
-/// The guard itself — see the module docs for the four rules.
+/// The guard itself — see the module docs for the rules.
 pub async fn require_allowed_host(
     State(guard): State<Arc<HostGuard>>,
     req: Request,
@@ -198,7 +238,7 @@ pub async fn require_allowed_host(
     };
     if !guard.allowed_hosts.contains(&host) {
         tracing::warn!(
-            host = %host,
+            host = %capped_for_log(host.as_bytes()),
             "gateway rejected a request with a disallowed Host header (possible DNS rebinding)"
         );
         return plain(
@@ -209,8 +249,17 @@ pub async fn require_allowed_host(
     let path = req.uri().path();
     if is_approvals_path(path) && !LOOPBACK_HOSTS.contains(&host.as_str()) {
         tracing::warn!(
-            host = %host,
+            host = %capped_for_log(host.as_bytes()),
             "gateway refused /approvals on a non-loopback Host (operator surface is loopback-only)"
+        );
+        return plain(
+            StatusCode::FORBIDDEN,
+            "Forbidden: /approvals is loopback-only",
+        );
+    }
+    if is_approvals_path(path) && has_proxy_header(req.headers()) {
+        tracing::warn!(
+            "gateway refused /approvals carrying a reverse-proxy header (operator surface is loopback-only)"
         );
         return plain(
             StatusCode::FORBIDDEN,
@@ -222,7 +271,11 @@ pub async fn require_allowed_host(
         && !request_origin_allowed(req.headers(), guard.auth.issuer())
     {
         tracing::warn!(
-            origin = ?req.headers().get(header::ORIGIN),
+            origin = %req
+                .headers()
+                .get(header::ORIGIN)
+                .map(|o| capped_for_log(o.as_bytes()))
+                .unwrap_or_default(),
             "gateway rejected a state-changing request from a foreign Origin"
         );
         return plain(
@@ -560,5 +613,79 @@ mod tests {
         // A lookalike prefix is not `/approvals`.
         let (status, _) = call(&router, "GET", "/approvalsx", &[("host", "gw.example.com")]).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[test]
+    fn capped_for_log_bounds_oversized_values_on_a_char_boundary() {
+        assert_eq!(
+            capped_for_log(b"https://evil.example"),
+            "https://evil.example"
+        );
+        let long = "é".repeat(200); // 400 bytes, 2-byte chars
+        let capped = capped_for_log(long.as_bytes());
+        assert!(capped.ends_with('…'), "{capped}");
+        assert!(capped.len() <= MAX_LOGGED_BYTES + '…'.len_utf8());
+        assert_eq!(
+            capped_for_log(&[0xff; 300]).chars().count(),
+            MAX_LOGGED_BYTES / 3 + 1
+        );
+    }
+
+    /// Fix round 1 (Ruling 4): a tunnel that rewrites `Host` to the loopback
+    /// origin still adds a proxy header — `/approvals` refuses any of them,
+    /// whatever the `Host`, before the pairing check.
+    #[tokio::test]
+    async fn approvals_refuses_any_proxy_header_even_on_a_loopback_host() {
+        let (_dir, router) = guard_router(Some("https://gw.example.com"));
+        for name in [
+            "Forwarded",
+            "X-Forwarded-For",
+            "x-forwarded-host",
+            "X-Real-IP",
+            "CF-Connecting-IP",
+        ] {
+            for (method, uri) in [("GET", "/approvals"), ("POST", "/approvals/a1")] {
+                let (status, body) = call(
+                    &router,
+                    method,
+                    uri,
+                    &[("host", "127.0.0.1:7717"), (name, "203.0.113.7")],
+                )
+                .await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "{name} {method} {uri}");
+                assert_eq!(body, "Forbidden: /approvals is loopback-only");
+            }
+        }
+        let (status, _) = call(&router, "GET", "/approvals", &[("host", "127.0.0.1:7717")]).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// cloudflared adds these headers to EVERY request: only `/approvals`
+    /// may care, so every other route (and the `/approvalsx` lookalike)
+    /// still answers through the tunnel host and on loopback.
+    #[tokio::test]
+    async fn proxy_headers_do_not_affect_non_approvals_routes() {
+        let (_dir, router) = guard_router(Some("https://gw.example.com"));
+        let proxied = |host| {
+            [
+                ("host", host),
+                ("forwarded", "for=203.0.113.7"),
+                ("x-forwarded-for", "203.0.113.7"),
+                ("x-forwarded-host", "gw.example.com"),
+                ("x-real-ip", "203.0.113.7"),
+                ("cf-connecting-ip", "203.0.113.7"),
+            ]
+        };
+        for host in ["gw.example.com", "localhost:7717"] {
+            for (method, uri) in [
+                ("GET", "/x"),
+                ("POST", "/x"),
+                ("POST", "/mcp"),
+                ("GET", "/approvalsx"),
+            ] {
+                let (status, body) = call(&router, method, uri, &proxied(host)).await;
+                assert_eq!(status, StatusCode::OK, "{method} {uri} via {host}: {body}");
+            }
+        }
     }
 }
