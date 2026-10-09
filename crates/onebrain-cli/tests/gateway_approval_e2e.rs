@@ -614,7 +614,7 @@ fn read_audit_entries(home: &Path) -> Vec<serde_json::Value> {
 /// naming it as the default vault, with `policy.mutating: ask_once` — the
 /// one config knob this whole test exists to drive `brain_capture` through.
 /// Every other `policy:` field is left at its default (`approval_wait_seconds:
-/// 300`, `grant_ttl_minutes: 30`) — comfortably long enough for this test's
+/// 240`, `grant_ttl_minutes: 30`) — comfortably long enough for this test's
 /// own poll-then-resolve loop, and long enough that the grant recorded by
 /// the first approval is still live for the second call.
 fn write_fixture_vault_and_config(home: &Path) -> tempfile::TempDir {

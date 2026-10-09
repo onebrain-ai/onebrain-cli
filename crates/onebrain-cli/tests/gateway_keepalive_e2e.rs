@@ -108,12 +108,11 @@ struct Sandbox {
     _root: TempDir,
     home: PathBuf,
     vault: TempDir,
-    // `child` and `stderr` are read by the shutdown tests (Tasks 3/4).
+    // `child` is read by the shutdown tests (Task 4).
     #[allow(dead_code)]
     child: KillOnDrop,
     mcp_url: String,
     approvals_url: String,
-    #[allow(dead_code)]
     stderr: PathBuf,
 }
 
@@ -395,4 +394,32 @@ fn an_approval_gated_call_streams_at_once_and_keeps_alive_until_approved() {
 #[ignore = "holds an approval for 130 s — run in the Task 5 verification"]
 fn an_approval_held_past_cloudflares_125s_limit_still_completes() {
     approve_after(Duration::from_secs(130));
+}
+
+/// The clamp reaches the running process: a configured 900 s wait is
+/// announced as 270 s, and stderr names the key.
+#[test]
+fn an_oversized_approval_wait_is_clamped_to_270s_at_startup() {
+    let sb = start("  mutating: ask_once\n  approval_wait_seconds: 900\n");
+    let (_ct, _t0, reader) = open_capture_stream(&sb);
+    let code = read_pairing_code(&sb.home);
+    let id = wait_for_one_pending(&sb, &code);
+    resolve(&sb, &code, &id, "deny");
+    let lines = join_within(reader, Duration::from_secs(10));
+    let body: String = lines.iter().map(|t| format!("{}\n\n", t.line)).collect();
+    let notice = &support::sse_data_events(&body)[0];
+    let text = notice["params"]["data"]
+        .as_str()
+        .or(notice["params"]["message"].as_str())
+        .unwrap_or("");
+    assert_eq!(
+        text, "waiting for human approval of brain_capture (up to 270s)",
+        "{body}"
+    );
+    let err = std::fs::read_to_string(&sb.stderr).unwrap();
+    assert!(
+        err.contains("policy.approval_wait_seconds is 900"),
+        "{}",
+        support::redacted_capture_tail(&err)
+    );
 }

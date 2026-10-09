@@ -285,7 +285,7 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
     // comment for the full list of decisions that depend on this.
     init_tracing();
 
-    let config = load_gateway_config()?;
+    let mut config = load_gateway_config()?;
     let port = port_flag.unwrap_or(config.port);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let public_url = config.public_url.clone();
@@ -301,6 +301,9 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
     // The rules themselves live in `PolicyConfig::startup_warnings` and are
     // unit-tested there; this loop only logs them, because `run()` itself is
     // subprocess-only under coverage.
+    if let Some(warning) = config.policy.clamp_approval_wait() {
+        tracing::warn!("gateway.yml: {warning}");
+    }
     for warning in config.policy.startup_warnings() {
         tracing::warn!("gateway.yml: {warning}");
     }

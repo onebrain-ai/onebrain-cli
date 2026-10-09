@@ -177,10 +177,10 @@ pub struct PolicyConfig {
     /// CURRENT, still-synchronous MCP tool call waits for a first decision
     /// (seconds-to-minutes scale) — conflating the two into one field would
     /// make it impossible for an operator to want "ask me and wait up to 5
-    /// minutes" independently of "then remember it for a day". Default 300s
-    /// (5 minutes): long enough for a human to notice the native macOS
-    /// dialog or the `/approvals` HTTP surface and respond, short enough
-    /// that a client isn't left hanging indefinitely.
+    /// minutes" independently of "then remember it for a day". Default 240 s
+    /// and never more than [`MAX_APPROVAL_WAIT_SECONDS`]: Claude's tool calls
+    /// time out at 300 s, so a longer wait could only ever end in the
+    /// client's own timeout instead of our clear refusal.
     ///
     /// **`0` is legal and means "time out immediately".** It is FAIL-CLOSED,
     /// not fail-open: `server::await_approval` waits zero seconds, sees no
@@ -210,8 +210,14 @@ fn default_grant_ttl_minutes() -> u64 {
     30
 }
 fn default_approval_wait_seconds() -> u64 {
-    300
+    240
 }
+
+/// Ceiling for `approval_wait_seconds`. Claude's tool-call timeout is 300 s;
+/// 270 leaves 30 s for the reply to travel back through the tunnel before
+/// the client gives up on its own (design §3.1, correcting parent spec §6's
+/// "10 min").
+pub const MAX_APPROVAL_WAIT_SECONDS: u64 = 270;
 
 impl Default for PolicyConfig {
     fn default() -> Self {
@@ -236,6 +242,22 @@ impl PolicyConfig {
             RiskClass::Mutating => self.mutating,
             RiskClass::Destructive => self.destructive,
         }
+    }
+
+    /// Clamp `approval_wait_seconds` to [`MAX_APPROVAL_WAIT_SECONDS`].
+    /// Returns the warning `gateway run` logs when it changed anything, so
+    /// the rule stays pure and unit-testable (`run()` is subprocess-only).
+    pub fn clamp_approval_wait(&mut self) -> Option<String> {
+        if self.approval_wait_seconds <= MAX_APPROVAL_WAIT_SECONDS {
+            return None;
+        }
+        let was = self.approval_wait_seconds;
+        self.approval_wait_seconds = MAX_APPROVAL_WAIT_SECONDS;
+        Some(format!(
+            "policy.approval_wait_seconds is {was} — above the {MAX_APPROVAL_WAIT_SECONDS}s \
+             ceiling (Claude's tool calls time out at 300s, so a longer wait can never be \
+             answered in time); using {MAX_APPROVAL_WAIT_SECONDS}s"
+        ))
     }
 
     /// Legal-but-almost-certainly-unintended values in a freshly loaded
@@ -440,7 +462,7 @@ mod tests {
             mutating,
             destructive,
             grant_ttl_minutes: 30,
-            approval_wait_seconds: 300,
+            approval_wait_seconds: 240,
         }
     }
 
@@ -453,7 +475,41 @@ mod tests {
         assert_eq!(cfg.mutating, PolicyMode::AskOnce);
         assert_eq!(cfg.destructive, PolicyMode::AskAlways);
         assert_eq!(cfg.grant_ttl_minutes, 30);
-        assert_eq!(cfg.approval_wait_seconds, 300);
+        assert_eq!(cfg.approval_wait_seconds, 240);
+    }
+
+    #[test]
+    fn approval_wait_defaults_to_240_seconds() {
+        assert_eq!(PolicyConfig::default().approval_wait_seconds, 240);
+        let sparse: PolicyConfig = serde_yaml::from_str("mutating: deny\n").unwrap();
+        assert_eq!(sparse.approval_wait_seconds, 240);
+    }
+
+    #[test]
+    fn clamp_approval_wait_caps_at_270_and_says_so() {
+        let mut cfg = PolicyConfig {
+            approval_wait_seconds: 900,
+            ..PolicyConfig::default()
+        };
+        let warning = cfg.clamp_approval_wait().expect("900 must be clamped");
+        assert_eq!(cfg.approval_wait_seconds, MAX_APPROVAL_WAIT_SECONDS);
+        assert!(
+            warning.contains("policy.approval_wait_seconds is 900"),
+            "{warning}"
+        );
+        assert!(warning.contains("270"), "{warning}");
+    }
+
+    #[test]
+    fn clamp_approval_wait_leaves_270_and_below_alone() {
+        for secs in [0, 1, 240, 270] {
+            let mut cfg = PolicyConfig {
+                approval_wait_seconds: secs,
+                ..PolicyConfig::default()
+            };
+            assert!(cfg.clamp_approval_wait().is_none(), "{secs}");
+            assert_eq!(cfg.approval_wait_seconds, secs);
+        }
     }
 
     #[test]
@@ -499,7 +555,7 @@ mod tests {
         assert_eq!(sparse.destructive, PolicyMode::AskAlways);
         assert_eq!(sparse.grant_ttl_minutes, 30);
         assert_eq!(
-            sparse.approval_wait_seconds, 300,
+            sparse.approval_wait_seconds, 240,
             "missing field must default"
         );
     }
