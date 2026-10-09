@@ -4,9 +4,6 @@
 //! renders CALENDAR jobs (`RunAtLoad false`, `StartCalendarInterval`); these
 //! are always-on daemons: `KeepAlive true` + `RunAtLoad true`. Pure and
 //! platform-neutral so the golden tests run (and are measured) on Linux CI.
-// Task 5 (`service.rs`) is the only non-test consumer; until it lands nothing
-// calls this on any OS. Drop to the macOS-only form then.
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 

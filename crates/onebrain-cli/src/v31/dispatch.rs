@@ -366,6 +366,10 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             GatewayVerb::Tunnel(TunnelCmd { verb }) => match verb {
                 TunnelVerb::Setup => commands::gateway::tunnel_setup(&mode),
             },
+            GatewayVerb::Service(ServiceCmd { verb }) => match verb {
+                ServiceVerb::Install => commands::gateway::service_install(&mode),
+                ServiceVerb::Uninstall => commands::gateway::service_uninstall(&mode),
+            },
             GatewayVerb::Clients(GatewayClientsCmd { verb }) => match verb {
                 GatewayClientsVerb::List => commands::gateway::access::clients_list(&mode),
                 GatewayClientsVerb::Remove { client_id } => {

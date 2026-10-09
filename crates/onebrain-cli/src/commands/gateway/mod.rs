@@ -31,10 +31,12 @@ pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod config_write;
+pub mod health;
 pub mod host_guard;
 pub mod oauth_routes;
 pub mod policy;
 pub mod server;
+pub mod service;
 pub mod service_plist;
 pub mod telegram;
 pub mod telegram_api;
@@ -47,6 +49,7 @@ pub mod tunnel;
 // Task 4's dead-code-allow removal).
 pub use config::{load_gateway_config, GatewayConfig};
 pub use server::{build_gateway_router, GatewayState};
+pub use service::{service_install, service_uninstall};
 pub use telegram_setup::telegram_setup;
 pub use tunnel::tunnel_setup;
 
@@ -201,6 +204,18 @@ fn resolve_issuer(public_url: Option<&str>, bound: SocketAddr) -> String {
     }
 }
 
+/// Every check `gateway run` refuses to start on — shared with
+/// `service install` and `doctor` so all three agree. (T1 may have added
+/// host-guard checks next to the `public_url` one; move them in here too.)
+pub(crate) fn validate_gateway_config(config: &GatewayConfig) -> anyhow::Result<()> {
+    if let Some(url) = config.public_url.as_deref() {
+        if let Err(reason) = validate_public_url(url) {
+            anyhow::bail!("gateway.yml `public_url` ({url:?}) is invalid: {reason}");
+        }
+    }
+    Ok(())
+}
+
 /// Validate a configured `public_url` (security review, Important: header
 /// injection + silent-fallback-to-insecure-issuer). Called ONCE at `run()`
 /// startup, before anything else happens (before opening the auth store,
@@ -352,11 +367,7 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
     let port = port_flag.unwrap_or(config.port);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let public_url = config.public_url.clone();
-    if let Some(url) = public_url.as_deref() {
-        if let Err(reason) = validate_public_url(url) {
-            anyhow::bail!("gateway.yml `public_url` ({url:?}) is invalid: {reason}");
-        }
-    }
+    validate_gateway_config(&config)?;
     // `approval_wait_seconds` above the 270 s ceiling is lowered to it, with a warning.
     if let Some(warning) = config.policy.clamp_approval_wait() {
         tracing::warn!("gateway.yml: {warning}");

@@ -353,6 +353,23 @@ pub enum GatewayVerb {
     Clients(GatewayClientsCmd),
     /// Remote access through a Cloudflare tunnel (token from the Zero Trust dashboard).
     Tunnel(TunnelCmd),
+    /// Keep the gateway (and its tunnel) running as macOS LaunchAgents.
+    Service(ServiceCmd),
+}
+
+#[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
+pub struct ServiceCmd {
+    #[command(subcommand)]
+    pub verb: ServiceVerb,
+}
+#[derive(Subcommand, Debug)]
+pub enum ServiceVerb {
+    /// Install (or refresh + restart) com.onebrain.gateway and, when a tunnel
+    /// is configured, com.onebrain.gateway-tunnel. macOS only for now.
+    Install,
+    /// Unload and remove both LaunchAgents. Never touches tokens or config.
+    Uninstall,
 }
 
 #[derive(Args, Debug)]
