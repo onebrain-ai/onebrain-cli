@@ -351,6 +351,21 @@ pub enum GatewayVerb {
     Tokens(GatewayTokensCmd),
     /// List or remove registered OAuth clients (connectors).
     Clients(GatewayClientsCmd),
+    /// Remote access through a Cloudflare tunnel (token from the Zero Trust dashboard).
+    Tunnel(TunnelCmd),
+}
+
+#[derive(Args, Debug)]
+#[command(disable_help_subcommand = true)]
+pub struct TunnelCmd {
+    #[command(subcommand)]
+    pub verb: TunnelVerb,
+}
+#[derive(Subcommand, Debug)]
+pub enum TunnelVerb {
+    /// Interactive: paste the tunnel token and hostname from the
+    /// Cloudflare dashboard; stores the token (0600) and sets `public_url`.
+    Setup,
 }
 
 #[derive(Args, Debug)]

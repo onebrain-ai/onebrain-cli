@@ -38,8 +38,6 @@ pub mod server;
 pub mod telegram;
 pub mod telegram_api;
 pub mod telegram_setup;
-// Validators only until the setup/status commands (T3b Task 3+) consume them.
-#[allow(dead_code)]
 pub mod tunnel;
 
 // `gateway_config_path` / `DEFAULT_GATEWAY_PORT` stay module-internal to
@@ -49,6 +47,7 @@ pub mod tunnel;
 pub use config::{load_gateway_config, GatewayConfig};
 pub use server::{build_gateway_router, GatewayState};
 pub use telegram_setup::telegram_setup;
+pub use tunnel::tunnel_setup;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

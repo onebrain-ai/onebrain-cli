@@ -363,6 +363,9 @@ pub fn dispatch(cli: Cli) -> Result<()> {
                     commands::gateway::access::tokens_revoke(&mode, &args)
                 }
             },
+            GatewayVerb::Tunnel(TunnelCmd { verb }) => match verb {
+                TunnelVerb::Setup => commands::gateway::tunnel_setup(&mode),
+            },
             GatewayVerb::Clients(GatewayClientsCmd { verb }) => match verb {
                 GatewayClientsVerb::List => commands::gateway::access::clients_list(&mode),
                 GatewayClientsVerb::Remove { client_id } => {
