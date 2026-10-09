@@ -30,6 +30,7 @@ pub mod approval_routes;
 pub mod audit;
 pub mod auth;
 pub mod config;
+pub mod config_write;
 pub mod host_guard;
 pub mod oauth_routes;
 pub mod policy;
