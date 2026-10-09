@@ -222,8 +222,7 @@ fn tokens_revoke_rejects_a_pasted_raw_token_without_echoing_it() {
     assert_eq!(out.status.code(), Some(1));
     assert!(
         stderr(&out).contains("✗ nothing revoked"),
-        "{}",
-        stderr(&out)
+        "a raw token passed as an id must be rejected with the `nothing revoked` error"
     );
     assert!(stderr(&out).contains("💡"));
     assert_no_secret(&out, "tokens revoke <raw token>");
