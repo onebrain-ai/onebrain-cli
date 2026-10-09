@@ -2126,3 +2126,75 @@ fn doctor_fix_backfills_comments_on_legacy_vault_end_to_end() {
     let cfg2 = std::fs::read_to_string(d.path().join("onebrain.yml")).unwrap();
     assert_eq!(cfg2, cfg, "second --fix must be byte-identical");
 }
+
+/// Walk any JSON and collect every object's `check` -> `status`.
+fn check_statuses(v: &serde_json::Value, out: &mut Vec<(String, String)>) {
+    match v {
+        serde_json::Value::Object(m) => {
+            if let (Some(c), Some(s)) = (
+                m.get("check").and_then(|x| x.as_str()),
+                m.get("status").and_then(|x| x.as_str()),
+            ) {
+                out.push((c.to_string(), s.to_string()));
+            }
+            m.values().for_each(|x| check_statuses(x, out));
+        }
+        serde_json::Value::Array(a) => a.iter().for_each(|x| check_statuses(x, out)),
+        _ => {}
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_shows_gateway_checks_only_when_gateway_yml_exists() {
+    let vault = tempdir().unwrap();
+    write_minimal_vault(vault.path());
+    let home = tempdir().unwrap();
+    let run = || {
+        let out = Command::cargo_bin("onebrain")
+            .unwrap()
+            .current_dir(vault.path())
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env("PATH", "/usr/bin:/bin")
+            .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
+            .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
+            .args(["doctor", "--json"])
+            .output()
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let mut rows = Vec::new();
+        check_statuses(&v, &mut rows);
+        rows
+    };
+    assert!(run().iter().all(|(c, _)| !c.starts_with("gateway-")));
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    std::fs::create_dir_all(home.path().join(".onebrain")).unwrap();
+    std::fs::write(
+        home.path().join(".onebrain/gateway.yml"),
+        format!(
+            "port: {port}\ndefault_vault: {}\npolicy:\n  approval_wait_seconds: 900\n",
+            vault.path().display()
+        ),
+    )
+    .unwrap();
+    let rows = run();
+    let status = |name: &str| rows.iter().find(|(c, _)| c == name).map(|(_, s)| s.clone());
+    assert_eq!(status("gateway-config").as_deref(), Some("ok"), "{rows:?}");
+    assert_eq!(
+        status("gateway-approval-wait").as_deref(),
+        Some("warn"),
+        "{rows:?}"
+    );
+    assert_eq!(
+        status("gateway-telegram").as_deref(),
+        Some("warn"),
+        "{rows:?}"
+    );
+    assert_eq!(status("gateway-local").as_deref(), Some("warn"), "{rows:?}");
+}
