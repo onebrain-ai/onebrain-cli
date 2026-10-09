@@ -5,27 +5,18 @@ use std::time::Duration;
 
 pub(crate) use super::service::HttpProbe;
 
-/// Real [`HttpProbe`]: blocking ureq GET, short global timeout, any non-200
-/// or non-JSON body is an `Err` (never a panic).
-pub(crate) struct UreqProbe {
-    agent: ureq::Agent,
-}
-
-impl UreqProbe {
-    pub(crate) fn new(timeout: Duration) -> Self {
-        Self {
-            agent: ureq::Agent::config_builder()
-                .timeout_global(Some(timeout))
-                .http_status_as_error(false)
-                .build()
-                .into(),
-        }
-    }
-}
+/// Real [`HttpProbe`]: blocking ureq GET, per-call global timeout, any
+/// non-200 or non-JSON body is an `Err` (never a panic).
+pub(crate) struct UreqProbe;
 
 impl HttpProbe for UreqProbe {
-    fn get_json(&self, url: &str) -> Result<serde_json::Value, String> {
-        let mut resp = self.agent.get(url).call().map_err(|e| e.to_string())?;
+    fn get_json(&self, url: &str, timeout: Duration) -> Result<serde_json::Value, String> {
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .http_status_as_error(false)
+            .build()
+            .into();
+        let mut resp = agent.get(url).call().map_err(|e| e.to_string())?;
         if resp.status() != 200 {
             return Err(format!("HTTP {}", resp.status().as_u16()));
         }
@@ -61,24 +52,25 @@ mod tests {
 
     #[test]
     fn ureq_probe_parses_json_and_reports_failures_as_err() {
-        let p = UreqProbe::new(Duration::from_secs(5));
+        let p = UreqProbe;
+        let t = Duration::from_secs(5);
         assert_eq!(
-            p.get_json(&serve_once("200 OK", r#"{"issuer":"x"}"#))
+            p.get_json(&serve_once("200 OK", r#"{"issuer":"x"}"#), t)
                 .unwrap()["issuer"],
             "x"
         );
         assert!(p
-            .get_json(&serve_once("503 Service Unavailable", "{}"))
+            .get_json(&serve_once("503 Service Unavailable", "{}"), t)
             .unwrap_err()
             .contains("503"));
         assert!(p
-            .get_json(&serve_once("200 OK", "nope"))
+            .get_json(&serve_once("200 OK", "nope"), t)
             .unwrap_err()
             .contains("not JSON"));
         let closed = std::net::TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
             .unwrap();
-        assert!(p.get_json(&format!("http://{closed}/")).is_err());
+        assert!(p.get_json(&format!("http://{closed}/"), t).is_err());
     }
 }

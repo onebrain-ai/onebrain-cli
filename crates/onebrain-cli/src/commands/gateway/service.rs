@@ -6,7 +6,6 @@
 //! [`LaunchctlLauncher`] (macOS) runs `launchctl`; with
 //! `ONEBRAIN_SCHEDULER_NO_ACTIVATE` set, [`system_launcher`] hands out
 //! [`NoopLauncher`] instead (the scheduler's test seam, reused).
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -26,7 +25,7 @@ pub(crate) trait Launcher {
 
 /// GET a URL and parse JSON. `Err` carries a short reason, never a panic.
 pub(crate) trait HttpProbe {
-    fn get_json(&self, url: &str) -> Result<serde_json::Value, String>;
+    fn get_json(&self, url: &str, timeout: Duration) -> Result<serde_json::Value, String>;
 }
 
 pub(crate) struct NoopLauncher;
@@ -142,6 +141,9 @@ pub(crate) fn unsupported_os_error() -> anyhow::Error {
     )
 }
 
+/// Per-request ceiling for health probes.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub(crate) fn local_probe_url(port: u16) -> String {
     format!("http://127.0.0.1:{port}/.well-known/oauth-authorization-server")
 }
@@ -202,6 +204,15 @@ fn ensure_private_log(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Install does not roll back: a failure after something was written or
+/// loaded says what stays, how to remove it, and where the log is.
+fn leftover_hint(paths: &ServicePaths, stays: &str) -> String {
+    format!(
+        "{stays}; remove it with `onebrain gateway service uninstall`, and check {}",
+        paths.log_dir.join("gateway.log").display()
+    )
+}
+
 fn bootstrap_with_retry(launcher: &dyn Launcher, plist: &Path) -> anyhow::Result<()> {
     let mut last = None;
     for _ in 0..5 {
@@ -231,7 +242,23 @@ fn write_agent(
     // only needs the owner to read it.
     super::config_write::write_private_file(&plist, xml.as_bytes())?;
     launcher.bootout(spec.label);
-    bootstrap_with_retry(launcher, &plist)?;
+    bootstrap_with_retry(launcher, &plist).map_err(|e| {
+        hinted(
+            format!("could not load com.onebrain.{}: {e:#}", spec.label),
+            leftover_hint(
+                paths,
+                &format!(
+                    "{} stays in ~/Library/LaunchAgents{}",
+                    plist.display(),
+                    if spec.label == TUNNEL_LABEL {
+                        format!(" and com.onebrain.{GATEWAY_LABEL} stays loaded")
+                    } else {
+                        String::new()
+                    }
+                ),
+            ),
+        )
+    })?;
     Ok(plist)
 }
 
@@ -277,7 +304,9 @@ pub(crate) fn install_service(
         ));
     }
     if launcher.print(GATEWAY_LABEL).is_none()
-        && http.get_json(&local_probe_url(config.port)).is_ok()
+        && http
+            .get_json(&local_probe_url(config.port), PROBE_TIMEOUT)
+            .is_ok()
     {
         return Err(hinted(
             format!(
@@ -297,33 +326,45 @@ pub(crate) fn install_service(
     )?;
 
     if let (true, Some(cloudflared)) = (tunnel, inputs.cloudflared.as_deref()) {
-        let auth = if inputs.token_file_supported {
-            TunnelAuth::TokenFile(token_path.clone())
-        } else {
-            let token = std::fs::read_to_string(&token_path)
-                .with_context(|| format!("read {}", token_path.display()))?;
-            TunnelAuth::EnvToken(token.trim().to_string())
+        let mut tunnel_step = || -> anyhow::Result<()> {
+            let auth = if inputs.token_file_supported {
+                TunnelAuth::TokenFile(token_path.clone())
+            } else {
+                let token = std::fs::read_to_string(&token_path)
+                    .with_context(|| format!("read {}", token_path.display()))?;
+                TunnelAuth::EnvToken(token.trim().to_string())
+            };
+            let spec = service_plist::tunnel_agent(cloudflared, &auth, &paths.log_dir);
+            let plist = write_agent(paths, &spec, launcher)?;
+            writeln!(
+                out,
+                "✓ com.onebrain.{TUNNEL_LABEL} loaded ({})",
+                plist.display()
+            )?;
+            // Hub ruling: record which token path the probe chose.
+            if inputs.token_file_supported {
+                writeln!(
+                    out,
+                    "  tunnel token via --token-file {}",
+                    token_path.display()
+                )?;
+            } else {
+                writeln!(
+                    out,
+                    "  tunnel token via TUNNEL_TOKEN in the 0600 plist (this cloudflared has no --token-file; `brew upgrade cloudflared` to switch)"
+                )?;
+            }
+            Ok(())
         };
-        let spec = service_plist::tunnel_agent(cloudflared, &auth, &paths.log_dir);
-        let plist = write_agent(paths, &spec, launcher)?;
-        writeln!(
-            out,
-            "✓ com.onebrain.{TUNNEL_LABEL} loaded ({})",
-            plist.display()
-        )?;
-        // Hub ruling: record which token path the probe chose.
-        if inputs.token_file_supported {
-            writeln!(
-                out,
-                "  tunnel token via --token-file {}",
-                token_path.display()
-            )?;
-        } else {
-            writeln!(
-                out,
-                "  tunnel token via TUNNEL_TOKEN in the 0600 plist (this cloudflared has no --token-file; `brew upgrade cloudflared` to switch)"
-            )?;
-        }
+        tunnel_step().map_err(|e| {
+            if e.downcast_ref::<crate::output::HintedError>().is_some() {
+                return e;
+            }
+            hinted(
+                format!("could not set up the tunnel agent: {e:#}"),
+                leftover_hint(paths, &format!("com.onebrain.{GATEWAY_LABEL} stays loaded")),
+            )
+        })?;
     } else {
         if remove_agent(paths, TUNNEL_LABEL, launcher)? {
             writeln!(
@@ -333,21 +374,38 @@ pub(crate) fn install_service(
         }
         if config.public_url.is_some() {
             writeln!(out, "• public_url is set but there is no tunnel token — run `onebrain gateway tunnel setup`")?;
+        } else if token_path.exists() {
+            writeln!(out, "• a tunnel token exists but gateway.yml has no public_url — run `onebrain gateway tunnel setup`")?;
         }
     }
 
     if let Some(limit) = inputs.wait_for_up {
         let url = local_probe_url(config.port);
         let deadline = Instant::now() + limit;
-        while http.get_json(&url).is_err() {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if http
+                .get_json(
+                    &url,
+                    remaining.clamp(Duration::from_millis(50), PROBE_TIMEOUT),
+                )
+                .is_ok()
+            {
+                break;
+            }
             if Instant::now() >= deadline {
                 return Err(hinted(
                     format!(
                         "the gateway did not answer on 127.0.0.1:{} within {}s",
                         config.port,
-                        limit.as_secs()
+                        limit.as_millis().div_ceil(1000)
                     ),
-                    format!("check {}", paths.log_dir.join("gateway.log").display()),
+                    leftover_hint(
+                        paths,
+                        &format!(
+                            "the loaded com.onebrain agent(s) keep restarting in the background"
+                        ),
+                    ),
                 ));
             }
             std::thread::sleep(Duration::from_millis(if cfg!(test) { 5 } else { 250 }));
@@ -393,18 +451,10 @@ pub fn service_install(_mode: &crate::output::OutputMode) -> anyhow::Result<()> 
     }
     let paths = ServicePaths::for_home(&home()?);
     let cloudflared = which::which("cloudflared").ok();
-    let token_file_supported = cloudflared.as_deref().is_some_and(|c| {
-        std::process::Command::new(c)
-            .args(["tunnel", "run", "--help"])
-            .output()
-            .is_ok_and(|o| {
-                super::tunnel::supports_token_file(&format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&o.stdout),
-                    String::from_utf8_lossy(&o.stderr)
-                ))
-            })
-    });
+    let token_file_supported = cloudflared
+        .as_deref()
+        .and_then(super::tunnel::cloudflared_run_help)
+        .is_some_and(|help| super::tunnel::supports_token_file(&help));
     let activate = !onebrain_core::scheduler::backend::activation_disabled();
     let current = std::env::current_exe().context("resolve the onebrain binary path")?;
     let (onebrain_exe, exe_warning) =
@@ -423,7 +473,7 @@ pub fn service_install(_mode: &crate::output::OutputMode) -> anyhow::Result<()> 
         &paths,
         &inputs,
         system_launcher().as_ref(),
-        &super::health::UreqProbe::new(Duration::from_secs(2)),
+        &super::health::UreqProbe,
         &mut std::io::stdout(),
     )
 }
@@ -482,7 +532,7 @@ mod tests {
         up: bool,
     }
     impl HttpProbe for FakeHttp {
-        fn get_json(&self, _url: &str) -> Result<serde_json::Value, String> {
+        fn get_json(&self, _url: &str, _t: Duration) -> Result<serde_json::Value, String> {
             if self.up {
                 Ok(serde_json::json!({"issuer": "http://127.0.0.1:7717"}))
             } else {
@@ -568,11 +618,11 @@ mod tests {
     /// loaded — models launchd starting the process.
     struct UpAfterBootstrap<'a>(&'a FakeLauncher);
     impl HttpProbe for UpAfterBootstrap<'_> {
-        fn get_json(&self, url: &str) -> Result<serde_json::Value, String> {
+        fn get_json(&self, url: &str, t: Duration) -> Result<serde_json::Value, String> {
             FakeHttp {
                 up: self.0.print("gateway").is_some(),
             }
-            .get_json(url)
+            .get_json(url, t)
         }
     }
 
@@ -797,5 +847,165 @@ mod tests {
             "{}",
             h.hint
         );
+    }
+
+    /// Fix round 1 (Ruling 9): a failure after something was written or
+    /// loaded must tell the user how to remove what stays.
+    #[test]
+    fn install_bootstrap_failure_hint_names_uninstall_and_the_log() {
+        let (_r, paths) = home_with("default_vault: /v\n", false);
+        let l = FakeLauncher::default();
+        *l.bootstrap_failures_left.borrow_mut() = 99;
+        let err = install_service(
+            &paths,
+            &inputs(false, false),
+            &l,
+            &FakeHttp { up: false },
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        let h = err.downcast_ref::<crate::output::HintedError>().unwrap();
+        assert!(
+            h.hint.contains("`onebrain gateway service uninstall`")
+                && h.hint.contains("gateway.log"),
+            "{}",
+            h.hint
+        );
+        assert!(
+            h.hint.contains("stays in ~/Library/LaunchAgents"),
+            "{}",
+            h.hint
+        );
+        assert!(paths.plist("gateway").exists());
+    }
+
+    #[test]
+    fn install_tunnel_step_failure_hint_says_the_gateway_stays_loaded() {
+        let (_r, paths) = home_with(WITH_VAULT, true);
+        let l = FakeLauncher::default();
+        // Gateway bootstrap succeeds; the tunnel's fails every retry.
+        struct FailTunnel<'a>(&'a FakeLauncher);
+        impl Launcher for FailTunnel<'_> {
+            fn bootout(&self, label: &str) {
+                self.0.bootout(label)
+            }
+            fn bootstrap(&self, plist: &Path) -> anyhow::Result<()> {
+                if plist.to_string_lossy().contains("gateway-tunnel") {
+                    anyhow::bail!("Bootstrap failed: 5");
+                }
+                self.0.bootstrap(plist)
+            }
+            fn print(&self, label: &str) -> Option<String> {
+                self.0.print(label)
+            }
+        }
+        let err = install_service(
+            &paths,
+            &inputs(true, true),
+            &FailTunnel(&l),
+            &UpAfterBootstrap(&l),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        let h = err.downcast_ref::<crate::output::HintedError>().unwrap();
+        assert!(
+            h.hint.contains("`onebrain gateway service uninstall`"),
+            "{}",
+            h.hint
+        );
+        assert!(
+            h.hint.contains("com.onebrain.gateway stays loaded"),
+            "{}",
+            h.hint
+        );
+    }
+
+    #[test]
+    fn install_tunnel_token_read_failure_hint_names_uninstall() {
+        let (_r, paths) = home_with(WITH_VAULT, true);
+        let l = FakeLauncher::default();
+        // EnvToken mode reads the token file; make it a directory so the read fails.
+        let tp = crate::commands::gateway::tunnel::tunnel_token_path(&paths.onebrain_dir);
+        std::fs::remove_file(&tp).unwrap();
+        std::fs::create_dir(&tp).unwrap();
+        let err = install_service(
+            &paths,
+            &inputs(true, false),
+            &l,
+            &UpAfterBootstrap(&l),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        let h = err.downcast_ref::<crate::output::HintedError>().unwrap();
+        assert!(
+            h.hint.contains("`onebrain gateway service uninstall`")
+                && h.hint.contains("stays loaded"),
+            "{}",
+            h.hint
+        );
+    }
+
+    #[test]
+    fn install_poll_timeout_hint_names_uninstall_and_never_reads_zero_seconds() {
+        let (_r, paths) = home_with("default_vault: /v\n", false);
+        let err = install_service(
+            &paths,
+            &inputs(false, false),
+            &FakeLauncher::default(),
+            &FakeHttp { up: false },
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        let h = err.downcast_ref::<crate::output::HintedError>().unwrap();
+        assert!(
+            h.hint.contains("`onebrain gateway service uninstall`")
+                && h.hint.contains("gateway.log"),
+            "{}",
+            h.hint
+        );
+        assert!(h.plain.contains("within 1s"), "{}", h.plain);
+    }
+
+    #[test]
+    fn install_poll_timeouts_are_clamped_to_the_remaining_budget() {
+        struct Rec(RefCell<Vec<Duration>>);
+        impl HttpProbe for Rec {
+            fn get_json(&self, _u: &str, t: Duration) -> Result<serde_json::Value, String> {
+                self.0.borrow_mut().push(t);
+                Err("down".into())
+            }
+        }
+        let (_r, paths) = home_with("default_vault: /v\n", false);
+        let rec = Rec(RefCell::new(Vec::new()));
+        let _ = install_service(
+            &paths,
+            &inputs(false, false),
+            &FakeLauncher::default(),
+            &rec,
+            &mut Vec::new(),
+        );
+        let seen = rec.0.borrow();
+        // [0] is the port-clash probe (full ceiling); every poll after it is within the 200ms budget.
+        assert!(
+            seen.len() > 1 && seen[1..].iter().all(|t| *t <= Duration::from_millis(200)),
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn install_hints_when_a_tunnel_token_exists_but_public_url_is_unset() {
+        let (_r, paths) = home_with("default_vault: /v\n", true);
+        let l = FakeLauncher::default();
+        let mut out = Vec::new();
+        install_service(
+            &paths,
+            &inputs(true, true),
+            &l,
+            &UpAfterBootstrap(&l),
+            &mut out,
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("no public_url"), "{text}");
     }
 }

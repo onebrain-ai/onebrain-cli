@@ -180,6 +180,20 @@ pub(crate) trait TunnelHost {
     fn service_supported(&self) -> bool;
 }
 
+/// `cloudflared tunnel run --help` text (stdout+stderr), if it ran. Shared by
+/// `tunnel setup` and `service install`.
+pub(crate) fn cloudflared_run_help(cloudflared: &Path) -> Option<String> {
+    let o = std::process::Command::new(cloudflared)
+        .args(["tunnel", "run", "--help"])
+        .output()
+        .ok()?;
+    Some(format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    ))
+}
+
 pub(crate) struct SystemTunnelHost {
     pub stdin_is_tty: bool,
 }
@@ -189,15 +203,7 @@ impl TunnelHost for SystemTunnelHost {
         which::which("cloudflared").ok()
     }
     fn cloudflared_run_help(&self, cloudflared: &Path) -> Option<String> {
-        let o = std::process::Command::new(cloudflared)
-            .args(["tunnel", "run", "--help"])
-            .output()
-            .ok()?;
-        Some(format!(
-            "{}{}",
-            String::from_utf8_lossy(&o.stdout),
-            String::from_utf8_lossy(&o.stderr)
-        ))
+        cloudflared_run_help(cloudflared)
     }
     fn read_secret(
         &self,
@@ -220,7 +226,7 @@ impl TunnelHost for SystemTunnelHost {
         Ok(line)
     }
     fn service_supported(&self) -> bool {
-        cfg!(target_os = "macos")
+        super::service::service_supported()
     }
 }
 
