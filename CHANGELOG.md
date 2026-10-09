@@ -141,7 +141,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - README roadmap re-synced to the 2026-08-28 renumber: Gateway v3.5 · Council
   v3.6 · Studio/Surfaces v3.7 · Terminal v3.8 · Bootstrap v3.9 · cleanup v3.10
   · bundles v3.11+.
-
 - Workspace declares `rust-version = "1.89"` (the cross-process store lock uses std `File::lock`).
 
 ### Security
@@ -184,14 +183,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Breaking:** `gateway run` prints the pairing code only when stdout is a
   terminal; under a service or redirect it points to `onebrain gateway pair`.
 - The gateway's token/client store takes a cross-process advisory lock
-  (`~/.onebrain/gateway/auth.lock`) around every read-modify-write. Previously
-  a `tokens revoke` from the CLI could be silently undone by a token refresh the
-  running gateway was writing at the same moment (both rewrote the same JSON).
+  (`~/.onebrain/gateway/auth.lock`) around every read-modify-write, so a
+  `tokens revoke` from the CLI can't be silently undone by a token refresh the
+  running gateway writes at the same moment.
 - `/authorize` and `/token` re-check that the client is still registered after
   minting, so a client removed mid-exchange (`clients remove` from another
   terminal) gets nothing usable. The 50-client cap on `/register` is now counted
   and inserted under the same lock.
-
 
 ## [3.4.25] — 2026-08-28 — Keep Codex hooks alive
 

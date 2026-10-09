@@ -243,11 +243,11 @@ Tokens are never printed. Each one is shown by a 12-character **id**: the first 
 
 | Command | What it does |
 |---|---|
-| `onebrain gateway tokens list` | Live tokens: id, kind (access/refresh), client, family, issued, expires. |
-| `onebrain gateway tokens list --all` | Also expired and revoked tokens still on disk (the gateway purges expired ones at startup). |
+| `onebrain gateway tokens list` | Live tokens: id, kind (access/refresh), client, family, status, issued, expires. |
+| `onebrain gateway tokens list --all` | Also expired and revoked tokens still on disk, with `status` live, expired or revoked (the gateway purges expired ones at startup). |
 | `onebrain gateway tokens revoke <id>` | Revokes **that one token only**. It does not cascade: revoking an access token does not stop a client that still holds a live refresh token. The output hints at the two rows below. |
 | `onebrain gateway tokens revoke --family <family>` | Revokes every token from one login (access and refresh). The client must pair again. |
-| `onebrain gateway tokens revoke --client <client_id>` | Revokes every token held by one client. A client id that matches nothing is reported without echoing the value. |
+| `onebrain gateway tokens revoke --client <client_id>` | Revokes every token held by one client, but not its pending authorization codes (600 s TTL), so a code exchange already in flight can still mint a pair. For a full cut-off use `clients remove`. A client id that matches nothing is reported without echoing the value. |
 | `onebrain gateway clients list` | Registered clients, with how many live tokens each holds. |
 | `onebrain gateway clients remove <client_id>` | Deletes the registration, revokes all its tokens, and deletes its pending authorization codes. |
 
