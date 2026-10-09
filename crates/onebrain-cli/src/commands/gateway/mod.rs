@@ -273,6 +273,9 @@ fn validate_public_url(raw: &str) -> Result<(), String> {
             None => (authority, None),
         }
     };
+    if host.is_empty() {
+        return Err("is missing a host".to_string());
+    }
     if let Some(port) = port {
         let valid = !port.is_empty()
             && port.bytes().all(|b| b.is_ascii_digit())
@@ -832,6 +835,17 @@ mod tests {
             assert!(!err.contains("pw"), "must not echo secrets: {err}");
         }
         assert!(validate_public_url("http://localhost:65535").is_ok());
+    }
+
+    /// An empty host (`https://:443`) parses as `Some("")` in `http::Uri`, so
+    /// it must be refused here or `allowed_hosts` would admit `Host: :443`.
+    #[test]
+    fn validate_public_url_rejects_an_empty_host() {
+        for bad in ["https://:443", "http://:7717", "https://:", "http://:80/"] {
+            let err = validate_public_url(bad).expect_err(bad);
+            assert!(err.contains("missing a host"), "{bad}: {err}");
+            assert!(!err.contains("443"), "must not echo the input: {err}");
+        }
     }
 
     /// Every public_url the validator accepts must yield the same host from

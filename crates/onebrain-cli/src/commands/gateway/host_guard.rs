@@ -69,7 +69,7 @@ pub fn allowed_hosts(public_url: Option<&str>) -> Vec<String> {
 
 fn public_url_host(url: &str) -> Option<String> {
     let uri: Uri = url.trim_end_matches('/').parse().ok()?;
-    uri.host().map(normalize_host)
+    uri.host().filter(|h| !h.is_empty()).map(normalize_host)
 }
 
 fn normalize_host(host: &str) -> String {
@@ -210,6 +210,10 @@ fn request_host(uri: &Uri, headers: &HeaderMap) -> Result<String, &'static str> 
     let authority: Authority = raw
         .parse()
         .map_err(|_| "Bad Request: invalid Host header")?;
+    // `":80"` parses as an authority with an empty host: never a real name.
+    if authority.host().is_empty() {
+        return Err("Bad Request: invalid Host header");
+    }
     Ok(normalize_host(authority.host()))
 }
 
@@ -477,6 +481,22 @@ mod tests {
         // HTTP/2 carries the host in `:authority` (the URI), not `Host`.
         let (status, _) = call(&router, "GET", "http://localhost:7717/x", &[]).await;
         assert_eq!(status, StatusCode::OK);
+    }
+
+    #[test]
+    fn an_empty_public_url_host_is_never_allowed() {
+        assert_eq!(public_url_host("https://:443"), None);
+        assert_eq!(allowed_hosts(Some("https://:443")), allowed_hosts(None));
+    }
+
+    #[tokio::test]
+    async fn an_empty_host_with_a_port_is_400() {
+        let (_dir, router) = guard_router(Some("https://:443"));
+        for host in [":80", ":", ":443"] {
+            let (status, body) = call(&router, "GET", "/x", &[("host", host)]).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{host:?}");
+            assert_eq!(body, "Bad Request: invalid Host header");
+        }
     }
 
     #[tokio::test]

@@ -3628,6 +3628,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_host_with_a_port_is_400_on_the_real_router() {
+        let (_dir, router, _token) = fixture_router();
+        for host in [":80", ":"] {
+            let (status, text) = raw_request(
+                &router,
+                "GET",
+                "/.well-known/oauth-authorization-server",
+                &[("host", host)],
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{host:?}: {text}");
+        }
+    }
+
+    #[tokio::test]
     async fn missing_host_is_400_on_the_real_router() {
         let (_dir, router, _token) = fixture_router();
         let (status, text) = raw_request(
