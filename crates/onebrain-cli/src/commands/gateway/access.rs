@@ -183,7 +183,14 @@ fn revoke_outcome_env(
             },
         )),
         RevokeOutcome::NotFound => Err(anyhow::Error::new(HintedError::new(
-            format!("nothing revoked — no token matches {kind} `{value}`"),
+            // `--client` is an unnormalized free-form value (a pasted bearer
+            // token, control characters): never echo it.
+            match selector {
+                TokenSelector::Client(_) => {
+                    "nothing revoked — no tokens found for that client id".to_string()
+                }
+                _ => format!("nothing revoked — no token matches {kind} `{value}`"),
+            },
             "run `onebrain gateway tokens list --all` to see token, client, and family ids",
         ))),
         RevokeOutcome::Ambiguous(ids) => Err(anyhow::Error::new(HintedError::new(
@@ -528,6 +535,32 @@ mod tests {
         assert!(hinted(&amb).plain.contains("matches 2 different ids"));
         assert!(hinted(&amb).hint.contains("abcd01, abcd02"));
         assert!(!hinted(&amb).hint.ends_with('.'));
+    }
+
+    #[test]
+    fn revoke_not_found_for_client_never_echoes_the_value() {
+        let (_d, store) = temp_store();
+        let raw = "tok_AbCdEf0123456789-_AbCdEf0123456789-_AbCdEf012";
+        for value in [raw, "evil\u{1b}[31m\nclient"] {
+            let err = tokens_revoke_env(&store, &args(None, Some(value), None)).unwrap_err();
+            let h = hinted(&err);
+            assert!(!h.plain.contains(value), "client value echoed in plain");
+            assert!(!h.hint.contains(value), "client value echoed in hint");
+            assert!(!h.plain.contains('\u{1b}') && !h.plain.contains('\n'));
+            assert!(!format!("{err:#}").contains(value), "client value in chain");
+            assert_eq!(
+                h.plain,
+                "nothing revoked — no tokens found for that client id"
+            );
+        }
+    }
+
+    #[test]
+    fn clients_list_env_on_a_corrupt_store_is_a_hinted_error_not_empty() {
+        let (d, store) = temp_store();
+        std::fs::write(d.path().join("gateway").join("clients.json"), "{not json").unwrap();
+        let err = clients_list_env(&store).unwrap_err();
+        assert!(hinted(&err).plain.contains("unreadable or corrupt"));
     }
 
     #[test]
