@@ -402,9 +402,7 @@ pub(crate) fn install_service(
                     ),
                     leftover_hint(
                         paths,
-                        &format!(
-                            "the loaded com.onebrain agent(s) keep restarting in the background"
-                        ),
+                        "the loaded com.onebrain.gateway agent (and tunnel agent, if any) stay loaded",
                     ),
                 ));
             }
