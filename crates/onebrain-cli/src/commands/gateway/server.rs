@@ -1356,7 +1356,11 @@ async fn await_approval(
                 Decision::Denied,
                 Some(via),
                 ErrorData::invalid_request(
-                    format!("this call was denied by the gateway operator [{tool}]"),
+                    if via == ResolvedVia::Shutdown {
+                        format!("the gateway is shutting down; this call was denied [{tool}]")
+                    } else {
+                        format!("this call was denied by the gateway operator [{tool}]")
+                    },
                     None,
                 ),
             ))

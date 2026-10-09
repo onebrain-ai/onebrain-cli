@@ -198,16 +198,20 @@ pub enum ResolvedVia {
     /// The Telegram approval channel (`telegram::TelegramChannel::ensure_polling`,
     /// Gateway PR 5, Task 5).
     Telegram,
+    /// The gateway itself, shutting down (`gateway run` got Ctrl-C/SIGTERM) —
+    /// [`Approvals::deny_all`].
+    Shutdown,
 }
 
 impl ResolvedVia {
     /// The exact lowercase string `audit::AuditEntry::channel` records —
-    /// `"http"`, `"native"`, or `"telegram"`.
+    /// `"http"`, `"native"`, `"telegram"`, or `"shutdown"`.
     pub fn as_str(self) -> &'static str {
         match self {
             ResolvedVia::Http => "http",
             ResolvedVia::Native => "native",
             ResolvedVia::Telegram => "telegram",
+            ResolvedVia::Shutdown => "shutdown",
         }
     }
 }
@@ -363,6 +367,24 @@ impl Approvals {
         }
     }
 
+    /// Deny EVERY pending approval at once (gateway shutdown, hub ruling):
+    /// each waiter wakes with `(Deny, via)` and its call answers with an
+    /// error on its own stream, instead of hanging until the shutdown grace
+    /// drops the connection. Same drain-then-send discipline as
+    /// [`Self::resolve`]: the lock is released before any send. Returns how
+    /// many waiters were still listening.
+    pub fn deny_all(&self, via: ResolvedVia) -> usize {
+        let senders: Vec<oneshot::Sender<Resolution>> = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.drain().map(|(_, (_, tx))| tx).collect()
+        };
+        senders
+            .into_iter()
+            .map(|tx| tx.send((Decision::Deny, via)).is_ok())
+            .filter(|delivered| *delivered)
+            .count()
+    }
+
     /// Wait up to `ttl` for `id`'s registered receiver `rx` to resolve.
     ///
     /// Never holds the `pending` lock across the `.await`:
@@ -474,6 +496,7 @@ mod tests {
             ResolvedVia::Http,
             ResolvedVia::Native,
             ResolvedVia::Telegram,
+            ResolvedVia::Shutdown,
         ] {
             let approvals = Approvals::new();
             let rx = approvals.register(sample("a1")).unwrap();
@@ -492,6 +515,7 @@ mod tests {
         assert_eq!(ResolvedVia::Http.as_str(), "http");
         assert_eq!(ResolvedVia::Native.as_str(), "native");
         assert_eq!(ResolvedVia::Telegram.as_str(), "telegram");
+        assert_eq!(ResolvedVia::Shutdown.as_str(), "shutdown");
     }
 
     // ── timeout path: TimedOut + entry dropped from pending ─────────────
@@ -506,6 +530,25 @@ mod tests {
             outcome,
             WaitOutcome::Decided(Decision::Deny, ResolvedVia::Native)
         );
+    }
+
+    /// Hub ruling: at shutdown every pending approval is DENIED — each
+    /// waiter wakes with `(Deny, Shutdown)` instead of a dropped channel.
+    #[tokio::test]
+    async fn deny_all_wakes_every_waiter_with_a_shutdown_denial_and_empties_pending() {
+        let approvals = Approvals::new();
+        let rx1 = approvals.register(sample("a1")).unwrap();
+        let rx2 = approvals.register(sample("a2")).unwrap();
+        assert_eq!(approvals.deny_all(ResolvedVia::Shutdown), 2);
+        assert!(approvals.list().is_empty());
+        for (id, rx) in [("a1", rx1), ("a2", rx2)] {
+            assert_eq!(
+                approvals.wait(id, rx, Duration::from_secs(5)).await,
+                WaitOutcome::Decided(Decision::Deny, ResolvedVia::Shutdown)
+            );
+        }
+        assert_eq!(approvals.deny_all(ResolvedVia::Shutdown), 0, "idempotent");
+        assert_eq!(ResolvedVia::Shutdown.as_str(), "shutdown");
     }
 
     #[tokio::test]

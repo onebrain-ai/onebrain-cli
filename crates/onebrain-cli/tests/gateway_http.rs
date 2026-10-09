@@ -720,3 +720,37 @@ fn redacted_capture_tail_is_bounded_and_marks_an_empty_stream() {
     assert!(out.starts_with("[…] "), "{out}");
     assert!(out.len() < CAPTURE_TAIL_BYTES + 16, "{}", out.len());
 }
+
+/// launchd stops an agent with SIGTERM; `gateway run` must treat it like
+/// Ctrl-C — clean exit 0 — not die by the signal.
+#[cfg(unix)]
+#[test]
+fn gateway_run_exits_cleanly_on_sigterm() {
+    let root = tempdir().unwrap();
+    let home = root.path().join("home");
+    let cache = root.path().join("cache");
+    std::fs::create_dir_all(&home).unwrap();
+    let (out, err) = (root.path().join("gw.out"), root.path().join("gw.err"));
+    let mut child = KillOnDrop(spawn_gateway(&cache, &home, root.path(), &out, &err));
+    wait_for_gateway_url(&mut child.0, &out, &err);
+
+    // SAFETY: plain kill(2) on our own child's pid.
+    let rc = unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(rc, 0);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(s) = child.0.try_wait().unwrap() {
+            break s;
+        }
+        assert!(Instant::now() < deadline, "no exit within 10s of SIGTERM");
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(status.code(), Some(0), "{status}");
+    let log = std::fs::read_to_string(&err).unwrap();
+    assert!(
+        log.contains("SIGTERM received"),
+        "{}",
+        support::redacted_capture_tail(&log)
+    );
+}

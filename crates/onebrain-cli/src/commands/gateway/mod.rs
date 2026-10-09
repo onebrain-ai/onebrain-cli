@@ -4,9 +4,9 @@
 //! `run` wires together `load_gateway_config` + `build_gateway_router` and
 //! hosts the result via [`crate::server::run_server_from_router`] — the SAME
 //! primitive `serve`/`daemon __run` share (see `server/mod.rs`), differing
-//! only in the shutdown trigger. This module mirrors `commands/serve.rs`'s
-//! shutdown shape exactly (Ctrl-C only): `serve.rs` itself has no SIGTERM
-//! handling to copy, so the gateway doesn't add one either.
+//! only in the shutdown trigger: Ctrl-C, or SIGTERM on Unix (launchd stops
+//! agents with SIGTERM — `gateway service`); pending approvals are then
+//! denied and in-flight requests get at most [`SHUTDOWN_GRACE`].
 //!
 //! OAuth: `run` opens the gateway's [`auth::AuthStore`], prints the current
 //! device-pairing code to stdout (the ONLY place it's ever shown — never
@@ -48,6 +48,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 
+use approval::ResolvedVia;
 use audit::AuditLog;
 use auth::AuthStore;
 use oauth_routes::AuthCtx;
@@ -317,6 +318,7 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
     // different concern from the log not being OPENABLE at all at startup.
     let audit = AuditLog::open().context("open gateway audit log")?;
     let state = Arc::new(GatewayState::new(config, audit));
+    let shutdown_state = state.clone();
 
     let auth_store = AuthStore::open().context("open gateway auth store")?;
     // Best-effort startup housekeeping: drop expired auth codes/tokens
@@ -357,11 +359,22 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
         .context("build tokio runtime for gateway")?;
 
     runtime.block_on(async move {
-        let shutdown = async {
-            // Ctrl-C (SIGINT) only — mirrors `serve.rs`'s shutdown future
-            // shape exactly; `serve` has no SIGTERM handling to copy.
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("Ctrl-C received; shutting down gateway");
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        let shutdown = async move {
+            let which = shutdown_signal().await;
+            tracing::info!("{which} received; shutting down gateway");
+            // Hub ruling: answer every waiting approval with a denial NOW,
+            // so its call ends cleanly on its own stream (and Telegram /
+            // the audit log say "denied via shutdown") instead of being
+            // cut off by the grace below.
+            let denied = shutdown_state.approvals.deny_all(ResolvedVia::Shutdown);
+            if denied > 0 {
+                tracing::warn!(
+                    denied,
+                    "denied pending approvals because the gateway is shutting down"
+                );
+            }
+            let _ = tx.send(Some(which));
         };
         let on_bind = move |bound: SocketAddr| {
             // Stable, single-line stdout contract — the binary integration
@@ -378,7 +391,12 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
             let issuer = resolve_issuer(public_url.as_deref(), bound);
             let _ = auth_ctx.issuer.set(issuer);
         };
-        run_server_from_router(router, addr, on_bind, shutdown).await
+        with_shutdown_grace(
+            run_server_from_router(router, addr, on_bind, shutdown),
+            rx,
+            SHUTDOWN_GRACE,
+        )
+        .await
     })
 }
 
@@ -416,10 +434,73 @@ pub fn pair(_mode: &OutputMode, rotate: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// How long `gateway run` keeps serving in-flight requests after a shutdown
+/// signal. An approval-gated call holds its SSE stream for up to
+/// `approval_wait_seconds` (≤ 270 s) and axum's graceful shutdown would wait
+/// for it, but launchd SIGKILLs an agent 20 s after SIGTERM (`ExitTimeOut`
+/// default) — every `service install` restart would become a SIGKILL. The
+/// shutdown future first DENIES every pending approval (`Approvals::deny_all`,
+/// hub ruling), so those calls answer at once; 5 s then lets ordinary calls
+/// finish and drops anything still open.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Resolves on Ctrl-C, or — on Unix — SIGTERM (what launchd sends to stop
+/// an agent). Returns which one, for the log line.
+async fn shutdown_signal() -> &'static str {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut term) => tokio::select! {
+                _ = tokio::signal::ctrl_c() => "Ctrl-C",
+                _ = term.recv() => "SIGTERM",
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "could not install a SIGTERM handler; Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+                "Ctrl-C"
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        "Ctrl-C"
+    }
+}
+
+/// Drive `serve` to completion — but once `signalled` holds `Some`, give it
+/// at most `grace` more, then return `Ok(())` and let the runtime drop
+/// whatever is still open.
+async fn with_shutdown_grace(
+    serve: impl std::future::Future<Output = anyhow::Result<()>>,
+    mut signalled: tokio::sync::watch::Receiver<Option<&'static str>>,
+    grace: std::time::Duration,
+) -> anyhow::Result<()> {
+    tokio::pin!(serve);
+    tokio::select! {
+        result = &mut serve => result,
+        _ = async {
+            if signalled.wait_for(Option::is_some).await.is_err() {
+                // Sender gone without a signal: never fire.
+                std::future::pending::<()>().await;
+            }
+            tokio::time::sleep(grace).await;
+        } => {
+            tracing::warn!(
+                grace_secs = grace.as_secs(),
+                "requests still open after the shutdown grace period; dropping them"
+            );
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
@@ -634,5 +715,42 @@ mod tests {
     fn validate_public_url_rejects_missing_scheme_and_unsupported_scheme() {
         assert!(validate_public_url("gw.example.com").is_err());
         assert!(validate_public_url("ftp://gw.example.com").is_err());
+    }
+
+    // ── shutdown grace (T3a Task 4) ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn shutdown_grace_returns_once_the_grace_elapses_after_a_signal() {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        let serve = std::future::pending::<anyhow::Result<()>>();
+        tx.send(Some("SIGTERM")).unwrap();
+        let started = std::time::Instant::now();
+        with_shutdown_grace(serve, rx, Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn shutdown_grace_returns_the_server_result_when_it_finishes_first() {
+        let (_tx, rx) = tokio::sync::watch::channel(None);
+        let serve = async { Err::<(), _>(anyhow::anyhow!("bind failed")) };
+        let err = with_shutdown_grace(serve, rx, Duration::from_secs(60))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("bind failed"));
+    }
+
+    #[tokio::test]
+    async fn shutdown_grace_never_fires_without_a_signal() {
+        let (tx, rx) = tokio::sync::watch::channel(None);
+        let serve = std::future::pending::<anyhow::Result<()>>();
+        let r = tokio::time::timeout(
+            Duration::from_millis(200),
+            with_shutdown_grace(serve, rx, Duration::from_millis(10)),
+        )
+        .await;
+        assert!(r.is_err(), "must keep serving while no signal arrived");
+        drop(tx);
     }
 }

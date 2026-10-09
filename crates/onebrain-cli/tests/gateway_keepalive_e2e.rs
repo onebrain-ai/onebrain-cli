@@ -108,8 +108,6 @@ struct Sandbox {
     _root: TempDir,
     home: PathBuf,
     vault: TempDir,
-    // `child` is read by the shutdown tests (Task 4).
-    #[allow(dead_code)]
     child: KillOnDrop,
     mcp_url: String,
     approvals_url: String,
@@ -284,7 +282,6 @@ fn join_within(reader: JoinHandle<Vec<Timed>>, limit: Duration) -> Vec<Timed> {
 
 /// Wait up to `limit` for `child` to exit; panic otherwise. Used by the
 /// shutdown tests (Tasks 3/4).
-#[allow(dead_code)]
 fn wait_exit(child: &mut std::process::Child, limit: Duration) -> std::process::ExitStatus {
     let deadline = Instant::now() + limit;
     loop {
@@ -419,6 +416,69 @@ fn an_oversized_approval_wait_is_clamped_to_270s_at_startup() {
     let err = std::fs::read_to_string(&sb.stderr).unwrap();
     assert!(
         err.contains("policy.approval_wait_seconds is 900"),
+        "{}",
+        support::redacted_capture_tail(&err)
+    );
+}
+
+/// Review Focus 1 + hub ruling: a restart while a call waits on a human
+/// DENIES that approval — the client gets a "shutting down" error as the
+/// final event of its own stream, nothing is written — and the process
+/// exits 0 long before launchd's 20 s SIGKILL.
+#[cfg(unix)]
+#[test]
+fn sigterm_with_an_approval_pending_denies_it_and_exits_cleanly() {
+    let mut sb = start("  mutating: ask_once\n");
+    let (_ct, _t0, reader) = open_capture_stream(&sb);
+    let code = read_pairing_code(&sb.home);
+    let _id = wait_for_one_pending(&sb, &code);
+
+    // SAFETY: plain kill(2) on our own child's pid.
+    let rc = unsafe { libc::kill(sb.child.0.id() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(rc, 0);
+    let started = Instant::now();
+    let status = wait_exit(&mut sb.child.0, Duration::from_secs(15));
+    assert_eq!(status.code(), Some(0), "{status}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+
+    let lines = join_within(reader, Duration::from_secs(10));
+    let body: String = lines.iter().map(|t| format!("{}\n\n", t.line)).collect();
+    let reply = support::parse_mcp_reply(&body);
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("shutting down"),
+        "the pending call must be DENIED on its own stream, not dropped: {body}"
+    );
+    assert!(
+        !sb.vault.path().join("00-inbox").exists()
+            || std::fs::read_dir(sb.vault.path().join("00-inbox"))
+                .unwrap()
+                .count()
+                == 0,
+        "a call denied at shutdown must write nothing"
+    );
+    // The audit trail names the shutdown as the denying channel.
+    let audit_dir = sb.home.join(".onebrain/gateway/audit");
+    let audit: String = std::fs::read_dir(&audit_dir)
+        .expect("audit dir")
+        .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect();
+    let entry: serde_json::Value = audit
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("audit line is JSON"))
+        .find(|e: &serde_json::Value| e["tool"] == "brain_capture")
+        .unwrap_or_else(|| panic!("no brain_capture audit entry: {audit}"));
+    assert_eq!(entry["decision"], "denied", "{entry}");
+    assert_eq!(entry["channel"], "shutdown", "{entry}");
+    let err = std::fs::read_to_string(&sb.stderr).unwrap();
+    assert!(
+        err.contains("denied pending approvals because the gateway is shutting down"),
         "{}",
         support::redacted_capture_tail(&err)
     );
