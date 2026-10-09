@@ -695,17 +695,12 @@ async fn register_client_handler(
         return resp;
     }
 
-    // Lock held across the cap check AND the insert — see the doc comment
-    // above and `AuthStore::client_count`'s.
+    // The cap check and the insert happen under the store's cross-process
+    // file lock inside `register_client_capped`, so a concurrent
+    // `gateway clients remove` in another process cannot race the count.
     let saved: anyhow::Result<bool> = {
         let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
-        store.client_count().and_then(|count| {
-            if count >= MAX_REGISTERED_CLIENTS {
-                Ok(false)
-            } else {
-                store.register_client(registered).map(|()| true)
-            }
-        })
+        store.register_client_capped(registered, MAX_REGISTERED_CLIENTS)
     };
     match saved {
         Ok(true) => {}

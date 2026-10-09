@@ -384,11 +384,28 @@ impl AuthStore {
         Ok(self.load_clients()?.remove(client_id))
     }
 
-    /// Number of registered clients — `POST /register`'s
-    /// `MAX_REGISTERED_CLIENTS` cap check (#404 item 3). The caller MUST
-    /// hold `AuthCtx::store`'s lock across this AND the following
-    /// `register_client`, or two racing registrations could both pass the
-    /// cap.
+    /// Insert `client` unless that would push the store past `max`
+    /// registrations: returns `Ok(false)` and writes nothing when
+    /// `clients.len() >= max` AND the `client_id` is not already present.
+    /// Overwriting an existing id always succeeds, matching
+    /// [`Self::register_client`]. The count and the insert happen under one
+    /// hold of the store lock, so a concurrent remove/register in another
+    /// process cannot slip between them (`POST /register`'s
+    /// `MAX_REGISTERED_CLIENTS` cap, #404 item 3).
+    pub fn register_client_capped(&self, client: RegisteredClient, max: usize) -> Result<bool> {
+        let _guard = self.lock_exclusive()?;
+        let mut clients = self.load_clients()?;
+        if clients.len() >= max && !clients.contains_key(&client.client_id) {
+            return Ok(false);
+        }
+        clients.insert(client.client_id.clone(), client);
+        self.save_clients(&clients)?;
+        Ok(true)
+    }
+
+    /// Number of registered clients. A plain read — NOT a cap check (use
+    /// [`Self::register_client_capped`], which counts and inserts under the
+    /// store lock).
     pub fn client_count(&self) -> Result<usize> {
         Ok(self.load_clients()?.len())
     }
@@ -1877,5 +1894,61 @@ mod tests {
             lost, 0,
             "{lost} revoke(s) were lost to a concurrent read-modify-write"
         );
+    }
+
+    // ── register_client_capped (T2 / #406, hub Ruling 1) ────────────────
+
+    #[test]
+    fn register_client_capped_refuses_a_new_client_at_the_cap_and_writes_nothing() {
+        let (_dir, store) = open_temp();
+        store.register_client(client("a")).unwrap();
+        store.register_client(client("b")).unwrap();
+        assert!(!store.register_client_capped(client("c"), 2).unwrap());
+        assert_eq!(store.client_count().unwrap(), 2);
+        assert!(store.get_client("c").unwrap().is_none());
+    }
+
+    #[test]
+    fn register_client_capped_still_overwrites_an_existing_id_at_the_cap() {
+        let (_dir, store) = open_temp();
+        store.register_client(client("a")).unwrap();
+        store.register_client(client("b")).unwrap();
+        let mut again = client("a");
+        again.client_name = Some("renamed".to_string());
+        assert!(store.register_client_capped(again, 2).unwrap());
+        assert_eq!(store.client_count().unwrap(), 2);
+        assert_eq!(
+            store
+                .get_client("a")
+                .unwrap()
+                .unwrap()
+                .client_name
+                .as_deref(),
+            Some("renamed")
+        );
+    }
+
+    #[test]
+    fn register_client_capped_inserts_under_the_cap() {
+        let (_dir, store) = open_temp();
+        store.register_client(client("a")).unwrap();
+        assert!(store.register_client_capped(client("b"), 2).unwrap());
+        assert_eq!(store.client_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn register_client_capped_blocks_while_another_handle_holds_the_lock() {
+        let (dir, store) = open_temp();
+        let other = AuthStore::open_at(dir.path().join("gateway")).unwrap();
+        let guard = store.lock_exclusive().unwrap();
+        let handle =
+            std::thread::spawn(move || other.register_client_capped(client("x"), 5).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "capped register must wait on the lock"
+        );
+        drop(guard);
+        assert!(handle.join().unwrap());
     }
 }
