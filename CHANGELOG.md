@@ -160,15 +160,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   50 stored clients (`429` naming `onebrain gateway clients remove <id>`),
   `client_name` ≤ 100 characters, `redirect_uri` ≤ 2048 bytes; `/register`,
   `/token` and `/authorize` bodies are capped at 64 KiB (`413`).
-- `POST /authorize` refuses cross-site submissions (`Sec-Fetch-Site`
-  cross-site/same-site, or a foreign `Origin`) before checking the pairing code,
+- `POST /authorize` refuses cross-site submissions (any `Sec-Fetch-Site`
+  other than `same-origin`/`none`, or a foreign `Origin`) before checking the pairing code,
   so a forged form cannot succeed or trip the lockout. The consent page shows
   the full redirect address, labels the client name as unverified (isolated in
   `<bdi>`), and sends `Referrer-Policy: same-origin` (was `no-referrer`).
 - Tokens record their RFC 8707 `resource` (not yet enforced, [#416](https://github.com/onebrain-ai/onebrain-cli/issues/416));
   a refresh naming a different `client_id` is rejected (`invalid_grant`).
 - `public_url` and native redirect URIs accept `http://[::1]`; `public_url`
-  rejects path prefixes, userinfo and non-numeric ports.
+  rejects path prefixes, userinfo, non-numeric ports and an empty host.
 - **Breaking:** `gateway run` prints the pairing code only when stdout is a
   terminal; under a service or redirect it points to `onebrain gateway pair`.
 
