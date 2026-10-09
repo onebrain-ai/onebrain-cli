@@ -260,9 +260,11 @@ pub enum RotateOutcome {
 
 /// Handle onto the four JSON files under `root` (normally
 /// `~/.onebrain/gateway/`). Cheap to construct — holds only the root path;
-/// every op re-reads its file fresh (single-process, low-frequency local
-/// auth traffic; no in-memory cache to keep coherent with the on-disk
-/// source of truth).
+/// every op re-reads its file fresh (no in-memory cache), so a change made by
+/// another process (e.g. `onebrain gateway tokens revoke` while `gateway run`
+/// is up) is seen on the very next call. Every read-modify-write op holds the
+/// store-wide `auth.lock` (see [`Self::lock_exclusive`]) so two processes can
+/// never lose each other's writes.
 pub struct AuthStore {
     root: PathBuf,
 }
@@ -288,6 +290,41 @@ impl AuthStore {
         Ok(AuthStore { root })
     }
 
+    /// Take the store-wide advisory EXCLUSIVE lock (`<root>/auth.lock`,
+    /// created 0600 on first use), blocking until it is free. Every method
+    /// that does load → modify → save holds this for its whole critical
+    /// section, so a `onebrain gateway tokens revoke` in one process can
+    /// never be lost to a concurrent `rotate_refresh_for_client`/
+    /// `issue_token_pair_for_resource` in the running gateway (both used to
+    /// read the same JSON, modify their copy, and atomically rename it back —
+    /// last rename silently won).
+    ///
+    /// Advisory: only `AuthStore` honours it, which is all that matters
+    /// because nothing else writes these files. Read-only methods do NOT take
+    /// it: writers replace files by atomic tmp+rename, so a reader always
+    /// sees one whole file. The lock is NOT re-entrant (a second handle on
+    /// the lock file conflicts even in-process), so a locked method must
+    /// never call another locked public method. It must use the private
+    /// `load_*`/`save_*` helpers instead. Corollary: the delegating wrappers
+    /// `issue_token_pair` / `rotate_refresh` take NO lock — only the inner
+    /// `*_for_resource` / `*_for_client` bodies do.
+    pub(crate) fn lock_exclusive(&self) -> Result<StoreLock> {
+        let path = self.lock_path();
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).write(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts
+            .open(&path)
+            .with_context(|| format!("open gateway auth lock {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("lock gateway auth store ({})", path.display()))?;
+        Ok(StoreLock { _file: file })
+    }
+
     fn clients_path(&self) -> PathBuf {
         self.root.join("clients.json")
     }
@@ -296,6 +333,9 @@ impl AuthStore {
     }
     fn tokens_path(&self) -> PathBuf {
         self.root.join("tokens.json")
+    }
+    fn lock_path(&self) -> PathBuf {
+        self.root.join("auth.lock")
     }
     fn pairing_path(&self) -> PathBuf {
         self.root.join("pairing.json")
@@ -333,6 +373,7 @@ impl AuthStore {
 
     /// Insert or overwrite a client registration, keyed by its `client_id`.
     pub fn register_client(&self, client: RegisteredClient) -> Result<()> {
+        let _guard = self.lock_exclusive()?;
         let mut clients = self.load_clients()?;
         clients.insert(client.client_id.clone(), client);
         self.save_clients(&clients)
@@ -366,6 +407,7 @@ impl AuthStore {
         resource: &str,
         scope: &str,
     ) -> Result<AuthCode> {
+        let _guard = self.lock_exclusive()?;
         let code_value = core::mint_secret_32();
         let auth_code = AuthCode {
             code: code_value.clone(),
@@ -390,6 +432,7 @@ impl AuthStore {
     /// second redemption of the SAME code always fails, even mid-expiry
     /// window) and returned.
     pub fn consume_code(&self, code: &str) -> Result<Option<AuthCode>> {
+        let _guard = self.lock_exclusive()?;
         let mut codes = self.load_codes()?;
         let now = core::now_epoch_secs();
         let Some(entry) = codes.get_mut(code) else {
@@ -416,6 +459,7 @@ impl AuthStore {
     /// this link only weakens the replay-hardening for a code that's already
     /// gone, it never wrongly trusts anything.
     pub fn mark_code_minted_family(&self, code: &str, family: &str) -> Result<()> {
+        let _guard = self.lock_exclusive()?;
         let mut codes = self.load_codes()?;
         if let Some(entry) = codes.get_mut(code) {
             entry.minted_family = Some(family.to_string());
@@ -458,6 +502,7 @@ impl AuthStore {
         scope: &str,
         resource: Option<&str>,
     ) -> Result<(TokenRecord, TokenRecord)> {
+        let _guard = self.lock_exclusive()?;
         let family = core::mint_secret_32();
         let now = core::now_epoch_secs();
         let resource = resource.map(str::to_string);
@@ -545,6 +590,7 @@ impl AuthStore {
         refresh: &str,
         client_id: Option<&str>,
     ) -> Result<RotateOutcome> {
+        let _guard = self.lock_exclusive()?;
         let mut tokens = self.load_tokens()?;
         let now = core::now_epoch_secs();
 
@@ -626,6 +672,7 @@ impl AuthStore {
     /// intentional revoke (e.g. a future logout route) only has the caller's
     /// say-so for the ONE token it names; a no-op on an unknown token.
     pub fn revoke_token(&self, token: &str) -> Result<()> {
+        let _guard = self.lock_exclusive()?;
         let mut tokens = self.load_tokens()?;
         if let Some(rec) = tokens.get_mut(token) {
             rec.revoked = true;
@@ -643,6 +690,7 @@ impl AuthStore {
     /// [`Self::mark_code_minted_family`]/[`Self::find_code_record`] for how
     /// that path finds the family to pass in here.
     pub fn revoke_family(&self, family: &str) -> Result<()> {
+        let _guard = self.lock_exclusive()?;
         let mut tokens = self.load_tokens()?;
         let mut changed = false;
         for t in tokens.values_mut() {
@@ -663,6 +711,7 @@ impl AuthStore {
     /// call. Idempotent after that — repeated calls return the SAME code
     /// until [`Self::rotate_pairing_code`] replaces it.
     pub fn pairing_code(&self) -> Result<String> {
+        let _guard = self.lock_exclusive()?;
         if let Some(state) = self.load_pairing()? {
             return Ok(state.code);
         }
@@ -678,6 +727,7 @@ impl AuthStore {
     /// there — the old code stops verifying immediately (verification only
     /// ever checks the CURRENT record).
     pub fn rotate_pairing_code(&self) -> Result<String> {
+        let _guard = self.lock_exclusive()?;
         let code = core::mint_pairing_code();
         self.save_pairing(&PairingState {
             code: code.clone(),
@@ -735,6 +785,7 @@ impl AuthStore {
     /// Returns the total number of dropped records (codes + tokens) so the
     /// startup caller can log a debug line naming the count.
     pub fn purge_expired(&self) -> Result<usize> {
+        let _guard = self.lock_exclusive()?;
         let now = core::now_epoch_secs();
         let mut dropped = 0usize;
 
@@ -765,6 +816,14 @@ impl AuthStore {
 
         Ok(dropped)
     }
+}
+
+/// RAII guard returned by [`AuthStore::lock_exclusive`]. The OS releases the
+/// lock when the file handle closes, i.e. when this guard drops. Bind it as
+/// `let _guard = …` — `let _ = …` would drop (and unlock) immediately.
+#[must_use = "the auth store lock is released as soon as this guard is dropped"]
+pub(crate) struct StoreLock {
+    _file: std::fs::File,
 }
 
 // ── File I/O helpers (mirrors `daemon_client::DaemonInfo`) ────────────────
@@ -1659,7 +1718,13 @@ mod tests {
             "gateway auth dir must be 0700, was {dir_mode:o}"
         );
 
-        for name in ["clients.json", "codes.json", "tokens.json", "pairing.json"] {
+        for name in [
+            "clients.json",
+            "codes.json",
+            "tokens.json",
+            "pairing.json",
+            "auth.lock",
+        ] {
             let mode = std::fs::metadata(root.join(name))
                 .unwrap()
                 .permissions()
@@ -1684,6 +1749,133 @@ mod tests {
         assert_eq!(
             mode, 0o700,
             "open_at must re-assert 0700 on a pre-existing looser dir"
+        );
+    }
+
+    // ── Cross-process advisory lock (T2 / #406) ─────────────────────────
+
+    /// A SECOND `AuthStore` handle on the same root stands in for a second
+    /// process (the CLI vs. a running gateway): `flock`/`LockFileEx` locks
+    /// conflict across distinct open file handles even inside one process,
+    /// so two handles reproduce the cross-process race faithfully.
+    /// Also covers the INNER token mutators directly (red-team blocker 1):
+    /// `rotate_refresh_for_client` must wait on a lock held elsewhere.
+    #[test]
+    fn a_mutator_blocks_while_another_handle_holds_the_store_lock() {
+        let (dir, store) = open_temp();
+        let (access, _refresh) = store.issue_token_pair("c1", "brain").unwrap();
+        let other = AuthStore::open_at(dir.path().join("gateway")).unwrap();
+
+        let guard = store.lock_exclusive().unwrap();
+        let token = access.token.clone();
+        let handle = std::thread::spawn(move || other.revoke_token(&token).unwrap());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "revoke_token must wait while another handle holds the store lock"
+        );
+        assert!(
+            store.check_access(&access.token).unwrap().is_some(),
+            "nothing may be written while another handle holds the lock"
+        );
+        drop(guard);
+        handle.join().unwrap();
+        assert!(
+            store.check_access(&access.token).unwrap().is_none(),
+            "the revoke must land once the lock is released"
+        );
+
+        let (_a2, refresh2) = store
+            .issue_token_pair_for_resource("c1", "brain", None)
+            .unwrap();
+        let other = AuthStore::open_at(dir.path().join("gateway")).unwrap();
+        let guard = store.lock_exclusive().unwrap();
+        let handle = std::thread::spawn(move || {
+            other
+                .rotate_refresh_for_client(&refresh2.token, Some("c1"))
+                .unwrap()
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !handle.is_finished(),
+            "rotate_refresh_for_client must wait while another handle holds the store lock"
+        );
+        drop(guard);
+        assert!(matches!(
+            handle.join().unwrap(),
+            RotateOutcome::Rotated { .. }
+        ));
+    }
+
+    /// The wrappers delegate to locked inner fns and must NOT lock
+    /// themselves: the lock is not re-entrant, so a locked wrapper would
+    /// block forever on its own inner call. A watchdog turns that hang into
+    /// a failure instead of a stuck test run.
+    #[test]
+    fn token_wrappers_do_not_deadlock_on_the_inner_lock() {
+        let (_dir, store) = open_temp();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (_a, r) = store.issue_token_pair("c1", "brain").unwrap();
+            let outcome = store.rotate_refresh(&r.token).unwrap();
+            let _ = tx.send(matches!(outcome, RotateOutcome::Rotated { .. }));
+        });
+        let rotated = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("issue_token_pair/rotate_refresh deadlocked on auth.lock");
+        assert!(rotated);
+    }
+
+    /// The lost-update race #406 is about: one handle hammers the INNER
+    /// `issue_token_pair_for_resource` (load → insert → save of the whole `tokens.json`)
+    /// while another revokes tokens one by one. Without the lock, a revoke
+    /// landing between the issuer's load and save is overwritten (last rename
+    /// wins), and an issuer insert can likewise be lost to the revoker's
+    /// save. Both effects are asserted.
+    #[test]
+    fn concurrent_mutators_on_two_handles_never_lose_a_revoke_or_an_insert() {
+        const TARGETS: usize = 40;
+        const ISSUES: usize = 150;
+        let (dir, store) = open_temp();
+        let targets: Vec<String> = (0..TARGETS)
+            .map(|_| {
+                store
+                    .issue_token_pair_for_resource("victim", "brain", None)
+                    .unwrap()
+                    .0
+                    .token
+            })
+            .collect();
+        let root = dir.path().join("gateway");
+        let issuer = AuthStore::open_at(root.clone()).unwrap();
+        let revoker = AuthStore::open_at(root).unwrap();
+
+        let a = std::thread::spawn(move || {
+            for _ in 0..ISSUES {
+                issuer
+                    .issue_token_pair_for_resource("busy", "brain", None)
+                    .unwrap();
+            }
+        });
+        let to_revoke = targets.clone();
+        let b = std::thread::spawn(move || {
+            for t in &to_revoke {
+                revoker.revoke_token(t).unwrap();
+            }
+        });
+        a.join().unwrap();
+        b.join().unwrap();
+
+        let tokens = store.load_tokens().unwrap();
+        assert_eq!(
+            tokens.len(),
+            TARGETS * 2 + ISSUES * 2,
+            "an issue_token_pair_for_resource insert was lost to a concurrent write"
+        );
+        let lost = targets.iter().filter(|t| !tokens[*t].revoked).count();
+        assert_eq!(
+            lost, 0,
+            "{lost} revoke(s) were lost to a concurrent read-modify-write"
         );
     }
 }
