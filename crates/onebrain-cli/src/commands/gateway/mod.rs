@@ -266,6 +266,9 @@ fn validate_public_url(raw: &str) -> Result<(), String> {
         if !(after.is_empty() || after.starts_with(':')) {
             return Err("has a malformed host".to_string());
         }
+        if authority[1..end].parse::<std::net::Ipv6Addr>().is_err() {
+            return Err("has a bracketed host that is not an IPv6 address".to_string());
+        }
         (&authority[..=end], after.strip_prefix(':'))
     } else {
         match authority.split_once(':') {
@@ -846,6 +849,19 @@ mod tests {
             assert!(err.contains("missing a host"), "{bad}: {err}");
             assert!(!err.contains("443"), "must not echo the input: {err}");
         }
+    }
+
+    /// A bracketed host must hold a real IPv6 address: `[]` is not an empty
+    /// host to `http::Uri` (host `"[]"`), but it normalises to one.
+    #[test]
+    fn validate_public_url_rejects_a_bracketed_non_ipv6_host() {
+        for bad in ["https://[]", "https://[zzz]:443", "http://[]:7717"] {
+            let err = validate_public_url(bad).expect_err(bad);
+            assert!(err.contains("IPv6"), "{bad}: {err}");
+            assert!(!err.contains("zzz"), "must not echo the input: {err}");
+        }
+        assert!(validate_public_url("http://[::1]:7717").is_ok());
+        assert!(validate_public_url("https://[2001:db8::1]").is_ok());
     }
 
     /// Every public_url the validator accepts must yield the same host from
