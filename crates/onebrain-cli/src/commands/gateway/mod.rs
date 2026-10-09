@@ -35,6 +35,7 @@ pub mod host_guard;
 pub mod oauth_routes;
 pub mod policy;
 pub mod server;
+pub mod service_plist;
 pub mod telegram;
 pub mod telegram_api;
 pub mod telegram_setup;
