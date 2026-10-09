@@ -36,11 +36,17 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
-    CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+    CallToolResult, ContentBlock, Implementation, ProgressNotificationParam, ProtocolVersion,
+    ServerCapabilities, ServerInfo,
 };
+// SEP-2577-deprecated logging types, used only by the approval-wait notice
+// (`announce_approval_wait`) and the `logging` capability it requires.
+#[allow(deprecated)]
+use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam, SetLevelRequestParams};
+use rmcp::service::{MaybeSendFuture, RequestContext};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
-use rmcp::{tool, tool_handler, tool_router, ErrorData, ServerHandler};
+use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler};
 
 use onebrain_core::{
     load_vault_config, require_vault, CoreError, ResolvedVault, VaultResolveInputs,
@@ -1013,6 +1019,53 @@ async fn extract_principal_audited(
     }
 }
 
+/// The text of the notice [`announce_approval_wait`] sends. One definition so
+/// the e2e tests and the wire can't drift.
+fn approval_wait_message(tool: &str, wait_secs: u64) -> String {
+    format!("waiting for human approval of {tool} (up to {wait_secs}s)")
+}
+
+/// Tell the waiting client, right now, that this call is blocked on a human.
+///
+/// Why this exists (design D1, #412): with `with_json_response(true)` rmcp
+/// buffers a reply until the handler's FIRST message, so an approval-gated
+/// call used to put zero bytes on the wire until a human answered —
+/// Cloudflare returns 524 after 125 s of that. A non-terminal message makes
+/// rmcp's negotiated path open an SSE stream instead (rmcp-3.0.1
+/// `transport/streamable_http_server/tower.rs:1108-1139`), and that stream
+/// carries rmcp's own `:` keep-alive comment every 15 s until the final
+/// reply, on the same stream. Calls that never wait keep plain JSON.
+///
+/// `notifications/progress` when the caller sent a `progressToken` (MCP's
+/// sanctioned "still working" signal); otherwise `notifications/message`,
+/// which SEP-2577 deprecates but every client either shows or ignores.
+/// Best effort: a failed send only costs the keep-alive, never the call.
+async fn announce_approval_wait(
+    ctx: Option<&RequestContext<RoleServer>>,
+    tool: &str,
+    wait_secs: u64,
+) {
+    let Some(ctx) = ctx else { return };
+    let msg = approval_wait_message(tool, wait_secs);
+    let sent = if let Some(token) = ctx.meta.get_progress_token() {
+        ctx.peer
+            .notify_progress(ProgressNotificationParam::new(token, 0.0).with_message(msg))
+            .await
+    } else {
+        #[allow(deprecated)]
+        let param = LoggingMessageNotificationParam::new(
+            LoggingLevel::Info,
+            serde_json::Value::String(msg),
+        )
+        .with_logger("onebrain-gateway");
+        #[allow(deprecated)]
+        ctx.peer.notify_logging_message(param).await
+    };
+    if let Err(e) = sent {
+        tracing::debug!(%e, "approval-wait notification not delivered");
+    }
+}
+
 /// Runs the policy check ([`policy::decide`]) for one tool call of risk
 /// class `class`. `Ok((Decision::Auto | Decision::Approved, channel))` means
 /// the call may proceed; `Err((Decision, channel, ErrorData))` carries the
@@ -1063,6 +1116,7 @@ async fn policy_gate(
     class: RiskClass,
     vault: Option<&str>,
     args_summary: &str,
+    ctx: Option<&RequestContext<RoleServer>>,
 ) -> Result<(Decision, Option<ResolvedVia>), (Decision, Option<ResolvedVia>, ErrorData)> {
     match policy::decide(&state.config.policy, &state.grants, principal, class, vault) {
         // Neither `Allow` nor `Deny` ever reaches an approval channel — no
@@ -1074,7 +1128,7 @@ async fn policy_gate(
             ErrorData::invalid_request(format!("gateway policy denies this call [{tool}]"), None),
         )),
         PolicyOutcome::NeedApproval => {
-            await_approval(state, principal, tool, class, vault, args_summary).await
+            await_approval(state, principal, tool, class, vault, args_summary, ctx).await
         }
     }
 }
@@ -1162,6 +1216,7 @@ async fn await_approval(
     class: RiskClass,
     vault: Option<&str>,
     args_summary: &str,
+    ctx: Option<&RequestContext<RoleServer>>,
 ) -> Result<(Decision, Option<ResolvedVia>), (Decision, Option<ResolvedVia>, ErrorData)> {
     let wait_secs = state.config.policy.approval_wait_seconds;
     let now = now_epoch_secs();
@@ -1204,6 +1259,9 @@ async fn await_approval(
             ));
         }
     };
+
+    // D1: bytes on the wire before anyone is asked — see the fn's doc.
+    announce_approval_wait(ctx, tool, wait_secs).await;
 
     // `cfg!(test)` guards this crate's OWN unit tests (this module's
     // `#[cfg(test)] mod tests` below) from ever actually reaching
@@ -1477,6 +1535,7 @@ impl GatewayServer {
     )]
     async fn capabilities(
         &self,
+        ctx: RequestContext<RoleServer>,
         Extension(parts): Extension<Parts>,
     ) -> Result<Json<CapabilitiesOut>, ErrorData> {
         let started = Instant::now();
@@ -1490,6 +1549,7 @@ impl GatewayServer {
             RiskClass::ReadOnly,
             None,
             &args_summary,
+            Some(&ctx),
         )
         .await
         {
@@ -1535,6 +1595,7 @@ impl GatewayServer {
     )]
     async fn brain_tasks(
         &self,
+        ctx: RequestContext<RoleServer>,
         Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<BrainTasksParams>,
     ) -> Result<Json<BrainTasksOut>, ErrorData> {
@@ -1554,6 +1615,7 @@ impl GatewayServer {
             RiskClass::ReadOnly,
             params.vault.as_deref(),
             &args_summary,
+            Some(&ctx),
         )
         .await
         {
@@ -1631,6 +1693,7 @@ impl GatewayServer {
     )]
     async fn brain_get(
         &self,
+        ctx: RequestContext<RoleServer>,
         Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<BrainGetParams>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -1647,6 +1710,7 @@ impl GatewayServer {
             RiskClass::ReadOnly,
             params.vault.as_deref(),
             &args_summary,
+            Some(&ctx),
         )
         .await
         {
@@ -1720,6 +1784,7 @@ impl GatewayServer {
     )]
     async fn brain_search(
         &self,
+        ctx: RequestContext<RoleServer>,
         Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<BrainSearchParams>,
     ) -> Result<CallToolResult, ErrorData> {
@@ -1739,6 +1804,7 @@ impl GatewayServer {
             RiskClass::ReadOnly,
             params.vault.as_deref(),
             &args_summary,
+            Some(&ctx),
         )
         .await
         {
@@ -1809,6 +1875,7 @@ impl GatewayServer {
     )]
     async fn brain_capture(
         &self,
+        ctx: RequestContext<RoleServer>,
         Extension(parts): Extension<Parts>,
         Parameters(params): Parameters<BrainCaptureParams>,
     ) -> Result<Json<BrainCaptureOut>, ErrorData> {
@@ -1834,6 +1901,7 @@ impl GatewayServer {
             RiskClass::Mutating,
             params.vault.as_deref(),
             &args_summary,
+            Some(&ctx),
         )
         .await
         {
@@ -2053,7 +2121,17 @@ async fn capture_note(
 #[tool_handler(router = self.tool_router.clone())]
 impl ServerHandler for GatewayServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        // `notifications/message` (the approval-wait notice, see
+        // `announce_approval_wait`) is only legal from a server that
+        // declared `logging` (MCP lifecycle/capabilities). Deprecated by
+        // SEP-2577 together with the notification itself — both go away
+        // together when rmcp drops them.
+        #[allow(deprecated)]
+        let capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_logging()
+            .build();
+        ServerInfo::new(capabilities)
             .with_instructions(
                 "OneBrain Gateway — Brain pack. Call `capabilities` first to see packs and \
                  vaults. `brain_search` finds notes, `brain_get` reads one, `brain_tasks` lists \
@@ -2066,6 +2144,17 @@ impl ServerHandler for GatewayServer {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_protocol_version(ProtocolVersion::V_2026_07_28)
+    }
+
+    /// The gateway only ever emits info-level approval-wait notices, so any
+    /// requested level is accepted and ignored.
+    #[allow(deprecated)]
+    fn set_level(
+        &self,
+        _request: SetLevelRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), ErrorData>> + MaybeSendFuture + '_ {
+        std::future::ready(Ok(()))
     }
 }
 
@@ -2293,18 +2382,34 @@ mod tests {
     }
 
     /// POST `body` to `/mcp` with `token` as the `Authorization: Bearer`
-    /// credential, plus the given extra headers (beyond the baseline
-    /// content-type/accept/host/authorization every request needs — the
-    /// Streamable HTTP service's DNS-rebinding guard 400s any request with
-    /// no `Host` header and no URI authority, and `oneshot` supplies
-    /// neither by default; `/mcp` now also 401s without a valid bearer
-    /// token, per Gateway PR 3, Task 2).
+    /// credential, plus the given extra headers (beyond the baseline ones
+    /// [`post_raw`] always sends), and return the JSON-RPC reply whether it
+    /// arrived as plain JSON or as the last event of an SSE stream (an
+    /// approval-gated call streams a wait notice first — see
+    /// `announce_approval_wait`).
     async fn post(
         router: &axum::Router,
         body: String,
         token: &str,
         extra: &[(&str, &str)],
     ) -> serde_json::Value {
+        let (_, _, text) = post_raw(router, body, token, extra).await;
+        parse_mcp_body(&text)
+    }
+
+    /// Raw `/mcp` POST — status, `content-type`, and the body text, unparsed.
+    /// For tests that assert on the reply's *framing* (JSON vs SSE), which
+    /// [`post`] deliberately hides. The baseline headers are what every
+    /// request needs: the Streamable HTTP service's DNS-rebinding guard 400s
+    /// any request with no `Host` header and no URI authority (`oneshot`
+    /// supplies neither by default), and `/mcp` 401s without a valid bearer
+    /// token (Gateway PR 3, Task 2).
+    async fn post_raw(
+        router: &axum::Router,
+        body: String,
+        token: &str,
+        extra: &[(&str, &str)],
+    ) -> (StatusCode, String, String) {
         let mut builder = Request::builder()
             .method("POST")
             .uri("/mcp")
@@ -2315,15 +2420,219 @@ mod tests {
         for (name, value) in extra {
             builder = builder.header(*name, *value);
         }
-        let req = builder.body(Body::from(body)).unwrap();
-        let res = router.clone().oneshot(req).await.unwrap();
+        let res = router
+            .clone()
+            .oneshot(builder.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let content_type = res
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
-        serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            panic!(
-                "response was not JSON ({e}): {}",
-                String::from_utf8_lossy(&bytes)
-            )
+        (
+            status,
+            content_type,
+            String::from_utf8(bytes.to_vec()).unwrap(),
+        )
+    }
+
+    /// Every `data:` event of an SSE body, each parsed as JSON, in order.
+    fn sse_data_events(text: &str) -> Vec<serde_json::Value> {
+        let text = text.replace("\r\n", "\n");
+        text.split("\n\n")
+            .filter_map(|event| {
+                let data: Vec<&str> = event
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("data:"))
+                    .map(str::trim_start)
+                    .collect();
+                (!data.is_empty()).then(|| data.join("\n"))
+            })
+            .map(|d| {
+                serde_json::from_str(&d)
+                    .unwrap_or_else(|e| panic!("SSE data event was not JSON ({e}): {d}"))
+            })
+            .collect()
+    }
+
+    /// The JSON-RPC reply of an `/mcp` response that may be plain JSON (the
+    /// first message was the final one) or an SSE stream (a notification came
+    /// first — see `announce_approval_wait`). For SSE the reply is the LAST
+    /// data event; anything before it is a notification.
+    fn parse_mcp_body(text: &str) -> serde_json::Value {
+        if text.trim_start().starts_with('{') {
+            return serde_json::from_str(text)
+                .unwrap_or_else(|e| panic!("response was not JSON ({e}): {text}"));
+        }
+        sse_data_events(text).pop().unwrap_or_else(|| {
+            panic!("response was neither JSON nor SSE with a data event: {text}")
         })
+    }
+
+    #[test]
+    fn parse_mcp_body_takes_the_last_sse_data_event_and_plain_json_as_is() {
+        let sse = "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\n\n\
+                   :\n\n\
+                   data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
+        assert_eq!(parse_mcp_body(sse)["id"], 1);
+        assert_eq!(parse_mcp_body("{\"id\":7}")["id"], 7);
+    }
+
+    #[test]
+    #[should_panic(expected = "neither JSON nor SSE")]
+    fn parse_mcp_body_refuses_a_body_with_no_reply() {
+        parse_mcp_body(":\n\n:\n\n");
+    }
+
+    /// D1: a call that has to wait for a human must put bytes on the wire
+    /// immediately — a notification first, so rmcp streams SSE (and its 15 s
+    /// keep-alives) instead of buffering until the decision. `approval_wait_seconds: 0`
+    /// makes the wait end at once, so the whole stream is notice + timeout.
+    #[tokio::test]
+    async fn an_approval_gated_call_streams_a_wait_notice_before_its_reply() {
+        let (_dir, router, _state, token) =
+            fixture_router_with_mutating_policy(policy::PolicyMode::AskOnce, 0, 30);
+        let body = call_body(
+            1,
+            "brain_capture",
+            serde_json::json!({"title": "Wait", "text": "x"}),
+        );
+        let (status, content_type, text) = post_raw(
+            &router,
+            body,
+            &token,
+            &standard_headers("tools/call", Some("brain_capture")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "{content_type}: {text}"
+        );
+        let events = sse_data_events(&text);
+        assert_eq!(events.len(), 2, "{text}");
+        assert_eq!(events[0]["method"], "notifications/message", "{text}");
+        assert_eq!(
+            events[0]["params"]["data"], "waiting for human approval of brain_capture (up to 0s)",
+            "{text}"
+        );
+        assert!(
+            events[1]["error"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("timed out"),
+            "{text}"
+        );
+    }
+
+    /// With a `progressToken`, the notice is the MCP-sanctioned
+    /// `notifications/progress` carrying that token back.
+    #[tokio::test]
+    async fn a_wait_notice_uses_progress_when_the_caller_sent_a_progress_token() {
+        let (_dir, router, _state, token) =
+            fixture_router_with_mutating_policy(policy::PolicyMode::AskOnce, 0, 30);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "brain_capture",
+                "arguments": {"title": "Wait", "text": "x"},
+                "_meta": {"progressToken": "p1"},
+            },
+        })
+        .to_string();
+        let (_, _, text) = post_raw(
+            &router,
+            body,
+            &token,
+            &standard_headers("tools/call", Some("brain_capture")),
+        )
+        .await;
+        let events = sse_data_events(&text);
+        assert_eq!(events[0]["method"], "notifications/progress", "{text}");
+        assert_eq!(events[0]["params"]["progressToken"], "p1", "{text}");
+    }
+
+    /// Review Focus 2: an operator can put READ tools behind approval too;
+    /// those must stream exactly like `brain_capture` does.
+    #[tokio::test]
+    async fn a_read_tool_behind_approval_streams_a_wait_notice_too() {
+        let (_dir, router, _state, token) =
+            fixture_router_with_read_only_policy(policy::PolicyMode::AskOnce, 0);
+        let body = call_body(1, "brain_get", serde_json::json!({"file": "hello.md"}));
+        let (_, content_type, text) = post_raw(
+            &router,
+            body,
+            &token,
+            &standard_headers("tools/call", Some("brain_get")),
+        )
+        .await;
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "{content_type}: {text}"
+        );
+        assert_eq!(
+            sse_data_events(&text)[0]["params"]["data"],
+            "waiting for human approval of brain_get (up to 0s)"
+        );
+    }
+
+    /// Red-team item 3: `notifications/message` is only legal from a server
+    /// that declared the `logging` capability — a spec-strict client may
+    /// drop the wait notice otherwise. Declaring it means answering
+    /// `logging/setLevel` too.
+    #[tokio::test]
+    async fn initialize_declares_the_logging_capability_and_accepts_set_level() {
+        let (_dir, router, token) = fixture_router();
+        let init = post(
+            &router,
+            init_body(1, PROTOCOL),
+            &token,
+            &[("MCP-Protocol-Version", PROTOCOL)],
+        )
+        .await;
+        assert!(
+            init["result"]["capabilities"]["logging"].is_object(),
+            "logging capability must be declared: {init}"
+        );
+        let set_level = serde_json::json!({
+            "jsonrpc": "2.0", "id": 2, "method": "logging/setLevel",
+            "params": {"level": "info"},
+        })
+        .to_string();
+        let resp = post(
+            &router,
+            set_level,
+            &token,
+            &standard_headers("logging/setLevel", None),
+        )
+        .await;
+        assert!(resp.get("error").is_none(), "setLevel must succeed: {resp}");
+    }
+
+    /// The negative space: nothing that does NOT wait may change framing —
+    /// `json_response(true)` still governs every call whose first message is
+    /// its final reply.
+    #[tokio::test]
+    async fn an_auto_allowed_call_still_replies_with_plain_json() {
+        let (_dir, router, token) = fixture_router();
+        let (status, content_type, text) = post_raw(
+            &router,
+            call_body(1, "capabilities", serde_json::json!({})),
+            &token,
+            &standard_headers("tools/call", Some("capabilities")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert!(
+            content_type.starts_with("application/json"),
+            "{content_type}: {text}"
+        );
     }
 
     fn init_body(id: u32, protocol_version: &str) -> String {
