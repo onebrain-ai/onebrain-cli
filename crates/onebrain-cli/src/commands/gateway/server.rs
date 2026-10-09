@@ -1329,11 +1329,28 @@ async fn await_approval(
         t.ensure_polling(state.approvals.clone());
     }
 
-    match state
+    // Smoke V F2: a client that goes away mid-wait (tunnel drop) must take
+    // its approval with it — otherwise a later approve writes a result
+    // nobody receives. rmcp cancels `ctx.ct` when the SSE response stream is
+    // dropped (`CancelOnDisconnect`); denying through `resolve` withdraws
+    // the native prompt like any other answer, and the Deny arm below
+    // closes the Telegram message.
+    let wait = state
         .approvals
-        .wait(&id, rx, Duration::from_secs(wait_secs))
-        .await
-    {
+        .wait(&id, rx, Duration::from_secs(wait_secs));
+    let outcome = match ctx {
+        Some(ctx) => tokio::select! {
+            outcome = wait => outcome,
+            () = ctx.ct.cancelled() => {
+                state
+                    .approvals
+                    .resolve(&id, approval::Decision::Deny, ResolvedVia::Disconnect);
+                WaitOutcome::Decided(approval::Decision::Deny, ResolvedVia::Disconnect)
+            }
+        },
+        None => wait.await,
+    };
+    match outcome {
         WaitOutcome::Decided(approval::Decision::Approve, via) => {
             // "Always ask" never leaves standing consent behind — see this
             // function's doc comment, step 4, and the identical guard in
@@ -1368,10 +1385,14 @@ async fn await_approval(
                 Decision::Denied,
                 Some(via),
                 ErrorData::invalid_request(
-                    if via == ResolvedVia::Shutdown {
-                        format!("the gateway is shutting down; this call was denied [{tool}]")
-                    } else {
-                        format!("this call was denied by the gateway operator [{tool}]")
+                    match via {
+                        ResolvedVia::Shutdown => {
+                            format!("the gateway is shutting down; this call was denied [{tool}]")
+                        }
+                        ResolvedVia::Disconnect => {
+                            format!("the client disconnected while approval was pending [{tool}]")
+                        }
+                        _ => format!("this call was denied by the gateway operator [{tool}]"),
                     },
                     None,
                 ),

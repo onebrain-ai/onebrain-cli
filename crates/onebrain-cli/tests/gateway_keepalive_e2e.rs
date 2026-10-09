@@ -171,42 +171,19 @@ struct Timed {
 /// POST an approval-gated `brain_capture` and stream its reply line by line
 /// on a thread. Returns the reply's content-type, the instant the POST was
 /// sent, and the reader. `send()` returns once response HEADERS arrive —
-/// which, before T3, was only after the human decided — so it runs on the
-/// reader thread and the caller waits at most 5 s (the first-byte bound) for
-/// the headers. ureq's `timeout_recv_response` can't express this: it also
+/// which, before T3, was only after the human decided — so it runs on its
+/// own thread ([`open_capture_response`]) and the caller waits at most 5 s
+/// (the first-byte bound) for the headers. ureq's `timeout_recv_response` can't express this: it also
 /// caps the body read at headers + limit, and the body streams for minutes.
 fn open_capture_stream(sb: &Sandbox) -> (String, Instant, JoinHandle<Vec<Timed>>) {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
-        "params": {"name": "brain_capture", "arguments": {"title": "keepalive", "text": "hello"}},
-    });
-    let url = sb.mcp_url.clone();
-    let (headers_tx, headers_rx) = std::sync::mpsc::channel::<Result<(u16, String), String>>();
-    let t0 = Instant::now();
+    let (resp, t0) = open_capture_response(sb);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
     let reader = std::thread::spawn(move || {
-        let sent = agent(Duration::from_secs(300))
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("accept", "application/json, text/event-stream")
-            .header("authorization", format!("Bearer {TOKEN}"))
-            .header("MCP-Protocol-Version", PROTOCOL)
-            .header("Mcp-Method", "tools/call")
-            .header("Mcp-Name", "brain_capture")
-            .send(body.to_string());
-        let resp = match sent {
-            Ok(resp) => resp,
-            Err(e) => {
-                let _ = headers_tx.send(Err(e.to_string()));
-                return Vec::new();
-            }
-        };
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let _ = headers_tx.send(Ok((resp.status().as_u16(), content_type)));
         std::io::BufReader::new(resp.into_body().into_reader())
             .lines()
             .map(|l| l.expect("read streamed line"))
@@ -217,8 +194,35 @@ fn open_capture_stream(sb: &Sandbox) -> (String, Instant, JoinHandle<Vec<Timed>>
             })
             .collect()
     });
-    let (status, content_type) = match headers_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Ok(headers)) => headers,
+    (content_type, t0, reader)
+}
+
+/// The POST half of [`open_capture_stream`]: the 200 response with its body
+/// still unread, so a caller can also DROP it to close the connection
+/// mid-wait (the client-disconnect test).
+fn open_capture_response(sb: &Sandbox) -> (ureq::http::Response<ureq::Body>, Instant) {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+        "params": {"name": "brain_capture", "arguments": {"title": "keepalive", "text": "hello"}},
+    });
+    let url = sb.mcp_url.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let t0 = Instant::now();
+    std::thread::spawn(move || {
+        let sent = agent(Duration::from_secs(300))
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("MCP-Protocol-Version", PROTOCOL)
+            .header("Mcp-Method", "tools/call")
+            .header("Mcp-Name", "brain_capture")
+            .send(body.to_string())
+            .map_err(|e| e.to_string());
+        let _ = tx.send(sent);
+    });
+    let resp = match rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(resp)) => resp,
         // Message wrapper only (no test forces a send error): reports a
         // refused connection etc. instead of a 5 s "first byte" timeout.
         Ok(Err(e)) => panic!("POST /mcp failed: {e}"),
@@ -228,11 +232,11 @@ fn open_capture_stream(sb: &Sandbox) -> (String, Instant, JoinHandle<Vec<Timed>>
         // Unreachable in practice: the thread sends on both send() outcomes
         // before it can return, so this needs a panic before send().
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            panic!("unreachable: stream thread ended without reporting send()")
+            panic!("unreachable: POST thread ended without reporting send()")
         }
     };
-    assert_eq!(status, 200);
-    (content_type, t0, reader)
+    assert_eq!(resp.status().as_u16(), 200);
+    (resp, t0)
 }
 
 /// Bounded poll (10 s) for exactly one pending approval; returns its id.
@@ -482,4 +486,68 @@ fn sigterm_with_an_approval_pending_denies_it_and_exits_cleanly() {
         "{}",
         support::redacted_capture_tail(&err)
     );
+}
+
+/// Smoke V F2 (#412): a connector whose call was cancelled mid-wait (tunnel
+/// drop) left its approval pending, and approving it minutes later still
+/// wrote the note nobody would receive. Dropping the client's stream must
+/// withdraw the approval within 5 s — the old id can no longer be approved,
+/// nothing is written, and the audit names `disconnect` as the denying
+/// channel.
+#[test]
+fn client_disconnect_mid_wait_cancels_the_pending_approval_and_writes_nothing() {
+    let sb = start("  mutating: ask_always\n  approval_wait_seconds: 30\n");
+    let (resp, _t0) = open_capture_response(&sb);
+    let code = read_pairing_code(&sb.home);
+    let id = wait_for_one_pending(&sb, &code);
+
+    drop(resp); // the client goes away
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut resp = agent(Duration::from_secs(10))
+            .get(&sb.approvals_url)
+            .header("X-OneBrain-Pairing", &code)
+            .call()
+            .expect("GET /approvals");
+        let list: serde_json::Value =
+            serde_json::from_str(&resp.body_mut().read_to_string().unwrap()).unwrap();
+        if list.as_array().is_some_and(|a| a.is_empty()) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the approval is still pending 5s after the client disconnected: {list}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let status = agent(Duration::from_secs(10))
+        .post(&format!("{}/{id}", sb.approvals_url))
+        .header("content-type", "application/json")
+        .header("X-OneBrain-Pairing", &code)
+        .send(serde_json::json!({ "decision": "approve" }).to_string())
+        .expect("POST /approvals/{id}")
+        .status()
+        .as_u16();
+    assert_eq!(status, 404, "the withdrawn approval must not be approvable");
+
+    let inbox = sb.vault.path().join("00-inbox");
+    assert!(
+        !inbox.exists() || std::fs::read_dir(&inbox).unwrap().count() == 0,
+        "a call whose client disconnected must write nothing"
+    );
+    let audit_dir = sb.home.join(".onebrain/gateway/audit");
+    let audit: String = std::fs::read_dir(&audit_dir)
+        .expect("audit dir")
+        .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect();
+    let entry: serde_json::Value = audit
+        .lines()
+        .rev()
+        .map(|l| serde_json::from_str(l).expect("audit line is JSON"))
+        .find(|e: &serde_json::Value| e["tool"] == "brain_capture")
+        .unwrap_or_else(|| panic!("no brain_capture audit entry: {audit}"));
+    assert_eq!(entry["decision"], "denied", "{entry}");
+    assert_eq!(entry["channel"], "disconnect", "{entry}");
 }

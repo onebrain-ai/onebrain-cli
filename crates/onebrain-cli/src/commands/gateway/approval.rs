@@ -206,17 +206,21 @@ pub enum ResolvedVia {
     /// The gateway itself, shutting down (`gateway run` got Ctrl-C/SIGTERM) —
     /// [`Approvals::deny_all`].
     Shutdown,
+    /// The client went away while its call waited (`server::await_approval`
+    /// saw the request's cancellation token fire) — smoke V F2.
+    Disconnect,
 }
 
 impl ResolvedVia {
     /// The exact lowercase string `audit::AuditEntry::channel` records —
-    /// `"http"`, `"native"`, `"telegram"`, or `"shutdown"`.
+    /// `"http"`, `"native"`, `"telegram"`, `"shutdown"`, or `"disconnect"`.
     pub fn as_str(self) -> &'static str {
         match self {
             ResolvedVia::Http => "http",
             ResolvedVia::Native => "native",
             ResolvedVia::Telegram => "telegram",
             ResolvedVia::Shutdown => "shutdown",
+            ResolvedVia::Disconnect => "disconnect",
         }
     }
 }
@@ -607,6 +611,7 @@ mod tests {
         assert_eq!(ResolvedVia::Native.as_str(), "native");
         assert_eq!(ResolvedVia::Telegram.as_str(), "telegram");
         assert_eq!(ResolvedVia::Shutdown.as_str(), "shutdown");
+        assert_eq!(ResolvedVia::Disconnect.as_str(), "disconnect");
     }
 
     // ── timeout path: TimedOut + entry dropped from pending ─────────────

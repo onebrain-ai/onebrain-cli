@@ -388,6 +388,9 @@ fn run_withdrawable(
     let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
+        // A dismissed or killed dialog prints "User canceled. (-128)" —
+        // noise in the gateway log, not a signal (the exit status is).
+        .stderr(std::process::Stdio::null())
         .spawn()
         .ok()?;
     let mut stdout = child.stdout.take();
