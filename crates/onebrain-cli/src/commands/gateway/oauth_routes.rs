@@ -45,7 +45,7 @@
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::extract::{Form, Query, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -57,6 +57,7 @@ use super::auth::{
     mint_secret_32, now_epoch_secs, pkce_s256_matches, AppType, AuthStore, RegisteredClient,
     RotateOutcome, TokenRecord, ACCESS_TTL_SECS,
 };
+use super::host_guard::request_origin_allowed;
 
 /// Consecutive wrong pairing-code submissions that trip a lockout.
 const MAX_PAIRING_FAILURES: u32 = 5;
@@ -1112,15 +1113,15 @@ fn append_query(base: &str, pairs: &[(&str, &str)]) -> String {
 /// separately, so there is no way for a future edit to add a THIRD
 /// `html_response` caller here and forget them.
 ///
-/// **`Referrer-Policy: no-referrer` (security review, Minor):** the consent
-/// page's one legitimate navigation is the "Authorize" submit -> the
-/// browser following the resulting redirect to `redirect_uri`, an origin
-/// this authorization server does not control. Without `Referrer-Policy`, a
-/// browser's default `Referer` behavior would leak this gateway's issuer
-/// host+port (e.g. `http://127.0.0.1:7717/authorize`) to that redirect
-/// target. `no-referrer` suppresses the header entirely on every navigation
-/// away from this page, matching the "don't leak local process details to a
-/// third party" posture the rest of this handler already takes.
+/// **`Referrer-Policy: same-origin` (#404 item 6; was `no-referrer`):** the
+/// consent page's one legitimate navigation away is the "Authorize" submit →
+/// the browser following the redirect to `redirect_uri`, an origin this
+/// authorization server does not control. `same-origin` still sends NO
+/// `Referer` there (cross-origin), so the issuer host+port never leaks. It
+/// is chosen over `no-referrer` because, per the Fetch spec, a `no-referrer`
+/// page makes the browser serialize `Origin: null` on its own form POST.
+/// That would make the `POST /authorize` Origin check (and the router-wide
+/// `host_guard` Origin rule) refuse every legitimate approval.
 fn html_response(status: StatusCode, html: String) -> Response {
     (
         status,
@@ -1128,7 +1129,7 @@ fn html_response(status: StatusCode, html: String) -> Response {
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
             (header::X_FRAME_OPTIONS, "DENY"),
             (header::CONTENT_SECURITY_POLICY, "default-src 'none'"),
-            (header::REFERRER_POLICY, "no-referrer"),
+            (header::REFERRER_POLICY, "same-origin"),
         ],
         html,
     )
@@ -1198,9 +1199,12 @@ fn redirect_with_code(ctx: &AuthCtx, req: &ValidatedAuthorize, code: &str) -> Re
 }
 
 /// Render the consent form: client name (untrusted — a DCR client sets this
-/// itself) + the redirect_uri's HOST (the one value that's actually anchored
-/// to a validated redirect target — see the module-level CIMD/Claude
-/// guidance note) + scope, one `pairing_code` text input, and hidden fields
+/// itself, so it is labelled "not verified" on the page, #404 item 5) + the
+/// redirect_uri's HOST + the FULL html-escaped redirect_uri (the one value
+/// anchored to a validated redirect target — the host alone hides path and
+/// query differences between two registrations on one domain; see the
+/// module-level CIMD/Claude guidance note) + scope, one `pairing_code` text
+/// input, and hidden fields
 /// carrying the whole VALIDATED (not raw-caller) request so a POST can
 /// re-derive and re-check everything from scratch. `notice`, when present,
 /// is a generic status line (wrong code / locked out) — see
@@ -1223,9 +1227,11 @@ fn render_consent_form(req: &ValidatedAuthorize, notice: Option<&str>) -> Respon
     let html = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
          <title>Authorize access</title></head><body>\
-         <h1>Authorize {client_name}</h1>\
+         <h1>Authorize {client_name} <small>(name provided by the app — not verified)</small></h1>\
          <p>This application is requesting access to: <strong>{scope}</strong></p>\
-         <p>It will redirect to: <code>{host}</code></p>\
+         <p>After you approve, your browser will be sent to <strong>{host}</strong> at this exact address:</p>\
+         <p><code>{redirect_uri}</code></p>\
+         <p>Only approve if you started this connection yourself and recognise that address.</p>\
          {notice_html}\
          <form method=\"post\" action=\"/authorize\">\
          <input type=\"hidden\" name=\"response_type\" value=\"code\">\
@@ -1282,7 +1288,42 @@ async fn authorize_get_handler(
     }
 }
 
+/// #404 item 6 — the explicit CSRF posture for `POST /authorize`, checked
+/// BEFORE the pairing code is even looked at (so a cross-site auto-submit
+/// can neither succeed nor spend the shared lockout budget):
+/// - `Sec-Fetch-Site`, when present, must be `same-origin` (the consent
+///   form itself) or `none` (a user-initiated navigation). `cross-site` and
+///   `same-site` (a sibling subdomain) are refused.
+/// - `Origin`, when present, must pass [`request_origin_allowed`]: equal
+///   to the issuer origin, or `null` vouched for by
+///   `Sec-Fetch-Site: same-origin` (hub ruling). `null` otherwise is
+///   refused.
+///
+/// Absent headers pass: non-browser clients send neither, and the pairing
+/// code in the body remains what defeats a blind forged POST. The pairing
+/// code is deliberately NOT rotated after a successful authorization — it is
+/// the single-user gateway's standing device credential, and rotating it on
+/// every approval would break pairing a second client (see docs/gateway.md
+/// "CSRF posture"). The router-wide `host_guard` repeats the Origin rule;
+/// this copy keeps the guarantee local to the handler and unit-testable.
+///
+/// Returns which header caused the refusal (for the operator log only).
+fn cross_site_post_rejection(ctx: &AuthCtx, headers: &HeaderMap) -> Option<&'static str> {
+    if let Some(site) = headers.get("sec-fetch-site") {
+        if !matches!(site.to_str(), Ok("same-origin") | Ok("none")) {
+            return Some("Sec-Fetch-Site");
+        }
+    }
+    if !request_origin_allowed(headers, ctx.issuer()) {
+        return Some("Origin");
+    }
+    None
+}
+
 /// `POST {issuer}/authorize` (form-urlencoded) — the pairing gate.
+///
+/// Step 0: [`cross_site_post_rejection`] — refuse a cross-site POST with a
+/// 403 page before anything else runs (#404 item 6).
 ///
 /// Step 1: re-run [`validate_authorize_request`] over the RAW posted form —
 /// hidden fields are attacker-controlled input, so this NEVER trusts that a
@@ -1304,8 +1345,17 @@ async fn authorize_get_handler(
 /// 600-second (10-minute) TTL — then a 302 with `code`/`state`/`iss`.
 async fn authorize_post_handler(
     State(ctx): State<Arc<AuthCtx>>,
+    headers: HeaderMap,
     Form(params): Form<AuthorizeParams>,
 ) -> Response {
+    if let Some(which) = cross_site_post_rejection(&ctx, &headers) {
+        tracing::warn!(header = which, "rejected a cross-site POST /authorize");
+        return error_page(
+            StatusCode::FORBIDDEN,
+            "This authorization request did not come from the gateway's own consent page.",
+        );
+    }
+
     let validated = match validate_authorize_request(&ctx, &params) {
         Ok(v) => v,
         Err(AuthorizeError::NoRedirect(msg)) => {
@@ -2877,7 +2927,7 @@ mod tests {
     /// one test since both go through the SAME `html_response` call site —
     /// proving one proves the other, but asserting both here means a future
     /// edit that special-cases either path would still be caught. Also
-    /// checks `Referrer-Policy: no-referrer` (security review, Minor) on
+    /// checks `Referrer-Policy: same-origin` (security review, Minor) on
     /// both paths for the same reason.
     #[tokio::test]
     async fn authorize_html_responses_carry_frame_and_csp_headers() {
@@ -2908,8 +2958,8 @@ mod tests {
                 .headers()
                 .get(header::REFERRER_POLICY)
                 .and_then(|v| v.to_str().ok()),
-            Some("no-referrer"),
-            "consent form must set Referrer-Policy: no-referrer"
+            Some("same-origin"),
+            "consent form must set Referrer-Policy: same-origin (no-referrer makes browsers send Origin: null on the form POST)"
         );
 
         let bad_params = valid_params("does-not-exist", "https://claude.ai/cb", "s1");
@@ -2936,8 +2986,8 @@ mod tests {
                 .headers()
                 .get(header::REFERRER_POLICY)
                 .and_then(|v| v.to_str().ok()),
-            Some("no-referrer"),
-            "error page must set Referrer-Policy: no-referrer"
+            Some("same-origin"),
+            "error page must set Referrer-Policy: same-origin"
         );
     }
 
@@ -3235,6 +3285,186 @@ mod tests {
         assert!(
             !body.contains("<script>alert(1)</script>"),
             "raw XSS payload leaked in the wrong-code re-render: {body}"
+        );
+    }
+
+    // ── #404 items 5-6: consent identity signal + CSRF posture ───────────
+
+    async fn post_authorize_with_headers(
+        router: &Router,
+        pairs: &[(&str, &str)],
+        extra: &[(&str, &str)],
+    ) -> Response {
+        let mut builder = Request::builder().method("POST").uri("/authorize").header(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        );
+        for (name, value) in extra {
+            builder = builder.header(*name, *value);
+        }
+        router
+            .clone()
+            .oneshot(builder.body(Body::from(build_query(pairs))).unwrap())
+            .await
+            .unwrap()
+    }
+
+    fn minted_code_count(dir: &tempfile::TempDir) -> usize {
+        let path = dir.path().join("auth").join("codes.json");
+        if !path.exists() {
+            return 0;
+        }
+        let map: std::collections::BTreeMap<String, Value> =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        map.len()
+    }
+
+    #[tokio::test]
+    async fn get_authorize_shows_full_escaped_redirect_uri_and_flags_the_name_as_unverified() {
+        let (_dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
+        let redirect = "https://claude.ai/api/mcp/auth_callback?x=<b>&y=1";
+        let client_id = register_web_client(&ctx, Some("Claude"), redirect);
+        let resp = get_authorize(&router, &valid_params(&client_id, redirect, "s1")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_text(resp).await;
+        assert!(
+            body.contains(
+                "<code>https://claude.ai/api/mcp/auth_callback?x=&lt;b&gt;&amp;y=1</code>"
+            ),
+            "full escaped redirect_uri must be shown: {body}"
+        );
+        assert!(
+            body.contains(
+                "<h1>Authorize Claude <small>(name provided by the app — not verified)</small></h1>"
+            ),
+            "{body}"
+        );
+        assert!(
+            body.contains("<strong>claude.ai</strong>"),
+            "host line kept: {body}"
+        );
+        assert!(
+            !body.contains("<b>&"),
+            "raw redirect_uri must never appear: {body}"
+        );
+    }
+
+    /// CSRF posture (#404 item 6): fetch metadata saying "another site
+    /// started this" is refused BEFORE the pairing check — even with the
+    /// right code — so it mints nothing and spends no lockout budget.
+    #[tokio::test]
+    async fn post_authorize_cross_site_fetch_metadata_is_403_and_burns_no_attempt() {
+        let (dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
+        let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+        let real_code = ctx.store.lock().unwrap().pairing_code().unwrap();
+        let mut params = valid_params(&client_id, "https://claude.ai/cb", "s1");
+        params.push(("pairing_code", real_code.as_str()));
+
+        for site in ["cross-site", "same-site"] {
+            let resp =
+                post_authorize_with_headers(&router, &params, &[("sec-fetch-site", site)]).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{site}");
+            assert!(resp.headers().get(header::LOCATION).is_none(), "{site}");
+            let body = body_text(resp).await;
+            assert!(body.contains("did not come from the gateway"), "{body}");
+        }
+        assert_eq!(minted_code_count(&dir), 0);
+        let attempts = ctx.attempts.lock().unwrap();
+        assert_eq!(attempts.consecutive_failures, 0);
+        assert!(attempts.locked_until.is_none());
+    }
+
+    #[tokio::test]
+    async fn post_authorize_foreign_or_null_origin_is_403_even_with_the_right_code() {
+        let (dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
+        let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+        let real_code = ctx.store.lock().unwrap().pairing_code().unwrap();
+        let mut params = valid_params(&client_id, "https://claude.ai/cb", "s1");
+        params.push(("pairing_code", real_code.as_str()));
+
+        for origin in ["https://evil.example", "null", "http://localhost:7717"] {
+            let resp = post_authorize_with_headers(&router, &params, &[("origin", origin)]).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{origin}");
+        }
+        assert_eq!(minted_code_count(&dir), 0);
+    }
+
+    /// Review Focus 1: what a real browser sends from the consent page
+    /// (Origin = issuer, Sec-Fetch-Site same-origin), plus `none` (a
+    /// user-initiated navigation) and the no-headers case (non-browser).
+    #[tokio::test]
+    async fn post_authorize_same_origin_browser_submission_succeeds() {
+        for extra in [
+            vec![
+                ("origin", "http://127.0.0.1:7717"),
+                ("sec-fetch-site", "same-origin"),
+            ],
+            vec![("sec-fetch-site", "none")],
+            vec![],
+        ] {
+            let (_dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
+            let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+            let real_code = ctx.store.lock().unwrap().pairing_code().unwrap();
+            let mut params = valid_params(&client_id, "https://claude.ai/cb", "s1");
+            params.push(("pairing_code", real_code.as_str()));
+            let resp = post_authorize_with_headers(&router, &params, &extra).await;
+            assert_eq!(resp.status(), StatusCode::FOUND, "{extra:?}");
+        }
+    }
+
+    /// Hub ruling (Referrer-Policy question): a browser that serialises
+    /// `Origin: null` on the consent form's own POST is accepted when
+    /// `Sec-Fetch-Site: same-origin` vouches for it; `null` + `cross-site`
+    /// is 403 and mints nothing.
+    #[tokio::test]
+    async fn post_authorize_null_origin_passes_only_with_same_origin_fetch_metadata() {
+        let (_dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
+        let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+        let real_code = ctx.store.lock().unwrap().pairing_code().unwrap();
+        let mut params = valid_params(&client_id, "https://claude.ai/cb", "s1");
+        params.push(("pairing_code", real_code.as_str()));
+
+        let resp = post_authorize_with_headers(
+            &router,
+            &params,
+            &[("origin", "null"), ("sec-fetch-site", "cross-site")],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let resp = post_authorize_with_headers(
+            &router,
+            &params,
+            &[("origin", "null"), ("sec-fetch-site", "same-origin")],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FOUND);
+    }
+
+    /// A cross-site page auto-submitting wrong codes must not be able to
+    /// lock the owner out (it never reaches `check_pairing_code`).
+    #[tokio::test]
+    async fn post_authorize_cross_site_wrong_codes_cannot_trip_the_lockout() {
+        let (_dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
+        let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+        let real_code = ctx.store.lock().unwrap().pairing_code().unwrap();
+        let mut wrong = valid_params(&client_id, "https://claude.ai/cb", "s1");
+        wrong.push(("pairing_code", "WRONG-CODE"));
+        for _ in 0..(MAX_PAIRING_FAILURES + 1) {
+            let resp =
+                post_authorize_with_headers(&router, &wrong, &[("sec-fetch-site", "cross-site")])
+                    .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+        let mut right = valid_params(&client_id, "https://claude.ai/cb", "s1");
+        right.push(("pairing_code", real_code.as_str()));
+        let resp =
+            post_authorize_with_headers(&router, &right, &[("sec-fetch-site", "same-origin")])
+                .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FOUND,
+            "owner must not be locked out"
         );
     }
 
