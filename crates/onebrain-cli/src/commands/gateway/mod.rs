@@ -218,7 +218,7 @@ fn resolve_issuer(public_url: Option<&str>, bound: SocketAddr) -> String {
 ///   the one exception (mirrors [`resolve_issuer`]'s own trim): `"https://x.example/"`
 ///   is valid, `"https://x.example/mcp"` is not.
 /// - `http://` is accepted ONLY for a loopback host (`localhost` /
-///   `127.0.0.1` — the same definition
+///   `127.0.0.1` / `[::1]` — the same set
 ///   `oauth_routes::is_loopback_redirect_uri` uses); every other host must
 ///   use `https://`, or the resolved issuer would be silently insecure.
 fn validate_public_url(raw: &str) -> Result<(), String> {
@@ -241,13 +241,29 @@ fn validate_public_url(raw: &str) -> Result<(), String> {
     }
     if authority.contains(['/', '?', '#']) {
         return Err(
-            "must be a bare origin (scheme://host[:port]) with no path, query, or fragment"
+            "must be a bare origin (scheme://host[:port]) with no path, query, or fragment — \
+             the gateway serves its OAuth endpoints at the origin root and the consent page \
+             posts to the root-relative /authorize, so a path-prefixed deployment would break \
+             pairing"
                 .to_string(),
         );
     }
 
-    let host = authority.split(':').next().unwrap_or(authority);
-    let is_loopback = host == "localhost" || host == "127.0.0.1";
+    // Bracket-aware: an IPv6 literal (`[::1]:7717`) contains colons, so a
+    // plain `split(':')` would yield `[` as the host.
+    let host = if authority.starts_with('[') {
+        let Some(end) = authority.find(']') else {
+            return Err("has an unterminated IPv6 address literal".to_string());
+        };
+        let after = &authority[end + 1..];
+        if !(after.is_empty() || after.starts_with(':')) {
+            return Err("has a malformed host".to_string());
+        }
+        &authority[..=end]
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+    let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
 
     match scheme {
         "https" => Ok(()),
@@ -723,6 +739,36 @@ mod tests {
     #[test]
     fn validate_public_url_accepts_and_trims_a_trailing_slash() {
         assert!(validate_public_url("https://gw.example.com/").is_ok());
+    }
+
+    #[test]
+    fn validate_public_url_accepts_ipv6_loopback_http() {
+        assert!(validate_public_url("http://[::1]:7717").is_ok());
+        assert!(validate_public_url("http://[::1]").is_ok());
+        assert!(validate_public_url("https://[::1]:7717").is_ok());
+    }
+
+    #[test]
+    fn validate_public_url_rejects_non_loopback_or_malformed_ipv6() {
+        let err = validate_public_url("http://[2001:db8::1]:7717").unwrap_err();
+        assert!(err.contains("https"), "{err}");
+        assert!(validate_public_url("http://[::1").is_err());
+        assert!(validate_public_url("http://[::1]evil").is_err());
+    }
+
+    /// #404 item 4: a path-prefixed deployment (`https://host/onebrain`) is
+    /// refused, AND the message says why: the gateway serves OAuth at the
+    /// origin root and the consent form posts to the root-relative
+    /// `/authorize`, which would escape the prefix.
+    #[test]
+    fn validate_public_url_rejects_a_path_prefixed_deployment_and_says_why() {
+        let err = validate_public_url("https://gw.example.com/onebrain").unwrap_err();
+        assert!(err.contains("path"), "{err}");
+        assert!(
+            err.contains("/authorize"),
+            "must explain the consent-form reason: {err}"
+        );
+        assert!(err.contains("root"), "{err}");
     }
 
     #[test]

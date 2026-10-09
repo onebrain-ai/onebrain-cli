@@ -463,8 +463,14 @@ fn oauth_error(status: StatusCode, code: &'static str, description: impl Into<St
         .into_response()
 }
 
-/// Is `uri` a loopback redirect URI per RFC 8252 §7.3 — `http://localhost`
-/// or `http://127.0.0.1`, with an optional `:<port>` and/or `/<path>` after?
+/// The RFC 8252 §7.3 loopback hosts a native client may register, in the
+/// exact form they appear after `http://` (IPv6 in brackets). Shared by
+/// [`is_loopback_redirect_uri`] and [`loopback_host_and_path`] so the two
+/// can never disagree.
+const LOOPBACK_REDIRECT_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "[::1]"];
+
+/// Is `uri` a loopback redirect URI per RFC 8252 §7.3 — `http://localhost`,
+/// `http://127.0.0.1`, or `http://[::1]`, with an optional `:<port>` and/or `/<path>` after?
 ///
 /// This is a real HOST-BOUNDARY check, not a bare string-prefix match.
 /// `"http://localhost"` is also a string PREFIX of
@@ -490,7 +496,7 @@ fn oauth_error(status: StatusCode, code: &'static str, description: impl Into<St
 /// particular no `@`. `http://127.0.0.1:` (colon, zero digits) is rejected
 /// too (`digits > 0` below).
 fn is_loopback_redirect_uri(uri: &str) -> bool {
-    for host in ["localhost", "127.0.0.1"] {
+    for host in LOOPBACK_REDIRECT_HOSTS {
         let prefix = format!("http://{host}");
         let Some(rest) = uri.strip_prefix(prefix.as_str()) else {
             continue;
@@ -641,8 +647,8 @@ async fn register_client_handler(
                     format!("redirect_uri must use https:// for a web client: {uri:?}")
                 }
                 AppType::Native => format!(
-                    "redirect_uri must be a loopback http://localhost or http://127.0.0.1 \
-                     address for a native client: {uri:?}"
+                    "redirect_uri must be a loopback http://localhost, http://127.0.0.1, or \
+                     http://[::1] address for a native client: {uri:?}"
                 ),
             };
             return oauth_error(StatusCode::BAD_REQUEST, "invalid_redirect_uri", msg);
@@ -888,11 +894,11 @@ fn redirect_uri_registered(client: &RegisteredClient, presented: &str) -> bool {
 /// with any `:<port>` dropped — the port-insensitive comparison key for
 /// native redirect_uri matching. Purely a normalization helper on a value
 /// [`is_loopback_redirect_uri`] already proved has one of the exact
-/// shapes `http://{localhost,127.0.0.1}[:<digits>](/…)?` — it does not
+/// shapes `http://{localhost,127.0.0.1,[::1]}[:<digits>](/…)?` — it does not
 /// re-decide safety, only where the port digits sit so they can be
 /// discarded.
 fn loopback_host_and_path(uri: &str) -> Option<(&'static str, &str)> {
-    for host in ["localhost", "127.0.0.1"] {
+    for host in LOOPBACK_REDIRECT_HOSTS {
         let prefix = format!("http://{host}");
         if let Some(rest) = uri.strip_prefix(prefix.as_str()) {
             let path = match rest.strip_prefix(':') {
@@ -2169,6 +2175,64 @@ mod tests {
     /// The happy-path loopback shapes must still all pass after the fix —
     /// a regression guard that the stricter port parsing didn't collaterally
     /// reject well-formed URIs.
+    #[test]
+    fn is_loopback_redirect_uri_accepts_ipv6_loopback_with_a_host_boundary() {
+        for ok in [
+            "http://[::1]",
+            "http://[::1]/cb",
+            "http://[::1]:8123",
+            "http://[::1]:8123/cb",
+        ] {
+            assert!(is_loopback_redirect_uri(ok), "{ok}");
+        }
+        for bad in [
+            "http://[::1].evil.example/cb",
+            "http://[::1]:80@evil.example/cb",
+            "http://[::1]:",
+            "http://[::1]evil/cb",
+            "http://[::2]/cb",
+            "https://[::1]/cb",
+        ] {
+            assert!(!is_loopback_redirect_uri(bad), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn register_native_client_with_ipv6_loopback_redirect_is_accepted() {
+        let (_dir, router) = register_router_with_issuer("http://127.0.0.1:7717");
+        let (status, body) = post_json(
+            &router,
+            "/register",
+            json!({
+                "application_type": "native",
+                "redirect_uris": ["http://[::1]:8123/callback"],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+
+    #[test]
+    fn redirect_uri_registered_native_ipv6_is_port_insensitive_but_host_exact() {
+        let client = RegisteredClient {
+            client_id: "c".to_string(),
+            client_name: None,
+            redirect_uris: vec!["http://[::1]:5000/cb".to_string()],
+            application_type: AppType::Native,
+            created: 0,
+        };
+        assert!(redirect_uri_registered(&client, "http://[::1]:61234/cb"));
+        assert!(redirect_uri_registered(&client, "http://[::1]/cb"));
+        assert!(!redirect_uri_registered(
+            &client,
+            "http://127.0.0.1:61234/cb"
+        ));
+        assert!(!redirect_uri_registered(
+            &client,
+            "http://[::1]:61234/other"
+        ));
+    }
+
     #[tokio::test]
     async fn register_accepts_well_formed_loopback_shapes_after_userinfo_confusion_fix() {
         let (_dir, router) = register_router_with_issuer("http://127.0.0.1:7717");

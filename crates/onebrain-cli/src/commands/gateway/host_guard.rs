@@ -360,6 +360,23 @@ mod tests {
         assert_eq!(allowed_hosts(None), vec!["localhost", "127.0.0.1", "::1"]);
     }
 
+    /// `validate_public_url` accepts the bracketed `[::1]`; `allowed_hosts`
+    /// stores the bracket-stripped form. They must agree: the IPv6 loopback
+    /// public_url adds nothing new (already in the loopback list) and every
+    /// shape `validate_public_url` accepts yields a host in the list.
+    #[test]
+    fn allowed_hosts_agrees_with_validate_public_url_on_ipv6() {
+        for url in ["http://[::1]:7717", "http://[::1]", "https://[::1]:7717"] {
+            assert!(super::super::validate_public_url(url).is_ok(), "{url}");
+            assert_eq!(
+                allowed_hosts(Some(url)),
+                vec!["localhost", "127.0.0.1", "::1"],
+                "{url}"
+            );
+        }
+        assert!(allowed_hosts(Some("https://[2001:db8::1]")).contains(&"2001:db8::1".to_string()));
+    }
+
     #[test]
     fn allowed_hosts_adds_the_normalised_public_url_host_once() {
         assert_eq!(
