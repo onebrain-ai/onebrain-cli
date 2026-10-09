@@ -486,6 +486,69 @@ fn read_pairing_code(home: &Path) -> String {
     })
 }
 
+/// Copied (not shared — see module docs) from `gateway_http.rs::plant_valid_access_token`:
+/// writes one live ACCESS `TokenRecord` straight into the sandboxed
+/// `$HOME/.onebrain/gateway/tokens.json`, in the exact shape `AuthStore`
+/// persists.
+fn plant_valid_access_token(home: &Path, token: &str) {
+    let dir = home.join(".onebrain").join("gateway");
+    std::fs::create_dir_all(&dir).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut tokens = serde_json::Map::new();
+    tokens.insert(
+        token.to_string(),
+        serde_json::json!({
+            "token": token,
+            "kind": "access",
+            "family": "gateway-revoke-e2e-family",
+            "client_id": "gateway-revoke-e2e",
+            "scope": "brain",
+            "expires": now + 3600,
+            "revoked": false,
+            "rotated_to": null,
+        }),
+    );
+    std::fs::write(
+        dir.join("tokens.json"),
+        serde_json::to_vec_pretty(&serde_json::Value::Object(tokens)).unwrap(),
+    )
+    .unwrap();
+}
+
+/// One live REFRESH `TokenRecord` (no `resource` key — the pre-#404 shape,
+/// which `#[serde(default)]` must keep loading), written straight into the
+/// sandboxed `tokens.json` before the first `/token` call.
+fn plant_refresh_token(home: &Path, token: &str) {
+    let dir = home.join(".onebrain").join("gateway");
+    std::fs::create_dir_all(&dir).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut tokens = serde_json::Map::new();
+    tokens.insert(
+        token.to_string(),
+        serde_json::json!({
+            "token": token,
+            "kind": "refresh",
+            "family": "gateway-refresh-e2e-family",
+            "client_id": "gateway-refresh-e2e",
+            "scope": "brain",
+            "expires": now + 3600,
+            "revoked": false,
+            "rotated_to": null,
+        }),
+    );
+    std::fs::write(
+        dir.join("tokens.json"),
+        serde_json::to_vec_pretty(&serde_json::Value::Object(tokens)).unwrap(),
+    )
+    .unwrap();
+}
+
 /// Set up a minimal fixture vault (one dated task) and a machine-level
 /// `~/.onebrain/gateway.yml` naming it as the default vault — same shape as
 /// `gateway_http.rs`'s own happy-path fixture, trimmed to what step 6 needs
@@ -990,4 +1053,163 @@ fn gateway_pair_verb_prints_and_rotates_the_pairing_code() {
         rotated.contains(&on_disk_after_rotate),
         "printed rotated code did not match the persisted code"
     );
+}
+
+/// #406 / hub decision D5: `onebrain gateway tokens revoke` from a SECOND
+/// process takes effect on the running gateway's very next request, with no
+/// restart and no IPC. The server re-reads `tokens.json` per request
+/// (`store.rs` module docs), and the CLI's write holds `auth.lock`.
+#[test]
+fn gateway_tokens_revoke_takes_effect_on_the_running_gateways_next_request() {
+    const TOKEN: &str = "revoke-e2e-access-token-0123456789abcdefghijklmnop";
+    let home = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let cwd = tempdir().unwrap();
+    let stdout_path = cwd.path().join("gateway-stdout.log");
+    let stderr_path = cwd.path().join("gateway-stderr.log");
+    let mut child = KillOnDrop(spawn_gateway(
+        cache.path(),
+        home.path(),
+        cwd.path(),
+        &stdout_path,
+        &stderr_path,
+    ));
+    let mcp_url = wait_for_gateway_url(&mut child.0, &stdout_path, &stderr_path);
+    let agent = http_agent();
+    plant_valid_access_token(home.path(), TOKEN);
+
+    let headers = [("MCP-Protocol-Version", PROTOCOL)];
+    let (status, _) = post_mcp(&agent, &mcp_url, TOKEN, &init_body(1), &headers);
+    assert_eq!(
+        status, 200,
+        "the planted token must authenticate before revocation"
+    );
+
+    let cli = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_onebrain"))
+            .env("ONEBRAIN_CACHE_DIR", cache.path())
+            .env("HOME", home.path())
+            .env("USERPROFILE", home.path())
+            .env_remove("ONEBRAIN_VAULT")
+            .current_dir(cwd.path())
+            .args(args)
+            .output()
+            .unwrap_or_else(|e| panic!("spawn onebrain {args:?}: {e}"))
+    };
+    let listed = cli(&["gateway", "tokens", "list", "--json"]);
+    assert!(listed.status.success());
+    let listed_text = String::from_utf8_lossy(&listed.stdout).into_owned();
+    assert!(
+        !listed_text.contains(TOKEN),
+        "tokens list leaked the token value"
+    );
+    let v: serde_json::Value = serde_json::from_str(&listed_text).unwrap();
+    let id = v["data"]["tokens"][0]["id"].as_str().unwrap().to_string();
+    let digest = Sha256::digest(TOKEN.as_bytes());
+    let mut expected = String::with_capacity(12);
+    for &b in &digest[..6] {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        expected.push(HEX[(b >> 4) as usize] as char);
+        expected.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    assert_eq!(id, expected, "display id must be sha256(token)[..12 hex]");
+
+    let revoked = cli(&["gateway", "tokens", "revoke", &id]);
+    assert!(
+        revoked.status.success(),
+        "tokens revoke failed: {}",
+        String::from_utf8_lossy(&revoked.stderr)
+    );
+
+    let (status, body) = post_mcp(&agent, &mcp_url, TOKEN, &init_body(2), &headers);
+    assert_eq!(
+        status, 401,
+        "a CLI revoke must take effect on the next request: {body}"
+    );
+    assert!(
+        child.0.try_wait().expect("poll gateway child").is_none(),
+        "the gateway must stay up — no restart involved"
+    );
+    assert_exits_after_kill(&mut child.0);
+}
+/// Red-team blocker 1 (T1 × T2 lock seam): the running gateway's `/token`
+/// refresh path goes through the INNER `rotate_refresh_for_client`, which
+/// now takes `auth.lock`. A double lock (wrapper + inner, or a locked method
+/// calling another) deadlocks the request; ureq's 30 s global timeout turns
+/// that into a panic here instead of a hung test. Also proves the server
+/// releases the lock between requests (a second rotation and a CLI read
+/// both complete) and that reuse detection still works under the lock.
+#[test]
+fn token_refresh_through_the_running_gateway_completes_under_the_auth_lock() {
+    const REFRESH: &str = "refresh-e2e-refresh-token-0123456789abcdefghijklmn";
+    let home = tempdir().unwrap();
+    let cache = tempdir().unwrap();
+    let cwd = tempdir().unwrap();
+    let stdout_path = cwd.path().join("gateway-stdout.log");
+    let stderr_path = cwd.path().join("gateway-stderr.log");
+    let mut child = KillOnDrop(spawn_gateway(
+        cache.path(),
+        home.path(),
+        cwd.path(),
+        &stdout_path,
+        &stderr_path,
+    ));
+    let mcp_url = wait_for_gateway_url(&mut child.0, &stdout_path, &stderr_path);
+    let token_url = format!("{}/token", mcp_url.trim_end_matches("/mcp"));
+    let agent = http_agent(); // 30 s global timeout = the deadlock detector
+    plant_refresh_token(home.path(), REFRESH);
+
+    let started = Instant::now();
+    let refresh = |rt: &str| {
+        post_token(
+            &agent,
+            &token_url,
+            &[("grant_type", "refresh_token"), ("refresh_token", rt)],
+        )
+    };
+    // Never interpolate a token or a response body (it carries new tokens)
+    // into an assertion message — CodeQL `rust/cleartext-logging`.
+    let (status, body) = refresh(REFRESH);
+    assert_eq!(status, 200, "first refresh failed ({} bytes)", body.len());
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let next = v["refresh_token"].as_str().unwrap().to_string();
+
+    let (status, body) = refresh(&next);
+    assert_eq!(status, 200, "second refresh failed ({} bytes)", body.len());
+
+    // Replaying the spent token is reuse → family burned → invalid_grant.
+    let (status, _) = refresh(REFRESH);
+    assert_eq!(
+        status, 400,
+        "a replayed refresh token must be invalid_grant"
+    );
+
+    // A second process can still take the lock (the server released it).
+    let cli_write = Command::new(env!("CARGO_BIN_EXE_onebrain"))
+        .env("ONEBRAIN_CACHE_DIR", cache.path())
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env_remove("ONEBRAIN_VAULT")
+        .current_dir(cwd.path())
+        .args([
+            "gateway",
+            "tokens",
+            "revoke",
+            "--client",
+            "gateway-refresh-e2e",
+        ])
+        .output()
+        .unwrap();
+    // `revoke --client` takes `auth.lock` (the family is already burned, so
+    // it reports `already_revoked` and exits 0).
+    assert!(
+        cli_write.status.success(),
+        "a CLI write after the refreshes failed"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "refresh round-trips took {:?} — lock contention?",
+        started.elapsed()
+    );
+    assert_exits_after_kill(&mut child.0);
 }
