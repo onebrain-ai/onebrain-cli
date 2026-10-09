@@ -63,6 +63,7 @@ use crate::commands::gateway::audit::{AuditEntry, AuditLog, Decision, Outcome};
 use crate::commands::gateway::auth::core::{mint_secret_32, now_epoch_secs};
 use crate::commands::gateway::auth::middleware::require_bearer;
 use crate::commands::gateway::auth::Principal;
+use crate::commands::gateway::host_guard::{self, require_allowed_host, HostGuard};
 use crate::commands::gateway::oauth_routes::{
     authorize_router, register_router, token_router, well_known_router, AuthCtx,
 };
@@ -2264,15 +2265,29 @@ impl ServerHandler for GatewayServer {
 /// `tests::token_is_reachable_without_auth_on_the_real_router`, and
 /// `tests::approvals_route_is_merged_into_the_real_router_and_ignores_a_connector_bearer_token`
 /// for the proof.
+///
+/// **Host/Origin guard (#404):** [`require_allowed_host`] is the OUTERMOST
+/// layer, applied after every merge, so a DNS-rebinding `Host` or a
+/// foreign-`Origin` POST is refused before ANY route (including the Bearer
+/// gate) runs. The same allowed-host list is handed to rmcp so `/mcp`
+/// accepts the `public_url` host too. See `host_guard.rs`'s module docs and
+/// `tests::every_non_mcp_route_rejects_a_rebinding_host_on_the_real_router` /
+/// `tests::public_url_host_reaches_oauth_and_mcp_through_both_guards`.
 pub fn build_gateway_router(state: Arc<GatewayState>, auth_ctx: Arc<AuthCtx>) -> axum::Router {
     // Cloned BEFORE the `move` closure below takes ownership of `state` for
     // the `/mcp` factory's own per-request `state.clone()` — `approval_router`
     // needs its own handle on the SAME `Arc<GatewayState>` afterward.
     let approvals_state = state.clone();
 
+    // #404 items 1-2: ONE allowed-host list, derived from the `public_url`
+    // `GatewayState` already carries (no signature change), feeds BOTH
+    // rmcp's `/mcp` guard and the router-wide `require_allowed_host` below.
+    let allowed_hosts = host_guard::allowed_hosts(state.config.public_url.as_deref());
+
     let config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
-        .with_json_response(true);
+        .with_json_response(true)
+        .with_allowed_hosts(allowed_hosts.clone());
     let service: StreamableHttpService<GatewayServer, LocalSessionManager> =
         StreamableHttpService::new(
             move || Ok(GatewayServer::new(state.clone())),
@@ -2282,12 +2297,19 @@ pub fn build_gateway_router(state: Arc<GatewayState>, auth_ctx: Arc<AuthCtx>) ->
     let mcp_router = axum::Router::new().nest_service("/mcp", service).layer(
         axum::middleware::from_fn_with_state(auth_ctx.clone(), require_bearer),
     );
+    let host_guard = Arc::new(HostGuard::new(allowed_hosts, auth_ctx.clone()));
     mcp_router
         .merge(well_known_router(auth_ctx.clone()))
         .merge(register_router(auth_ctx.clone()))
         .merge(authorize_router(auth_ctx.clone()))
         .merge(token_router(auth_ctx.clone()))
         .merge(approval_router(approvals_state, auth_ctx))
+        // LAST, after every merge, so it wraps the whole surface (an axum
+        // `.layer` only wraps routes that exist when it is called).
+        .layer(axum::middleware::from_fn_with_state(
+            host_guard,
+            require_allowed_host,
+        ))
 }
 
 #[cfg(test)]
@@ -3403,6 +3425,7 @@ mod tests {
             let req = Request::builder()
                 .method("GET")
                 .uri(path)
+                .header("host", "localhost")
                 .body(Body::empty())
                 .unwrap();
             let resp = router.clone().oneshot(req).await.unwrap();
@@ -3437,6 +3460,7 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri("/register")
+            .header("host", "localhost")
             .header("content-type", "application/json")
             .body(Body::from(
                 serde_json::json!({
@@ -3467,6 +3491,7 @@ mod tests {
         let req = Request::builder()
             .method("GET")
             .uri("/authorize?response_type=code&client_id=nope&redirect_uri=https%3A%2F%2Fx.example%2Fcb&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256")
+            .header("host", "localhost")
             .body(Body::empty())
             .unwrap();
         let resp = router.clone().oneshot(req).await.unwrap();
@@ -3491,6 +3516,7 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri("/token")
+            .header("host", "localhost")
             .header("content-type", "application/x-www-form-urlencoded")
             .body(Body::from("grant_type=client_credentials"))
             .unwrap();
@@ -3500,6 +3526,274 @@ mod tests {
             StatusCode::UNAUTHORIZED,
             "/token must be public — no Authorization header was sent"
         );
+    }
+
+    /// Same shape as [`fixture_router`] minus the task fixture, but with
+    /// `public_url` set — exercises `build_gateway_router`'s derivation of
+    /// the allowed-host list from `state.config.public_url`.
+    fn fixture_router_with_public_url(
+        public_url: &str,
+    ) -> (tempfile::TempDir, axum::Router, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("onebrain.yml"), "folders: {}\n").unwrap();
+        let mut vaults = BTreeMap::new();
+        vaults.insert("t1".to_string(), root.to_path_buf());
+        let config = GatewayConfig {
+            default_vault: Some(root.to_path_buf()),
+            vaults,
+            public_url: Some(public_url.to_string()),
+            ..GatewayConfig::default()
+        };
+        let audit = AuditLog::open_at(audit_log_path(root)).unwrap();
+        let state = Arc::new(GatewayState::new(config, audit));
+        let (auth_ctx, token) = test_auth_ctx(root);
+        (dir, build_gateway_router(state, auth_ctx), token)
+    }
+
+    /// One request with exactly the given headers (no implicit `host`, unlike
+    /// [`post`]) → `(status, body text)`.
+    async fn raw_request(
+        router: &axum::Router,
+        method: &str,
+        uri: &str,
+        headers: &[(&str, &str)],
+        body: Body,
+    ) -> (StatusCode, String) {
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let res = router
+            .clone()
+            .oneshot(builder.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    const REAL_ROUTER_AUTHORIZE_URI: &str = "/authorize?response_type=code&client_id=nope&redirect_uri=https%3A%2F%2Fx.example%2Fcb&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256";
+
+    /// #404 item 1: every non-`/mcp` route on the REAL router refuses a
+    /// DNS-rebinding `Host` before any handler runs.
+    #[tokio::test]
+    async fn every_non_mcp_route_rejects_a_rebinding_host_on_the_real_router() {
+        let (_dir, router, _token) = fixture_router();
+        let cases: [(&str, &str, Option<&str>, &'static str); 6] = [
+            ("GET", "/.well-known/oauth-protected-resource", None, ""),
+            ("GET", "/.well-known/oauth-authorization-server", None, ""),
+            (
+                "POST",
+                "/register",
+                Some("application/json"),
+                r#"{"redirect_uris":["https://claude.ai/api/mcp/auth_callback"]}"#,
+            ),
+            ("GET", REAL_ROUTER_AUTHORIZE_URI, None, ""),
+            (
+                "POST",
+                "/token",
+                Some("application/x-www-form-urlencoded"),
+                "grant_type=client_credentials",
+            ),
+            ("GET", "/approvals", None, ""),
+        ];
+        for (method, uri, content_type, body) in cases {
+            let mut headers = vec![("host", "evil.example")];
+            if let Some(ct) = content_type {
+                headers.push(("content-type", ct));
+            }
+            let (status, text) =
+                raw_request(&router, method, uri, &headers, Body::from(body)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}: {text}");
+            assert_eq!(text, "Forbidden: Host header is not allowed");
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_hosts_reach_the_oauth_routes_on_the_real_router() {
+        let (_dir, router, _token) = fixture_router();
+        for host in ["localhost:7717", "127.0.0.1:7717", "[::1]:7717"] {
+            let (status, text) = raw_request(
+                &router,
+                "GET",
+                "/.well-known/oauth-authorization-server",
+                &[("host", host)],
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{host}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_host_is_400_on_the_real_router() {
+        let (_dir, router, _token) = fixture_router();
+        let (status, text) = raw_request(
+            &router,
+            "GET",
+            "/.well-known/oauth-authorization-server",
+            &[],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    }
+
+    /// #404 item 1 (Origin half): a browser-issued POST from a foreign
+    /// origin is refused even on a loopback Host; the issuer's own origin
+    /// is not.
+    #[tokio::test]
+    async fn foreign_origin_on_a_state_changing_oauth_request_is_403_on_the_real_router() {
+        let (_dir, router, _token) = fixture_router();
+        let body = r#"{"redirect_uris":["https://claude.ai/api/mcp/auth_callback"]}"#;
+        let (status, text) = raw_request(
+            &router,
+            "POST",
+            "/register",
+            &[
+                ("host", "localhost"),
+                ("content-type", "application/json"),
+                ("origin", "https://evil.example"),
+            ],
+            Body::from(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+        assert_eq!(text, "Forbidden: Origin header is not allowed");
+
+        let (status, text) = raw_request(
+            &router,
+            "POST",
+            "/register",
+            &[
+                ("host", "localhost"),
+                ("content-type", "application/json"),
+                ("origin", "http://127.0.0.1:7717"),
+            ],
+            Body::from(body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{text}");
+    }
+
+    /// #404 item 2 — the functional landmine: with `public_url` set, `/mcp`
+    /// must accept the tunnel hostname. rmcp's default `allowed_hosts` is
+    /// loopback-only and would 403 this request.
+    #[tokio::test]
+    async fn public_url_host_reaches_oauth_and_mcp_through_both_guards() {
+        let (_dir, router, token) = fixture_router_with_public_url("https://gw.example.com");
+        let (status, text) = raw_request(
+            &router,
+            "GET",
+            "/.well-known/oauth-authorization-server",
+            &[("host", "gw.example.com")],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+
+        let auth = format!("Bearer {token}");
+        let (status, text) = raw_request(
+            &router,
+            "POST",
+            "/mcp",
+            &[
+                ("host", "gw.example.com"),
+                ("content-type", "application/json"),
+                ("accept", "application/json, text/event-stream"),
+                ("authorization", auth.as_str()),
+            ],
+            Body::from(init_body(1, PROTOCOL)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        assert!(text.contains("\"result\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn mcp_rejects_a_foreign_host_even_with_a_valid_token() {
+        let (_dir, router, token) = fixture_router();
+        let auth = format!("Bearer {token}");
+        let (status, _) = raw_request(
+            &router,
+            "POST",
+            "/mcp",
+            &[
+                ("host", "evil.example"),
+                ("content-type", "application/json"),
+                ("accept", "application/json, text/event-stream"),
+                ("authorization", auth.as_str()),
+            ],
+            Body::from(init_body(1, PROTOCOL)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// Hub ruling (Hub question 2): `/mcp` is EXEMPT from the router-wide
+    /// Origin rule — Bearer auth already blocks cross-site use, so an MCP
+    /// client that sends an `Origin` must not be 403'd by our guard.
+    /// (rmcp's own guard checks Host only.) `mcp_rejects_a_foreign_host…`
+    /// above keeps the Host half pinned.
+    #[tokio::test]
+    async fn mcp_post_with_a_foreign_origin_passes_the_guard_because_mcp_is_exempt() {
+        let (_dir, router, token) = fixture_router();
+        let auth = format!("Bearer {token}");
+        let (status, text) = raw_request(
+            &router,
+            "POST",
+            "/mcp",
+            &[
+                ("host", "localhost"),
+                ("origin", "https://evil.example"),
+                ("content-type", "application/json"),
+                ("accept", "application/json, text/event-stream"),
+                ("authorization", auth.as_str()),
+            ],
+            Body::from(init_body(1, PROTOCOL)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+    }
+
+    /// Red-team item 5: the tunnel host never reaches `/approvals` — not
+    /// even with the right pairing code — while loopback still does.
+    #[tokio::test]
+    async fn approvals_through_the_public_url_host_is_403_on_the_real_router() {
+        let (dir, router, _token) = fixture_router_with_public_url("https://gw.example.com");
+        // `test_auth_ctx` opens its store at `<root>/gateway-auth`.
+        let code = AuthStore::open_at(dir.path().join("gateway-auth"))
+            .unwrap()
+            .pairing_code()
+            .unwrap();
+        let (status, text) = raw_request(
+            &router,
+            "GET",
+            "/approvals",
+            &[
+                ("host", "gw.example.com"),
+                ("x-onebrain-pairing", code.as_str()),
+            ],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{text}");
+        assert_eq!(text, "Forbidden: /approvals is loopback-only");
+
+        let (status, _) = raw_request(
+            &router,
+            "GET",
+            "/approvals",
+            &[
+                ("host", "127.0.0.1:7717"),
+                ("x-onebrain-pairing", code.as_str()),
+            ],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
     }
 
     // ── Gateway PR 4, Task 2: policy engine + Principal wiring ───────────
@@ -3846,6 +4140,7 @@ mod tests {
         let req = Request::builder()
             .method("GET")
             .uri("/approvals")
+            .header("host", "localhost")
             .header("authorization", format!("Bearer {token}"))
             .body(Body::empty())
             .unwrap();
