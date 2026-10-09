@@ -100,7 +100,7 @@ fn spawn_gateway(
 /// stderr, never with stdout in any form and never with either stream raw —
 /// see `gateway_http.rs::wait_for_gateway_url` for the full reasoning (the
 /// capture files are deleted during this panic's own unwind, so a byte count
-/// would leave no diagnostic anywhere; stdout carries the pairing code;
+/// would leave no diagnostic anywhere; stdout carries the pairing code when it is a terminal (never in these harnesses, which pipe it);
 /// stderr carries host paths). All three gateway harnesses share one
 /// redactor, [`support::redacted_capture_tail`], and
 /// `gateway_http.rs::gateway_startup_failure_panic_carries_a_redacted_stderr_tail`
@@ -537,20 +537,24 @@ fn gateway_oauth_full_authorization_code_and_refresh_rotation_flow() {
     // code at the very end (see the final assertion).
     let mut captured_bodies: Vec<(&'static str, String)> = Vec::new();
 
-    // `gateway run` must have printed the pairing-code startup line — the
-    // ONLY channel a pairing code is ever shown on (see `commands/gateway/
-    // mod.rs`'s module docs). Checked now: `wait_for_gateway_url` already
-    // proved the stdout file is being flushed promptly (`println!` uses a
-    // `LineWriter` regardless of TTY status, so this line — printed BEFORE
-    // the "gateway listening" line — is already on disk too).
+    // Red-team item 5 (#404): stdout here is a FILE (as under launchd), so
+    // `gateway run` must NOT print the pairing code — only a pointer to
+    // `onebrain gateway pair`. Checked now: `wait_for_gateway_url` already
+    // proved the stdout file is flushed promptly (`println!` uses a
+    // `LineWriter` regardless of TTY status, and this line is printed BEFORE
+    // the "gateway listening" line).
     let stdout_so_far = std::fs::read_to_string(&stdout_path).unwrap_or_default();
-    // Security: `stdout_so_far` already contains the real, live pairing
-    // code by design at this point (the very thing this assertion checks
-    // for) — never interpolate it whole into the message (CodeQL
-    // `rust/cleartext-logging`).
+    let pairing_code_now = read_pairing_code(home.path());
+    // Security: never interpolate stdout or the code into a message
+    // (CodeQL `rust/cleartext-logging`).
     assert!(
-        stdout_so_far.contains("pairing code: "),
-        "gateway run must print the pairing-code startup line ({} bytes of stdout captured)",
+        !stdout_so_far.contains(&pairing_code_now),
+        "gateway run printed the pairing code to a non-terminal stdout ({} bytes captured)",
+        stdout_so_far.len()
+    );
+    assert!(
+        stdout_so_far.contains("run `onebrain gateway pair` to see it"),
+        "gateway run must point a non-terminal stdout at `onebrain gateway pair` ({} bytes captured)",
         stdout_so_far.len()
     );
 

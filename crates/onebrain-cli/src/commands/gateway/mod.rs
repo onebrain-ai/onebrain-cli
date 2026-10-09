@@ -9,8 +9,9 @@
 //! denied and in-flight requests get at most [`SHUTDOWN_GRACE`].
 //!
 //! OAuth: `run` opens the gateway's [`auth::AuthStore`], prints the current
-//! device-pairing code to stdout (the ONLY place it's ever shown — never
-//! logged, never returned over HTTP), and builds the
+//! device-pairing code to stdout **when stdout is a terminal** (the ONLY place
+//! it's ever shown — never logged, never returned over HTTP; otherwise it
+//! points to `onebrain gateway pair`), and builds the
 //! [`oauth_routes::AuthCtx`] every OAuth/resource-server route shares. The
 //! issuer is resolved (via [`resolve_issuer`]) and set exactly once inside
 //! `on_bind`, after the listener is confirmed up
@@ -28,6 +29,7 @@ pub mod approval_routes;
 pub mod audit;
 pub mod auth;
 pub mod config;
+pub mod host_guard;
 pub mod oauth_routes;
 pub mod policy;
 pub mod server;
@@ -167,8 +169,8 @@ fn log_filter_from(raw: Option<String>) -> tracing_subscriber::EnvFilter {
 /// - ANSI is enabled only when stderr is a real terminal (the crate's
 ///   existing `std::io::IsTerminal` convention — see `banner.rs`), so a
 ///   redirected `2>gateway.log` gets clean text and a terminal gets colour.
-/// - stdout is untouched. `run`'s pairing-code line and the
-///   `gateway listening on …` line are a deliberate plain-`println!` stdout
+/// - stdout is untouched. `run`'s pairing-code line (code shown only on a
+///   TTY) and the `gateway listening on …` line are a deliberate plain-`println!` stdout
 ///   contract that integration tests parse; routing logs to stderr keeps
 ///   them out of it entirely.
 fn init_tracing() -> bool {
@@ -217,7 +219,7 @@ fn resolve_issuer(public_url: Option<&str>, bound: SocketAddr) -> String {
 ///   the one exception (mirrors [`resolve_issuer`]'s own trim): `"https://x.example/"`
 ///   is valid, `"https://x.example/mcp"` is not.
 /// - `http://` is accepted ONLY for a loopback host (`localhost` /
-///   `127.0.0.1` — the same definition
+///   `127.0.0.1` / `[::1]` — the same set
 ///   `oauth_routes::is_loopback_redirect_uri` uses); every other host must
 ///   use `https://`, or the resolved issuer would be silently insecure.
 fn validate_public_url(raw: &str) -> Result<(), String> {
@@ -240,13 +242,52 @@ fn validate_public_url(raw: &str) -> Result<(), String> {
     }
     if authority.contains(['/', '?', '#']) {
         return Err(
-            "must be a bare origin (scheme://host[:port]) with no path, query, or fragment"
+            "must be a bare origin (scheme://host[:port]) with no path, query, or fragment — \
+             the gateway serves its OAuth endpoints at the origin root and the consent page \
+             posts to the root-relative /authorize, so a path-prefixed deployment would break \
+             pairing"
                 .to_string(),
         );
     }
 
-    let host = authority.split(':').next().unwrap_or(authority);
-    let is_loopback = host == "localhost" || host == "127.0.0.1";
+    // A `@` means userinfo: `http://localhost:80@evil.com` has host
+    // `evil.com`, not `localhost`.
+    if authority.contains('@') {
+        return Err("must not contain userinfo (user@host)".to_string());
+    }
+
+    // Bracket-aware: an IPv6 literal (`[::1]:7717`) contains colons, so a
+    // plain `split(':')` would yield `[` as the host.
+    let (host, port) = if authority.starts_with('[') {
+        let Some(end) = authority.find(']') else {
+            return Err("has an unterminated IPv6 address literal".to_string());
+        };
+        let after = &authority[end + 1..];
+        if !(after.is_empty() || after.starts_with(':')) {
+            return Err("has a malformed host".to_string());
+        }
+        if authority[1..end].parse::<std::net::Ipv6Addr>().is_err() {
+            return Err("has a bracketed host that is not an IPv6 address".to_string());
+        }
+        (&authority[..=end], after.strip_prefix(':'))
+    } else {
+        match authority.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() {
+        return Err("is missing a host".to_string());
+    }
+    if let Some(port) = port {
+        let valid = !port.is_empty()
+            && port.bytes().all(|b| b.is_ascii_digit())
+            && port.parse::<u16>().is_ok_and(|n| n >= 1);
+        if !valid {
+            return Err("has an invalid port (must be 1-65535)".to_string());
+        }
+    }
+    let is_loopback = matches!(host, "localhost" | "127.0.0.1" | "[::1]");
 
     match scheme {
         "https" => Ok(()),
@@ -257,6 +298,22 @@ fn validate_public_url(raw: &str) -> Result<(), String> {
         other => Err(format!(
             "has unsupported scheme {other:?} — must be http or https"
         )),
+    }
+}
+
+/// The startup line `run` prints about the pairing code. On a terminal it is
+/// the code itself (a human is watching); otherwise — launchd, a redirect,
+/// a pipe — stdout is a FILE that outlives the process (T3b's
+/// `~/Library/Logs/onebrain/gateway.log`), so the code is withheld and the
+/// operator is pointed at `onebrain gateway pair`, which reads it from the
+/// store on demand. Pure so both branches are unit-tested (`run` is
+/// subprocess-only under coverage).
+fn pairing_banner(code: &str, stdout_is_tty: bool) -> String {
+    if stdout_is_tty {
+        format!("pairing code: {code}  (rotate: onebrain gateway pair --rotate)")
+    } else {
+        "pairing code: not shown (stdout is not a terminal) — run `onebrain gateway pair` to see it"
+            .to_string()
     }
 }
 
@@ -338,16 +395,24 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
             tracing::warn!(error = %e, "failed to purge expired gateway auth-store records at startup; continuing");
         }
     }
-    // The pairing code is printed here — stdout of the foreground `gateway
-    // run` process — and NOWHERE else: never logged (the daemon/server log
-    // is a longer-lived, potentially shared file), never returned over HTTP.
-    // `pairing_code()` mints one on first call and is stable after, so
-    // restarting `gateway run` doesn't rotate it out from under an
-    // in-progress pairing.
+    // The pairing code is shown ONLY on an interactive terminal (red-team
+    // item 5, #404): under launchd (`gateway service`, v3.5.0) stdout is a
+    // long-lived log file, which must never hold a credential. It is never
+    // logged and never returned over HTTP either. `pairing_code()` still
+    // runs unconditionally: it mints the code on first start so `onebrain
+    // gateway pair` (the non-TTY way to read it) always has one, and it is
+    // stable after, so restarting `gateway run` doesn't rotate it out from
+    // under an in-progress pairing.
     let pairing_code = auth_store
         .pairing_code()
         .context("mint/read gateway pairing code")?;
-    println!("pairing code: {pairing_code}  (rotate: onebrain gateway pair --rotate)");
+    {
+        use std::io::IsTerminal;
+        println!(
+            "{}",
+            pairing_banner(&pairing_code, std::io::stdout().is_terminal())
+        );
+    }
     let auth_ctx = Arc::new(AuthCtx::new(auth_store));
 
     let router = build_gateway_router(state, auth_ctx.clone());
@@ -564,6 +629,26 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
     }
 
+    #[test]
+    fn pairing_banner_shows_the_code_on_a_terminal() {
+        let line = pairing_banner("ABCD-2345", true);
+        assert!(line.starts_with("pairing code: ABCD-2345"), "{line}");
+        assert!(line.contains("onebrain gateway pair --rotate"), "{line}");
+    }
+
+    /// Red-team item 5: under launchd stdout IS the service log — the code
+    /// must never land there; point the operator at `gateway pair` instead.
+    #[test]
+    fn pairing_banner_never_contains_the_code_when_stdout_is_not_a_terminal() {
+        let line = pairing_banner("ABCD-2345", false);
+        assert!(
+            !line.contains("ABCD-2345"),
+            "the code leaked into non-TTY stdout"
+        );
+        assert!(line.contains("onebrain gateway pair"), "{line}");
+        assert!(line.contains("not a terminal"), "{line}");
+    }
+
     // ── tracing subscriber (round-2 finding D) ────────────────────────────
 
     /// `RUST_LOG` wins when set — an operator debugging a gateway must be
@@ -722,6 +807,104 @@ mod tests {
     #[test]
     fn validate_public_url_accepts_and_trims_a_trailing_slash() {
         assert!(validate_public_url("https://gw.example.com/").is_ok());
+    }
+
+    #[test]
+    fn validate_public_url_accepts_ipv6_loopback_http() {
+        assert!(validate_public_url("http://[::1]:7717").is_ok());
+        assert!(validate_public_url("http://[::1]").is_ok());
+        assert!(validate_public_url("https://[::1]:7717").is_ok());
+    }
+
+    /// Userinfo (`user@`) and malformed ports must be refused for EVERY host:
+    /// `http://localhost:80@evil.com` really has host `evil.com`, so reading
+    /// the host with `split(':')` would wave an insecure http issuer through.
+    #[test]
+    fn validate_public_url_rejects_userinfo_and_malformed_ports_for_all_hosts() {
+        for bad in [
+            "http://[::1]:80@evil.com",
+            "http://localhost:80@evil.com",
+            "http://127.0.0.1:80@evil.com",
+            "https://user@gw.example.com",
+            "https://user:pw@gw.example.com",
+            "http://[::1]:abc",
+            "http://localhost:",
+            "http://localhost:0",
+            "http://localhost:65536",
+            "https://gw.example.com:99999",
+            "https://gw.example.com:1:2",
+        ] {
+            let err = validate_public_url(bad).expect_err(bad);
+            assert!(!err.contains("pw"), "must not echo secrets: {err}");
+        }
+        assert!(validate_public_url("http://localhost:65535").is_ok());
+    }
+
+    /// An empty host (`https://:443`) parses as `Some("")` in `http::Uri`, so
+    /// it must be refused here or `allowed_hosts` would admit `Host: :443`.
+    #[test]
+    fn validate_public_url_rejects_an_empty_host() {
+        for bad in ["https://:443", "http://:7717", "https://:", "http://:80/"] {
+            let err = validate_public_url(bad).expect_err(bad);
+            assert!(err.contains("missing a host"), "{bad}: {err}");
+            assert!(!err.contains("443"), "must not echo the input: {err}");
+        }
+    }
+
+    /// A bracketed host must hold a real IPv6 address: `[]` is not an empty
+    /// host to `http::Uri` (host `"[]"`), but it normalises to one.
+    #[test]
+    fn validate_public_url_rejects_a_bracketed_non_ipv6_host() {
+        for bad in ["https://[]", "https://[zzz]:443", "http://[]:7717"] {
+            let err = validate_public_url(bad).expect_err(bad);
+            assert!(err.contains("IPv6"), "{bad}: {err}");
+            assert!(!err.contains("zzz"), "must not echo the input: {err}");
+        }
+        assert!(validate_public_url("http://[::1]:7717").is_ok());
+        assert!(validate_public_url("https://[2001:db8::1]").is_ok());
+    }
+
+    /// Every public_url the validator accepts must yield the same host from
+    /// `host_guard::allowed_hosts` (bracket-stripped, lower-cased).
+    #[test]
+    fn validate_public_url_and_allowed_hosts_agree_on_the_host() {
+        for (url, host) in [
+            ("http://localhost:7717", "localhost"),
+            ("http://127.0.0.1", "127.0.0.1"),
+            ("http://[::1]:7717", "::1"),
+            ("https://gw.example.com", "gw.example.com"),
+            ("https://gw.example.com:8443/", "gw.example.com"),
+            ("https://[2001:db8::1]:8443", "2001:db8::1"),
+        ] {
+            assert!(validate_public_url(url).is_ok(), "{url}");
+            assert!(
+                host_guard::allowed_hosts(Some(url)).contains(&host.to_string()),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_public_url_rejects_non_loopback_or_malformed_ipv6() {
+        let err = validate_public_url("http://[2001:db8::1]:7717").unwrap_err();
+        assert!(err.contains("https"), "{err}");
+        assert!(validate_public_url("http://[::1").is_err());
+        assert!(validate_public_url("http://[::1]evil").is_err());
+    }
+
+    /// #404 item 4: a path-prefixed deployment (`https://host/onebrain`) is
+    /// refused, AND the message says why: the gateway serves OAuth at the
+    /// origin root and the consent form posts to the root-relative
+    /// `/authorize`, which would escape the prefix.
+    #[test]
+    fn validate_public_url_rejects_a_path_prefixed_deployment_and_says_why() {
+        let err = validate_public_url("https://gw.example.com/onebrain").unwrap_err();
+        assert!(err.contains("path"), "{err}");
+        assert!(
+            err.contains("/authorize"),
+            "must explain the consent-form reason: {err}"
+        );
+        assert!(err.contains("root"), "{err}");
     }
 
     #[test]

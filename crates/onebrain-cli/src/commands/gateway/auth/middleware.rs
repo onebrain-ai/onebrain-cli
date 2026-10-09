@@ -58,6 +58,11 @@ pub async fn require_bearer(
         return challenge(ctx.issuer(), false);
     };
 
+    // RFC 8707 `resource` is RECORDED on every token (#404) but NOT compared
+    // here against `{issuer}/mcp`: the gateway serves exactly one resource,
+    // and enforcing it would also invalidate every token after a
+    // `public_url` change. Hub ruling for v3.5.0 — follow-up: #416
+    // (v3.5.x).
     let checked = {
         let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
         store.check_access(&token)
