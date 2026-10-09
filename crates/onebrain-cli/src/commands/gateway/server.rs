@@ -1209,6 +1209,30 @@ async fn policy_gate(
 ///    timeout still closes the Telegram message's loop, just with a
 ///    different outcome string (see the call sites below for the three
 ///    exact strings).
+/// The outcome of a call whose client disconnected mid-wait (Ruling 10):
+/// always a denial — but if another path had already denied it (shutdown's
+/// `deny_all` won the race), that path's channel is kept for the audit and
+/// Telegram, instead of being relabelled "disconnect". An approve that won
+/// the race is still turned into a Disconnect denial (fail-safe: nobody is
+/// left to receive the result).
+async fn outcome_on_disconnect(
+    approvals: &Approvals,
+    id: &str,
+    wait: impl std::future::Future<Output = WaitOutcome>,
+) -> WaitOutcome {
+    let disconnect = WaitOutcome::Decided(approval::Decision::Deny, ResolvedVia::Disconnect);
+    // Whoever took `id` out of `pending` — this resolve, or a path that got
+    // there first — has put (or is about to put) its answer in the channel
+    // `wait` reads, so this await returns at once.
+    approvals.resolve(id, approval::Decision::Deny, ResolvedVia::Disconnect);
+    match wait.await {
+        WaitOutcome::Decided(approval::Decision::Deny, via) => {
+            WaitOutcome::Decided(approval::Decision::Deny, via)
+        }
+        _ => disconnect,
+    }
+}
+
 async fn await_approval(
     state: &Arc<GatewayState>,
     principal: &Principal,
@@ -1344,6 +1368,7 @@ async fn await_approval(
     let wait = state
         .approvals
         .wait(&id, rx, Duration::from_secs(wait_secs));
+    tokio::pin!(wait);
     let outcome = match ctx {
         // `biased`, cancel first: an approve racing the disconnect resolves
         // as the fail-safe denial. An approve landing after `ct` fires may
@@ -1352,12 +1377,9 @@ async fn await_approval(
         Some(ctx) => tokio::select! {
             biased;
             () = ctx.ct.cancelled() => {
-                state
-                    .approvals
-                    .resolve(&id, approval::Decision::Deny, ResolvedVia::Disconnect);
-                WaitOutcome::Decided(approval::Decision::Deny, ResolvedVia::Disconnect)
+                outcome_on_disconnect(&state.approvals, &id, wait.as_mut()).await
             }
-            outcome = wait => outcome,
+            outcome = &mut wait => outcome,
         },
         None => wait.await,
     };
@@ -5243,6 +5265,70 @@ mod tests {
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["decision"], "denied", "{entries:?}");
         assert_eq!(entries[0]["channel"], "shutdown", "{entries:?}");
+    }
+
+    /// Minor 3: a disconnect that loses the race to shutdown's `deny_all`
+    /// keeps the shutdown channel; one that wins is a Disconnect denial;
+    /// one that loses to an approve is still a Disconnect denial.
+    #[tokio::test]
+    async fn a_disconnect_keeps_the_channel_of_a_denial_that_won_the_race() {
+        let sample = |id: &str| {
+            let now = now_epoch_secs();
+            PendingApproval {
+                id: id.to_string(),
+                client_id: "c".to_string(),
+                tool: "brain_capture".to_string(),
+                vault: None,
+                summary: "s".to_string(),
+                created: now,
+                expires: now + 300,
+                class: RiskClass::Mutating,
+            }
+        };
+        let deny = approval::Decision::Deny;
+
+        let a = Approvals::new();
+        let rx = a.register(sample("lost-to-shutdown")).unwrap();
+        a.deny_all(ResolvedVia::Shutdown);
+        let w = a.wait("lost-to-shutdown", rx, Duration::from_secs(60));
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                outcome_on_disconnect(&a, "lost-to-shutdown", w)
+            )
+            .await
+            .expect("must not wait out the TTL"),
+            WaitOutcome::Decided(deny, ResolvedVia::Shutdown)
+        );
+
+        let a = Approvals::new();
+        let rx = a.register(sample("won")).unwrap();
+        let w = a.wait("won", rx, Duration::from_secs(60));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), outcome_on_disconnect(&a, "won", w))
+                .await
+                .expect("must not wait out the TTL"),
+            WaitOutcome::Decided(deny, ResolvedVia::Disconnect)
+        );
+        assert!(a.list().is_empty());
+
+        let a = Approvals::new();
+        let rx = a.register(sample("lost-to-approve")).unwrap();
+        assert!(a.resolve(
+            "lost-to-approve",
+            approval::Decision::Approve,
+            ResolvedVia::Http
+        ));
+        let w = a.wait("lost-to-approve", rx, Duration::from_secs(60));
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                outcome_on_disconnect(&a, "lost-to-approve", w)
+            )
+            .await
+            .expect("must not wait out the TTL"),
+            WaitOutcome::Decided(deny, ResolvedVia::Disconnect)
+        );
     }
 
     // ── Fix wave: grants are vault-scoped (F5) ───────────────────────────
