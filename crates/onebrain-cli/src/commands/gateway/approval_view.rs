@@ -246,21 +246,11 @@ pub fn telegram_outcome(
                 (ResolvedVia::Disconnect, _) => {
                     "\u{26d4} Denied \u{b7} the app disconnected, nothing written".to_string()
                 }
-                (ResolvedVia::Telegram, true) => {
-                    let mut out = format!("\u{2705} Allowed \u{b7} {}", allowed_detail(p));
-                    if let Some(m) = p.grant_minutes {
-                        let more = if p.tool == "brain_capture" {
-                            "more notes allowed"
-                        } else {
-                            "repeat allowed"
-                        };
-                        out.push_str(&format!(
-                            " \u{b7} {more} until {}",
-                            until(now.saturating_add(m.saturating_mul(60)))
-                        ));
-                    }
-                    out
-                }
+                (ResolvedVia::Telegram, true) => format!(
+                    "\u{2705} Allowed \u{b7} {}{}",
+                    allowed_detail(p),
+                    grant_suffix(p, now, until)
+                ),
                 (ResolvedVia::Telegram, false) if p.tool == "brain_capture" => {
                     "\u{26d4} Denied \u{b7} nothing was written to the vault".to_string()
                 }
@@ -269,15 +259,46 @@ pub fn telegram_outcome(
                 }
                 (ResolvedVia::Native, a) => format!(
                     "\u{1f4bb} Answered on the Mac \u{b7} {}",
-                    if a { "allowed" } else { "denied" }
+                    decision_word(p, a, now, until)
                 ),
                 (ResolvedVia::Http, a) => format!(
                     "\u{1f4bb} Answered on the approvals page \u{b7} {}",
-                    if a { "allowed" } else { "denied" }
+                    decision_word(p, a, now, until)
                 ),
             }
         }
     }
+}
+
+/// `allowed` / `denied`; an allow also names the `ask_once` window.
+fn decision_word(
+    p: &PendingApproval,
+    allowed: bool,
+    now: u64,
+    until: &dyn Fn(u64) -> String,
+) -> String {
+    if allowed {
+        format!("allowed{}", grant_suffix(p, now, until))
+    } else {
+        "denied".to_string()
+    }
+}
+
+/// ` · more notes allowed until HH:MM` when this approval opens an
+/// `ask_once` window, however the Allow arrived; empty otherwise.
+fn grant_suffix(p: &PendingApproval, now: u64, until: &dyn Fn(u64) -> String) -> String {
+    let Some(m) = p.grant_minutes else {
+        return String::new();
+    };
+    let more = if p.tool == "brain_capture" {
+        "more notes allowed"
+    } else {
+        "repeat allowed"
+    };
+    format!(
+        " \u{b7} {more} until {}",
+        until(now.saturating_add(m.saturating_mul(60)))
+    )
 }
 
 /// Epoch seconds as the gateway machine's local `HH:MM`.
@@ -643,6 +664,18 @@ mod tests {
         assert_eq!(
             tout(&p, Outcome::Decided(Decision::Approve, ResolvedVia::Telegram)),
             "\u{2705} Allowed \u{b7} \"ทดสอบ approve จากมือถือ 1\" \u{b7} more notes allowed until t2800"
+        );
+        assert_eq!(
+            tout(&p, Outcome::Decided(Decision::Approve, ResolvedVia::Native)),
+            "\u{1f4bb} Answered on the Mac \u{b7} allowed \u{b7} more notes allowed until t2800"
+        );
+        assert_eq!(
+            tout(&p, Outcome::Decided(Decision::Approve, ResolvedVia::Http)),
+            "\u{1f4bb} Answered on the approvals page \u{b7} allowed \u{b7} more notes allowed until t2800"
+        );
+        assert_eq!(
+            tout(&p, Outcome::Decided(Decision::Deny, ResolvedVia::Native)),
+            "\u{1f4bb} Answered on the Mac \u{b7} denied"
         );
         // Not shown on a deny.
         assert!(
