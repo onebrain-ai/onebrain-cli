@@ -169,6 +169,10 @@ pub struct PendingApproval {
     /// Structured facts the approval prompts are built from (title / path /
     /// query, body length) — see [`super::approval_view`].
     pub subject: super::approval_view::ApprovalSubject,
+    /// `Some(minutes)` iff this tool's class is `ask_once`: an Allow then
+    /// also covers repeat calls for `policy.grant_ttl_minutes`. Shown so the
+    /// approver knows why the next call may not prompt.
+    pub grant_minutes: Option<u64>,
 }
 
 /// Longest client name (in chars) shown to an approver before an ellipsis.
@@ -706,6 +710,7 @@ mod tests {
             class: RiskClass::Mutating,
             client_name: None,
             subject: Default::default(),
+            grant_minutes: None,
         }
     }
 
@@ -962,7 +967,7 @@ mod tests {
         assert!(p.expires > p.created, "{p:?}");
         assert_eq!(p.class, RiskClass::Mutating);
 
-        // Serializes to EXACTLY these 10 fields — a JSON object with no extra
+        // Serializes to EXACTLY these 11 fields — a JSON object with no extra
         // keys, so no token / full note body / host path could sneak in
         // through a field this struct doesn't have. (`vault` is a
         // `gateway.yml` vault NAME, never a path — see its own doc comment.)
@@ -978,6 +983,7 @@ mod tests {
                 "client_name",
                 "created",
                 "expires",
+                "grant_minutes",
                 "id",
                 "subject",
                 "summary",

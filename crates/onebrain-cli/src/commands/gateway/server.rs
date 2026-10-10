@@ -1295,6 +1295,8 @@ async fn await_approval(
         class,
         client_name: registered_client_name(state, &principal.client_id),
         subject: call.subject.clone(),
+        grant_minutes: (state.config.policy.mode_for(class) == PolicyMode::AskOnce)
+            .then_some(state.config.policy.grant_ttl_minutes),
     };
     let id = pending.id.clone();
     let rx = match state.approvals.register(pending.clone()) {
@@ -1449,6 +1451,8 @@ async fn await_approval(
                     &approval_view::telegram_outcome(
                         &pending,
                         approval_view::Outcome::Decided(approval::Decision::Approve, via),
+                        now_epoch_secs(),
+                        &approval_view::local_hhmm,
                     ),
                 );
             }
@@ -1461,6 +1465,8 @@ async fn await_approval(
                     &approval_view::telegram_outcome(
                         &pending,
                         approval_view::Outcome::Decided(approval::Decision::Deny, via),
+                        now_epoch_secs(),
+                        &approval_view::local_hhmm,
                     ),
                 );
             }
@@ -1485,7 +1491,12 @@ async fn await_approval(
             if let Some(t) = &state.telegram {
                 t.note_outcome(
                     &id,
-                    &approval_view::telegram_outcome(&pending, approval_view::Outcome::TimedOut),
+                    &approval_view::telegram_outcome(
+                        &pending,
+                        approval_view::Outcome::TimedOut,
+                        now_epoch_secs(),
+                        &approval_view::local_hhmm,
+                    ),
                 );
             }
             Err((
@@ -5384,6 +5395,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grant_window_reaches_the_pending_entry_from_config_only_under_ask_once() {
+        for (mode, ttl, want) in [
+            (policy::PolicyMode::AskOnce, 17, Some(17)),
+            (policy::PolicyMode::AskAlways, 17, None),
+        ] {
+            let (_dir, router, state, token) = fixture_router_with_mutating_policy(mode, 300, ttl);
+            let handle = tokio::spawn(async move {
+                let body = call_body(
+                    1,
+                    "brain_capture",
+                    serde_json::json!({"title": "G", "text": "b"}),
+                );
+                post(
+                    &router,
+                    body,
+                    &token,
+                    &standard_headers("tools/call", Some("brain_capture")),
+                )
+                .await
+            });
+            let pending = wait_for_one_pending(&state).await;
+            assert_eq!(pending.grant_minutes, want);
+            state.approvals.resolve(
+                &pending.id,
+                approval::Decision::Deny,
+                approval::ResolvedVia::Http,
+            );
+            let _ = handle.await;
+        }
+    }
+
+    #[tokio::test]
     async fn the_registered_client_name_reaches_the_pending_prompt_sanitized() {
         use crate::commands::gateway::auth::store::{AppType, RegisteredClient};
         let (_dir, router, state, token) =
@@ -5748,6 +5791,7 @@ mod tests {
                         class: RiskClass::Mutating,
                         client_name: None,
                         subject: Default::default(),
+                        grant_minutes: None,
                     })
                     .unwrap_or_else(|e| panic!("filler {i} must fit under the cap: {e:?}")),
             );
@@ -5846,6 +5890,7 @@ mod tests {
                 class: RiskClass::Mutating,
                 client_name: None,
                 subject: Default::default(),
+                grant_minutes: None,
             }
         };
         let deny = approval::Decision::Deny;

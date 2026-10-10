@@ -1890,6 +1890,7 @@ mod tests {
             class: crate::commands::gateway::policy::RiskClass::Mutating,
             client_name: None,
             subject: Default::default(),
+            grant_minutes: None,
         }
     }
 

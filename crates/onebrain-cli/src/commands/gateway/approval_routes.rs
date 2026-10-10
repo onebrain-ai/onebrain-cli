@@ -279,6 +279,7 @@ mod tests {
             class: RiskClass::Mutating,
             client_name: None,
             subject: Default::default(),
+            grant_minutes: None,
         }
     }
 

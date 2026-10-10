@@ -192,13 +192,29 @@ pub fn telegram_wait_line(remaining_secs: u64) -> String {
     }
 }
 
+/// The `ask_once` consent-window line, or `None` when an Allow covers this
+/// one call only.
+fn grant_line(p: &PendingApproval) -> Option<String> {
+    let m = p.grant_minutes?;
+    let what = if p.tool == "brain_capture" {
+        "save more notes"
+    } else {
+        "do this again"
+    };
+    let who = p
+        .client_name
+        .as_ref()
+        .map_or_else(|| "the app".to_string(), |_| self::who(p));
+    Some(format!("Allow also lets {who} {what} for {m} min"))
+}
+
 /// Full pending Telegram prompt.
 pub fn telegram_prompt(p: &PendingApproval, now: u64) -> String {
-    format!(
-        "{}\n{}",
-        telegram_body(p),
-        telegram_wait_line(p.expires.saturating_sub(now))
-    )
+    let wait = telegram_wait_line(p.expires.saturating_sub(now));
+    match grant_line(p) {
+        Some(g) => format!("{}\n{g}\n{wait}", telegram_body(p)),
+        None => format!("{}\n{wait}", telegram_body(p)),
+    }
 }
 
 /// How an approval ended, as far as the Telegram edit is concerned.
@@ -209,7 +225,14 @@ pub enum Outcome {
 }
 
 /// The line the Telegram message is edited to once resolved.
-pub fn telegram_outcome(p: &PendingApproval, outcome: Outcome) -> String {
+/// `until` formats an epoch second as the local `HH:MM` (see [`local_hhmm`]);
+/// `now` is when the decision landed.
+pub fn telegram_outcome(
+    p: &PendingApproval,
+    outcome: Outcome,
+    now: u64,
+    until: &dyn Fn(u64) -> String,
+) -> String {
     match outcome {
         Outcome::TimedOut => {
             "\u{231b} Timed out \u{b7} denied automatically, nothing written".to_string()
@@ -224,7 +247,19 @@ pub fn telegram_outcome(p: &PendingApproval, outcome: Outcome) -> String {
                     "\u{26d4} Denied \u{b7} the app disconnected, nothing written".to_string()
                 }
                 (ResolvedVia::Telegram, true) => {
-                    format!("\u{2705} Allowed \u{b7} {}", allowed_detail(p))
+                    let mut out = format!("\u{2705} Allowed \u{b7} {}", allowed_detail(p));
+                    if let Some(m) = p.grant_minutes {
+                        let more = if p.tool == "brain_capture" {
+                            "more notes allowed"
+                        } else {
+                            "repeat allowed"
+                        };
+                        out.push_str(&format!(
+                            " \u{b7} {more} until {}",
+                            until(now.saturating_add(m.saturating_mul(60)))
+                        ));
+                    }
+                    out
                 }
                 (ResolvedVia::Telegram, false) if p.tool == "brain_capture" => {
                     "\u{26d4} Denied \u{b7} nothing was written to the vault".to_string()
@@ -243,6 +278,15 @@ pub fn telegram_outcome(p: &PendingApproval, outcome: Outcome) -> String {
             }
         }
     }
+}
+
+/// Epoch seconds as the gateway machine's local `HH:MM`.
+pub fn local_hhmm(epoch: u64) -> String {
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_opt(i64::try_from(epoch).unwrap_or(i64::MAX), 0)
+        .single()
+        .map_or_else(|| "?".to_string(), |t| t.format("%H:%M").to_string())
 }
 
 /// Unescaped dialog lines (the caller escapes each for AppleScript and joins
@@ -287,6 +331,9 @@ pub fn dialog_lines(p: &PendingApproval, remaining_secs: u64) -> Vec<String> {
         _ => lines.push(row("Vault:", vault)),
     }
     lines.push(String::new());
+    if let Some(g) = grant_line(p) {
+        lines.push(g);
+    }
     let id = client_id_short(&p.client_id);
     let asked = if p.client_name.is_some() {
         format!("Asked by {} (self-declared name \u{b7} id {id})", who(p))
@@ -319,6 +366,9 @@ pub fn describe(p: &PendingApproval, now: u64) -> String {
             s => format!("{} min left", s.div_ceil(60)),
         }
     ));
+    if let Some(m) = p.grant_minutes {
+        out.push_str(&format!(" \u{b7} Allow also covers repeats for {m} min"));
+    }
     out
 }
 
@@ -326,6 +376,10 @@ pub fn describe(p: &PendingApproval, now: u64) -> String {
 mod tests {
     use super::*;
     use crate::commands::gateway::policy::RiskClass;
+
+    fn tout(p: &PendingApproval, o: Outcome) -> String {
+        telegram_outcome(p, o, 1000, &|e| format!("t{e}"))
+    }
 
     const ID: &str = "rKkfrep1IPUdbsIDkOsWPZoYfdIc6cx-qL8Vj1CGY58";
 
@@ -341,6 +395,7 @@ mod tests {
             class: RiskClass::Mutating,
             client_name: Some("Claude".to_string()),
             subject: ApprovalSubject::new(Some("ทดสอบ approve จากมือถือ 1"), Some(25)),
+            grant_minutes: None,
         }
     }
 
@@ -400,7 +455,7 @@ mod tests {
     fn golden_outcomes() {
         use Decision::{Approve, Deny};
         let p = capture();
-        let o = |o| telegram_outcome(&p, o);
+        let o = |o| tout(&p, o);
         assert_eq!(
             o(Outcome::Decided(Approve, ResolvedVia::Telegram)),
             "\u{2705} Allowed \u{b7} \"ทดสอบ approve จากมือถือ 1\""
@@ -446,16 +501,13 @@ mod tests {
             ("brain_zap", "\u{2705} Allowed \u{b7} run brain_zap"),
         ] {
             p.tool = tool.to_string();
-            assert_eq!(telegram_outcome(&p, allow), want);
+            assert_eq!(tout(&p, allow), want);
         }
         p.tool = "brain_capture".to_string();
         p.subject = ApprovalSubject::default();
-        assert_eq!(
-            telegram_outcome(&p, allow),
-            "\u{2705} Allowed \u{b7} a new note"
-        );
+        assert_eq!(tout(&p, allow), "\u{2705} Allowed \u{b7} a new note");
         for w in ["saved", "written", "done"] {
-            assert!(!telegram_outcome(&capture(), allow).contains(w));
+            assert!(!tout(&capture(), allow).contains(w));
         }
     }
 
@@ -518,7 +570,7 @@ mod tests {
         assert!(w.chars().count() <= 64 + 1 + "\\u{202e}\\u{a}".len(), "{w}");
         for out in [
             telegram_prompt(&p, 1000),
-            telegram_outcome(&p, Outcome::TimedOut),
+            tout(&p, Outcome::TimedOut),
             dialog_lines(&p, 240).join("\n"),
             describe(&p, 1000),
         ] {
@@ -552,19 +604,13 @@ mod tests {
         let deny = Outcome::Decided(Decision::Deny, ResolvedVia::Telegram);
         let mut p = capture();
         assert_eq!(
-            telegram_outcome(&p, deny),
+            tout(&p, deny),
             "\u{26d4} Denied \u{b7} nothing was written to the vault"
         );
         p.tool = "brain_get".to_string();
-        assert_eq!(
-            telegram_outcome(&p, deny),
-            "\u{26d4} Denied \u{b7} read a note"
-        );
+        assert_eq!(tout(&p, deny), "\u{26d4} Denied \u{b7} read a note");
         p.tool = "brain_search".to_string();
-        assert_eq!(
-            telegram_outcome(&p, deny),
-            "\u{26d4} Denied \u{b7} search your vault"
-        );
+        assert_eq!(tout(&p, deny), "\u{26d4} Denied \u{b7} search your vault");
     }
 
     #[test]
@@ -572,6 +618,47 @@ mod tests {
         let mut p = capture();
         p.client_name = crate::commands::gateway::approval::sanitize_client_name("My \"App\"");
         assert!(telegram_body(&p).starts_with("\u{1f510} My \"App\" wants to"));
+    }
+
+    #[test]
+    fn ask_once_shows_the_grant_window_in_prompt_dialog_and_outcome() {
+        let mut p = capture();
+        // ask_always / auto: no line anywhere.
+        assert!(!telegram_prompt(&p, 1000).contains("Allow also"));
+        assert!(!dialog_lines(&p, 240).join("\n").contains("Allow also"));
+        p.grant_minutes = Some(30);
+        let t = telegram_prompt(&p, 1000);
+        assert!(
+            t.ends_with(
+                "Allow also lets Claude save more notes for 30 min\n\
+                 \u{23f3} Answer within 4 min, or it's denied automatically"
+            ),
+            "{t}"
+        );
+        let d = dialog_lines(&p, 240);
+        assert_eq!(
+            d[d.len() - 2],
+            "Allow also lets Claude save more notes for 30 min"
+        );
+        assert_eq!(
+            tout(&p, Outcome::Decided(Decision::Approve, ResolvedVia::Telegram)),
+            "\u{2705} Allowed \u{b7} \"ทดสอบ approve จากมือถือ 1\" \u{b7} more notes allowed until t2800"
+        );
+        // Not shown on a deny.
+        assert!(
+            !tout(&p, Outcome::Decided(Decision::Deny, ResolvedVia::Telegram)).contains("until")
+        );
+        p.tool = "brain_get".to_string();
+        p.client_name = None;
+        assert!(
+            telegram_prompt(&p, 1000).contains("Allow also lets the app do this again for 30 min")
+        );
+        assert!(tout(
+            &p,
+            Outcome::Decided(Decision::Approve, ResolvedVia::Telegram)
+        )
+        .ends_with("read a note \u{b7} repeat allowed until t2800"));
+        assert!(describe(&p, 1000).ends_with("Allow also covers repeats for 30 min"));
     }
 
     #[test]
