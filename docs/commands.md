@@ -62,9 +62,9 @@ Not every target ships every search capability — see the [platform-support mat
 | `gateway service uninstall` | none | Unload and remove both LaunchAgents; never touches tokens or config. macOS only. |
 | `gateway service status` | none | Both agents loaded and running, local endpoint up, tunnel reaching this gateway. macOS only. |
 | `gateway tokens list` | `--all` | List issued tokens (live ones, or also expired and revoked with `--all`). Token values are never printed; each is shown by a 12-character id. |
-| `gateway tokens revoke` | exactly one of `<ID>` (id or unique prefix of 4+ characters), `--client <CLIENT_ID>`, `--family <FAMILY_ID>` | Revoke one token, every token of a client, or every token of one login. Takes effect on the running gateway's next request. |
+| `gateway tokens revoke` | exactly one of `<ID>`, `--client <CLIENT_ID>`, `--family <FAMILY_ID>` | `<ID>` revokes one token (id or a unique prefix of 4+ characters) and does not end its family; `--client` revokes every login of that app; `--family` revokes one login (id from `tokens list`). Takes effect on the running gateway's next request, and a call already waiting for approval is denied within about 5 s. A client id that starts with `-` needs `--client=<ID>`. |
 | `gateway clients list` | none | List registered OAuth clients and how many live tokens each holds. |
-| `gateway clients remove` | `<CLIENT_ID>` | Remove a client: revokes its tokens and deletes its pending authorization codes. |
+| `gateway clients remove` | `<CLIENT_ID>` | Revokes all of the client's tokens, deletes its pending authorization codes and unregisters it. Takes effect on the next request, and a call already waiting for approval is denied within about 5 s. A client id that starts with `-` needs `--` before it (`clients remove -- <ID>`). |
 
 ## Output modes
 
