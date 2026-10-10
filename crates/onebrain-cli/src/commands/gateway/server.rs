@@ -2343,8 +2343,16 @@ async fn capture_note(
         let vault_root = vault_root.clone();
         let rel_for_error = rel_path.clone();
         let rel_path = rel_path.clone();
+        let title = params.title.clone();
         tokio::task::spawn_blocking(move || {
-            onebrain_fs::note::new_note(&vault_root, &rel_path, None, &frontmatter, false)
+            onebrain_fs::note::new_note_titled(
+                &vault_root,
+                &rel_path,
+                None,
+                &frontmatter,
+                false,
+                title.as_deref(),
+            )
         })
         .await
         .map_err(|e| sanitized_internal("internal task failure", e.into()))?
@@ -5329,6 +5337,32 @@ mod tests {
                 .contains("Some captured note body"),
             "the audit trail must never carry the raw note body: {entries:?}"
         );
+    }
+
+    /// #431: the note's H1 is the caller's title, not the filename stem.
+    #[tokio::test]
+    async fn brain_capture_h1_is_the_thai_title_not_the_filename_slug() {
+        let (dir, router, _state, token) =
+            fixture_router_with_mutating_policy(policy::PolicyMode::Auto, 300, 30);
+        let body = call_body(
+            1,
+            "brain_capture",
+            serde_json::json!({"title": "ทดสอบ approve 3", "text": "body text"}),
+        );
+        let resp = post(
+            &router,
+            body,
+            &token,
+            &standard_headers("tools/call", Some("brain_capture")),
+        )
+        .await;
+        assert!(resp.get("error").is_none(), "{resp}");
+        let path = resp["result"]["structuredContent"]["path"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no path in response: {resp}"));
+        let content = std::fs::read_to_string(dir.path().join(path)).unwrap();
+        assert!(content.contains("\n# ทดสอบ approve 3\n"), "{content}");
+        assert!(!content.contains("\n# 2026-"), "{content}");
     }
 
     /// The round-2 finding E regression, end to end through the real
