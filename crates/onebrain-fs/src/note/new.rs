@@ -134,11 +134,26 @@ fn title_from_path(rel_path: &Path) -> String {
 /// Max chars kept from a caller-supplied heading.
 const MAX_TITLE_CHARS: usize = 200;
 
-/// Sanitize a caller-supplied heading: collapse all whitespace (newlines
-/// included) to single spaces, strip leading `#`s, trim, cap at
-/// [`MAX_TITLE_CHARS`] chars (char-boundary safe). `None` if nothing is left.
+/// Control, bidi-override and zero-width characters that must never reach an
+/// H1 (terminal escapes, NUL, text-direction spoofing, invisible padding).
+fn is_unsafe_title_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+}
+
+/// Sanitize a caller-supplied heading: drop control/bidi/zero-width chars,
+/// collapse all whitespace (newlines included) to single spaces, strip
+/// leading `#`s, trim, cap at [`MAX_TITLE_CHARS`] chars (char-boundary
+/// safe). The input is bounded first so a huge title is never fully copied.
+/// `None` if nothing is left.
 fn sanitize_title(raw: &str) -> Option<String> {
-    let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Whitespace controls (\n, \t) must collapse to a space, not vanish.
+    let bounded: String = raw
+        .chars()
+        .take(MAX_TITLE_CHARS * 4)
+        .filter(|c| c.is_whitespace() || !is_unsafe_title_char(*c))
+        .collect();
+    let one_line = bounded.split_whitespace().collect::<Vec<_>>().join(" ");
     let stripped = one_line.trim_start_matches('#').trim();
     let capped: String = stripped.chars().take(MAX_TITLE_CHARS).collect();
     let out = capped.trim_end();
@@ -395,6 +410,16 @@ mod tests {
         let h1 = out.lines().find(|l| l.starts_with("# ")).unwrap();
         assert_eq!(h1.chars().count(), 2 + MAX_TITLE_CHARS, "got: {h1}");
         assert!(long.starts_with(&h1[2..]));
+    }
+
+    #[test]
+    fn titled_heading_drops_control_bidi_and_zero_width_chars() {
+        let out = titled(
+            "a/stem.md",
+            Some("A\0B\x1b[31mC\u{202E}D\u{200B}E\u{FEFF}F\u{2066}G\u{2069}H"),
+        );
+        assert!(out.contains("\n# AB[31mCDEFGH\n"), "got: {out:?}");
+        assert!(!out.contains('\x1b') && !out.contains('\0'), "got: {out:?}");
     }
 
     #[test]

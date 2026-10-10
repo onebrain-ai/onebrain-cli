@@ -322,7 +322,9 @@ pub struct BrainSearchParams {
 pub struct BrainCaptureParams {
     /// Note body/content to capture.
     pub text: String,
-    /// Optional title. Drives the derived filename's slug; when omitted (or
+    /// Optional title. Also the note's `# ` heading (sanitized to one line,
+    /// max 200 chars; the filename slug is used when it sanitizes to
+    /// nothing). Drives the derived filename's slug; when omitted (or
     /// when it has no usable alphanumeric content at all) the slug is
     /// derived from the first words of `text` instead. Any script works —
     /// a Thai, Japanese, or Cyrillic title yields a Thai, Japanese, or
