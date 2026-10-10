@@ -160,6 +160,116 @@ pub struct PendingApproval {
     /// the pending list benefits from seeing exactly what class of access is
     /// being asked for, same as `tool`/`summary`.
     pub class: RiskClass,
+    /// The client's SELF-REGISTERED name (DCR `client_name`), already passed
+    /// through [`sanitize_client_name`] (visible escapes for control/bidi
+    /// characters, capped). Untrusted: the approver sees it labelled
+    /// "unverified" (see [`PendingApproval::client_line`]). `None` when the
+    /// store has no name or the lookup failed.
+    pub client_name: Option<String>,
+    /// Structured facts the approval prompts are built from (title / path /
+    /// query, body length) — see [`super::approval_view`].
+    pub subject: super::approval_view::ApprovalSubject,
+    /// `Some(minutes)` iff this tool's class is `ask_once`: an Allow then
+    /// also covers repeat calls for `policy.grant_ttl_minutes`. Shown so the
+    /// approver knows why the next call may not prompt.
+    pub grant_minutes: Option<u64>,
+}
+
+/// Longest client name (in chars) shown to an approver before an ellipsis.
+pub(crate) const CLIENT_NAME_MAX_CHARS: usize = 64;
+
+/// Quote a user-supplied string for an operator-facing summary: every
+/// printable character (Thai combining marks, emoji, ...) passes through
+/// unchanged; `"` and `\` are backslash-escaped; control characters and
+/// Unicode bidi/line-separator characters become a visible `\u{..}` escape
+/// so they can neither spoof the surrounding text nor break the line.
+pub fn summary_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    push_escaped(&mut out, s);
+    out.push('"');
+    out
+}
+
+/// Escape only control and bidi/separator characters (visibly, as
+/// `\u{..}`); quotes, backslashes and all printable text stay as written.
+pub fn escape_visible(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || is_bidi_or_separator(c) {
+                format!("\\u{{{:x}}}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+fn push_escaped(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() || is_bidi_or_separator(c) => {
+                out.push_str(&format!("\\u{{{:x}}}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+/// Bidi controls (embeddings/overrides/isolates/marks) and the Unicode line
+/// and paragraph separators: invisible, yet able to reorder or split the text
+/// an approver reads.
+fn is_bidi_or_separator(c: char) -> bool {
+    matches!(
+        c,
+        '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{061C}'
+            | '\u{2028}'
+            | '\u{2029}'
+    )
+}
+
+/// `Some(s)` -> [`summary_value`]; `None` -> `none_label` verbatim.
+pub fn summary_opt(s: Option<&str>, none_label: &str) -> String {
+    s.map_or_else(|| none_label.to_string(), summary_value)
+}
+
+/// Neutralise a self-registered client name for display: escape as
+/// [`summary_value`] does (without the quotes), then cap at
+/// [`CLIENT_NAME_MAX_CHARS`] chars with an ellipsis. Blank -> `None`.
+pub fn sanitize_client_name(raw: &str) -> Option<String> {
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let escaped = escape_visible(raw);
+    if escaped.chars().count() <= CLIENT_NAME_MAX_CHARS {
+        return Some(escaped);
+    }
+    let mut cut: String = escaped.chars().take(CLIENT_NAME_MAX_CHARS).collect();
+    // Never leave a half-written escape (`\u{20`) at the cut.
+    if let Some(i) = cut.rfind('\\') {
+        if cut[i..].starts_with("\\u{") && !cut[i..].contains('}') {
+            cut.truncate(i);
+        }
+    }
+    cut.push('\u{2026}');
+    Some(cut)
+}
+
+/// First 8 + last 3 chars of a client_id (`rKkfrep1…Y58`); short ids as-is.
+pub fn client_id_short(id: &str) -> String {
+    let n = id.chars().count();
+    if n <= 12 {
+        return id.to_string();
+    }
+    let head: String = id.chars().take(8).collect();
+    let tail: String = id.chars().skip(n - 3).collect();
+    format!("{head}\u{2026}{tail}")
 }
 
 /// A human operator's response to one [`PendingApproval`] — deliberately a
@@ -519,6 +629,63 @@ impl Default for Approvals {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn summary_value_passes_thai_combining_marks_and_emoji_through() {
+        assert_eq!(
+            summary_value("ทดสอบ approve จากมือถือ 1"),
+            "\"ทดสอบ approve จากมือถือ 1\""
+        );
+        assert_eq!(summary_value("ok 🚀"), "\"ok 🚀\"");
+    }
+
+    #[test]
+    fn summary_value_escapes_quote_and_backslash() {
+        assert_eq!(summary_value(r#"a"b\c"#), r#""a\"b\\c""#);
+    }
+
+    #[test]
+    fn summary_value_makes_bidi_and_control_characters_visible() {
+        assert_eq!(summary_value("a\u{202e}b"), "\"a\\u{202e}b\"");
+        assert_eq!(summary_value("a\nb\tc"), "\"a\\u{a}b\\u{9}c\"");
+        assert_eq!(
+            summary_value("\u{2066}\u{200f}\u{61c}"),
+            "\"\\u{2066}\\u{200f}\\u{61c}\""
+        );
+    }
+
+    #[test]
+    fn summary_opt_renders_none_as_the_given_label() {
+        assert_eq!(summary_opt(None, "default"), "default");
+        assert_eq!(summary_opt(Some("v"), "default"), "\"v\"");
+    }
+
+    #[test]
+    fn sanitize_client_name_neutralises_and_caps_hostile_names() {
+        let hostile = format!("evil\u{202e}name\nline{}", "z".repeat(200));
+        let out = sanitize_client_name(&hostile).unwrap();
+        assert!(!out.contains('\u{202e}') && !out.contains('\n'), "{out}");
+        assert!(out.contains("\\u{202e}"), "{out}");
+        assert!(out.chars().count() <= 65, "{} chars", out.chars().count());
+        assert!(out.ends_with('\u{2026}'));
+        assert_eq!(sanitize_client_name("Claude").as_deref(), Some("Claude"));
+        assert_eq!(sanitize_client_name("  "), None);
+    }
+
+    #[test]
+    fn client_id_short_keeps_first_8_and_last_3() {
+        assert_eq!(
+            client_id_short("rKkfrep1IPUdbsIDkOsWPZoYfdIc6cx-qL8Vj1CGY58"),
+            "rKkfrep1\u{2026}Y58"
+        );
+        assert_eq!(client_id_short("client-1"), "client-1");
+    }
+
+    #[test]
+    fn escape_visible_leaves_quotes_and_thai_but_escapes_controls() {
+        assert_eq!(escape_visible("say \"hi\" ทดสอบ"), "say \"hi\" ทดสอบ");
+        assert_eq!(escape_visible("a\u{202e}\nb"), "a\\u{202e}\\u{a}b");
+    }
+
     use super::*;
 
     /// A pending entry whose TTL is comfortably LIVE. That matters:
@@ -541,6 +708,9 @@ mod tests {
             created: now,
             expires: now + 300,
             class: RiskClass::Mutating,
+            client_name: None,
+            subject: Default::default(),
+            grant_minutes: None,
         }
     }
 
@@ -797,7 +967,7 @@ mod tests {
         assert!(p.expires > p.created, "{p:?}");
         assert_eq!(p.class, RiskClass::Mutating);
 
-        // Serializes to EXACTLY these 8 fields — a JSON object with no extra
+        // Serializes to EXACTLY these 11 fields — a JSON object with no extra
         // keys, so no token / full note body / host path could sneak in
         // through a field this struct doesn't have. (`vault` is a
         // `gateway.yml` vault NAME, never a path — see its own doc comment.)
@@ -810,9 +980,12 @@ mod tests {
             [
                 "class",
                 "client_id",
+                "client_name",
                 "created",
                 "expires",
+                "grant_minutes",
                 "id",
+                "subject",
                 "summary",
                 "tool",
                 "vault"

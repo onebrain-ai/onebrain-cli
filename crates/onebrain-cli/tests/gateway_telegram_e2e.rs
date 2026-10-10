@@ -887,12 +887,12 @@ fn assert_prompt_and_extract_buttons(send_body: &Value) -> Buttons {
         .as_str()
         .unwrap_or_else(|| panic!("sendMessage had no text field: {send_body}"));
     assert!(
-        text.contains("Tool: brain_capture"),
-        "the prompt must name the tool being approved: {text}"
+        text.contains("wants to save a new note"),
+        "the prompt must say what is being approved: {text}"
     );
     assert!(
-        text.contains("capture: title="),
-        "the prompt must carry the bounded args_summary, not something else: {text}"
+        text.contains("\u{1f4dd} Telegram E2E"),
+        "the prompt must carry the note title, not something else: {text}"
     );
     assert!(
         !text.contains(BODY_MARKER),
@@ -903,7 +903,7 @@ fn assert_prompt_and_extract_buttons(send_body: &Value) -> Buttons {
         .as_array()
         .unwrap_or_else(|| panic!("sendMessage had no inline_keyboard row: {send_body}"));
     assert_eq!(row.len(), 2, "{send_body}");
-    assert_eq!(row[0]["text"], "✅ Approve", "{send_body}");
+    assert_eq!(row[0]["text"], "✅ Allow", "{send_body}");
     assert_eq!(row[1]["text"], "⛔ Deny", "{send_body}");
     let approve_data = row[0]["callback_data"]
         .as_str()
@@ -1032,7 +1032,7 @@ fn a_capture_is_approved_from_telegram_end_to_end() {
         .as_str()
         .unwrap_or_else(|| panic!("editMessageText had no text field: {edit_body}"));
     assert!(
-        edit_text.starts_with("✅ Approved via telegram"),
+        edit_text.starts_with("✅ Allowed · \"Telegram E2E"),
         "{edit_text}"
     );
     assert_eq!(
@@ -1145,7 +1145,7 @@ fn d_capture_is_denied_from_telegram_end_to_end() {
         .as_str()
         .unwrap_or_else(|| panic!("editMessageText had no text field: {edit_body}"));
     assert!(
-        edit_text.starts_with("⛔ Denied via telegram"),
+        edit_text.starts_with("⛔ Denied · nothing was written to the vault"),
         "{edit_text}"
     );
     assert_eq!(

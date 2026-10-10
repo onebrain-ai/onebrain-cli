@@ -45,6 +45,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use super::approval::{self, PendingApproval};
+use super::approval_view;
 use super::oauth_routes::{AuthCtx, PairingCheck};
 use super::policy::{GrantKey, PolicyMode};
 use super::server::GatewayState;
@@ -120,8 +121,28 @@ async fn require_pairing_header(
 /// `GET /approvals` — every currently pending approval. See
 /// [`super::approval::Approvals::list`]'s own doc comment for why this can
 /// never expose more than [`PendingApproval`]'s own fields.
-async fn list_approvals(State(state): State<Arc<GatewayState>>) -> Json<Vec<PendingApproval>> {
-    Json(state.approvals.list())
+async fn list_approvals(State(state): State<Arc<GatewayState>>) -> Json<Vec<ApprovalListItem>> {
+    let now = crate::commands::gateway::auth::core::now_epoch_secs();
+    Json(
+        state
+            .approvals
+            .list()
+            .into_iter()
+            .map(|p| ApprovalListItem {
+                description: approval_view::describe(&p, now),
+                pending: p,
+            })
+            .collect(),
+    )
+}
+
+/// One `GET /approvals` row: the pending entry's own fields plus the same
+/// plain-words description the Telegram and native prompts use.
+#[derive(serde::Serialize)]
+struct ApprovalListItem {
+    #[serde(flatten)]
+    pending: PendingApproval,
+    description: String,
 }
 
 /// `POST /approvals/{id}` request body: `{"decision":"approve"|"deny"}`.
@@ -256,6 +277,9 @@ mod tests {
             created: now,
             expires: now + 300,
             class: RiskClass::Mutating,
+            client_name: None,
+            subject: Default::default(),
+            grant_minutes: None,
         }
     }
 

@@ -59,6 +59,7 @@ use crate::commands::gateway::approval::{
 };
 use crate::commands::gateway::approval_native;
 use crate::commands::gateway::approval_routes::approval_router;
+use crate::commands::gateway::approval_view;
 use crate::commands::gateway::audit::{AuditEntry, AuditLog, Decision, Outcome};
 use crate::commands::gateway::auth::core::{mint_secret_32, now_epoch_secs};
 use crate::commands::gateway::auth::middleware::require_bearer;
@@ -135,6 +136,11 @@ pub struct GatewayState {
     /// `gateway.yml`) makes both calls unconditionally no-ops, never a
     /// special case the caller has to think about.
     pub telegram: Option<Arc<telegram::TelegramChannel>>,
+    /// The OAuth context, set once by [`build_gateway_router`]. Used ONLY to
+    /// look up a client's self-registered display name when an approval is
+    /// created (the approval path, not every request). Unset (tests, early
+    /// startup) just means no name is shown.
+    pub auth: std::sync::OnceLock<Arc<AuthCtx>>,
 }
 
 impl GatewayState {
@@ -164,6 +170,7 @@ impl GatewayState {
             audit,
             approvals: Arc::new(Approvals::new()),
             telegram,
+            auth: std::sync::OnceLock::new(),
         }
     }
 }
@@ -978,6 +985,18 @@ fn extract_principal(parts: &Parts) -> Result<Principal, ErrorData> {
 /// marker it is when grepping the audit log.
 const UNKNOWN_PRINCIPAL_CLIENT_ID: &str = "<no-principal>";
 
+/// The operator-facing `args_summary` for `brain_capture` (see the call
+/// site for the never-the-body rule): title and vault via
+/// [`approval::summary_opt`], the body by char count only.
+fn capture_summary(title: Option<&str>, vault: Option<&str>, text: &str) -> String {
+    format!(
+        "capture: title={} vault={} text_chars={}",
+        approval::summary_opt(title, "(none)"),
+        approval::summary_opt(vault, "default"),
+        text.chars().count()
+    )
+}
+
 /// [`extract_principal`], plus one more thing: on failure, records a
 /// minimal audit entry BEFORE returning the error (Task 3 review, binding
 /// requirement B). The bare `extract_principal(&parts)?` this replaces
@@ -1067,6 +1086,22 @@ async fn announce_approval_wait(
     }
 }
 
+/// The client's self-registered name, sanitized for display. A single small
+/// read, done only when an approval is created; any failure means no name.
+fn registered_client_name(state: &GatewayState, client_id: &str) -> Option<String> {
+    let ctx = state.auth.get()?;
+    let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
+    let name = store.get_client(client_id).ok().flatten()?.client_name?;
+    approval::sanitize_client_name(&name)
+}
+
+/// What a gated call tells the approval machinery about itself: the
+/// redacted audit line, plus the structured facts the prompts are built from.
+struct GateCall<'a> {
+    args_summary: &'a str,
+    subject: approval_view::ApprovalSubject,
+}
+
 /// Runs the policy check ([`policy::decide`]) for one tool call of risk
 /// class `class`. `Ok((Decision::Auto | Decision::Approved, channel))` means
 /// the call may proceed; `Err((Decision, channel, ErrorData))` carries the
@@ -1116,7 +1151,7 @@ async fn policy_gate(
     tool: &'static str,
     class: RiskClass,
     vault: Option<&str>,
-    args_summary: &str,
+    call: &GateCall<'_>,
     ctx: Option<&RequestContext<RoleServer>>,
 ) -> Result<(Decision, Option<ResolvedVia>), (Decision, Option<ResolvedVia>, ErrorData)> {
     match policy::decide(&state.config.policy, &state.grants, principal, class, vault) {
@@ -1129,7 +1164,7 @@ async fn policy_gate(
             ErrorData::invalid_request(format!("gateway policy denies this call [{tool}]"), None),
         )),
         PolicyOutcome::NeedApproval => {
-            await_approval(state, principal, tool, class, vault, args_summary, ctx).await
+            await_approval(state, principal, tool, class, vault, call, ctx).await
         }
     }
 }
@@ -1240,7 +1275,7 @@ async fn await_approval(
     tool: &'static str,
     class: RiskClass,
     vault: Option<&str>,
-    args_summary: &str,
+    call: &GateCall<'_>,
     ctx: Option<&RequestContext<RoleServer>>,
 ) -> Result<(Decision, Option<ResolvedVia>), (Decision, Option<ResolvedVia>, ErrorData)> {
     let wait_secs = state.config.policy.approval_wait_seconds;
@@ -1254,10 +1289,14 @@ async fn await_approval(
         // copy: this string is shown to a human over `GET /approvals` and
         // handed to `osascript` as a command-line argument. See
         // [`bounded_summary`].
-        summary: bounded_summary(args_summary.to_string()),
+        summary: bounded_summary(call.args_summary.to_string()),
         created: now,
         expires: now.saturating_add(wait_secs),
         class,
+        client_name: registered_client_name(state, &principal.client_id),
+        subject: call.subject.clone(),
+        grant_minutes: (state.config.policy.mode_for(class) == PolicyMode::AskOnce)
+            .then_some(state.config.policy.grant_ttl_minutes),
     };
     let id = pending.id.clone();
     let rx = match state.approvals.register(pending.clone()) {
@@ -1407,13 +1446,29 @@ async fn await_approval(
             // `telegram_api::BotApi::edit_message_text`'s own doc comment
             // for why that requires an explicit empty keyboard).
             if let Some(t) = &state.telegram {
-                t.note_outcome(&id, &format!("✅ Approved via {}", via.as_str()));
+                t.note_outcome(
+                    &id,
+                    &approval_view::telegram_outcome(
+                        &pending,
+                        approval_view::Outcome::Decided(approval::Decision::Approve, via),
+                        now_epoch_secs(),
+                        &approval_view::local_hhmm,
+                    ),
+                );
             }
             Ok((Decision::Approved, Some(via)))
         }
         WaitOutcome::Decided(approval::Decision::Deny, via) => {
             if let Some(t) = &state.telegram {
-                t.note_outcome(&id, &format!("⛔ Denied via {}", via.as_str()));
+                t.note_outcome(
+                    &id,
+                    &approval_view::telegram_outcome(
+                        &pending,
+                        approval_view::Outcome::Decided(approval::Decision::Deny, via),
+                        now_epoch_secs(),
+                        &approval_view::local_hhmm,
+                    ),
+                );
             }
             Err((
                 Decision::Denied,
@@ -1434,7 +1489,15 @@ async fn await_approval(
         }
         WaitOutcome::TimedOut => {
             if let Some(t) = &state.telegram {
-                t.note_outcome(&id, "⏰ Expired — no one answered in time");
+                t.note_outcome(
+                    &id,
+                    &approval_view::telegram_outcome(
+                        &pending,
+                        approval_view::Outcome::TimedOut,
+                        now_epoch_secs(),
+                        &approval_view::local_hhmm,
+                    ),
+                );
             }
             Err((
                 Decision::TimedOut,
@@ -1619,7 +1682,10 @@ impl GatewayServer {
             "capabilities",
             RiskClass::ReadOnly,
             None,
-            &args_summary,
+            &GateCall {
+                args_summary: &args_summary,
+                subject: approval_view::ApprovalSubject::default(),
+            },
             Some(&ctx),
         )
         .await
@@ -1675,8 +1741,12 @@ impl GatewayServer {
             extract_principal_audited(&self.state, "brain_tasks", started, &parts).await?;
         let vault = params.vault.clone();
         let args_summary = format!(
-            "tasks: due_by={:?} limit={:?} vault={:?}",
-            params.due_by, params.limit, params.vault
+            "tasks: due_by={} limit={} vault={}",
+            approval::summary_opt(params.due_by.as_deref(), "(none)"),
+            params
+                .limit
+                .map_or_else(|| "(none)".to_string(), |n| n.to_string()),
+            approval::summary_opt(params.vault.as_deref(), "default")
         );
 
         let (decision, channel, result) = match policy_gate(
@@ -1685,7 +1755,10 @@ impl GatewayServer {
             "brain_tasks",
             RiskClass::ReadOnly,
             params.vault.as_deref(),
-            &args_summary,
+            &GateCall {
+                args_summary: &args_summary,
+                subject: approval_view::ApprovalSubject::default(),
+            },
             Some(&ctx),
         )
         .await
@@ -1772,7 +1845,11 @@ impl GatewayServer {
         let principal =
             extract_principal_audited(&self.state, "brain_get", started, &parts).await?;
         let vault = params.vault.clone();
-        let args_summary = format!("get: {} vault={:?}", params.file, params.vault);
+        let args_summary = format!(
+            "get: {} vault={}",
+            approval::summary_value(&params.file),
+            approval::summary_opt(params.vault.as_deref(), "default")
+        );
 
         let (decision, channel, result) = match policy_gate(
             &self.state,
@@ -1780,7 +1857,10 @@ impl GatewayServer {
             "brain_get",
             RiskClass::ReadOnly,
             params.vault.as_deref(),
-            &args_summary,
+            &GateCall {
+                args_summary: &args_summary,
+                subject: approval_view::ApprovalSubject::new(Some(&params.file), None),
+            },
             Some(&ctx),
         )
         .await
@@ -1864,8 +1944,12 @@ impl GatewayServer {
             extract_principal_audited(&self.state, "brain_search", started, &parts).await?;
         let vault = params.vault.clone();
         let args_summary = format!(
-            "search: {:?} top_k={:?} vault={:?}",
-            params.query, params.top_k, params.vault
+            "search: {} top_k={} vault={}",
+            approval::summary_value(&params.query),
+            params
+                .top_k
+                .map_or_else(|| "(none)".to_string(), |n| n.to_string()),
+            approval::summary_opt(params.vault.as_deref(), "default")
         );
 
         let (decision, channel, result) = match policy_gate(
@@ -1874,7 +1958,10 @@ impl GatewayServer {
             "brain_search",
             RiskClass::ReadOnly,
             params.vault.as_deref(),
-            &args_summary,
+            &GateCall {
+                args_summary: &args_summary,
+                subject: approval_view::ApprovalSubject::new(Some(&params.query), None),
+            },
             Some(&ctx),
         )
         .await
@@ -1958,11 +2045,10 @@ impl GatewayServer {
         // `audit::AuditEntry::args_summary`'s own doc comment (this string
         // also becomes `PendingApproval::summary` if the call needs
         // approval, an operator-facing field with the identical constraint).
-        let args_summary = format!(
-            "capture: title={:?} vault={:?} text_chars={}",
-            params.title,
-            params.vault,
-            params.text.chars().count()
+        let args_summary = capture_summary(
+            params.title.as_deref(),
+            params.vault.as_deref(),
+            &params.text,
         );
 
         let (decision, channel, result) = match policy_gate(
@@ -1971,7 +2057,13 @@ impl GatewayServer {
             "brain_capture",
             RiskClass::Mutating,
             params.vault.as_deref(),
-            &args_summary,
+            &GateCall {
+                args_summary: &args_summary,
+                subject: approval_view::ApprovalSubject::new(
+                    params.title.as_deref(),
+                    Some(params.text.chars().count()),
+                ),
+            },
             Some(&ctx),
         )
         .await
@@ -2274,6 +2366,12 @@ impl ServerHandler for GatewayServer {
 /// `tests::every_non_mcp_route_rejects_a_rebinding_host_on_the_real_router` /
 /// `tests::public_url_host_reaches_oauth_and_mcp_through_both_guards`.
 pub fn build_gateway_router(state: Arc<GatewayState>, auth_ctx: Arc<AuthCtx>) -> axum::Router {
+    // Built once per process; a second, different context would be a bug.
+    let first = state.auth.set(auth_ctx.clone()).is_ok();
+    debug_assert!(
+        first,
+        "build_gateway_router called twice for one GatewayState"
+    );
     // Cloned BEFORE the `move` closure below takes ownership of `state` for
     // the `/mcp` factory's own per-request `state.clone()` — `approval_router`
     // needs its own handle on the SAME `Arc<GatewayState>` afterward.
@@ -4373,6 +4471,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn capture_summary_keeps_thai_titles_readable_and_never_shows_option_debug() {
+        assert_eq!(
+            capture_summary(Some("ทดสอบ approve จากมือถือ 1"), None, &"x".repeat(25)),
+            "capture: title=\"ทดสอบ approve จากมือถือ 1\" vault=default text_chars=25"
+        );
+        assert_eq!(
+            capture_summary(None, Some("work"), "body"),
+            "capture: title=(none) vault=\"work\" text_chars=4"
+        );
+    }
+
     // ── args_summary is bounded before it is recorded (round-2 finding C) ─
 
     #[test]
@@ -5285,6 +5395,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grant_window_reaches_the_pending_entry_from_config_only_under_ask_once() {
+        for (mode, ttl, want) in [
+            (policy::PolicyMode::AskOnce, 17, Some(17)),
+            (policy::PolicyMode::AskAlways, 17, None),
+        ] {
+            let (_dir, router, state, token) = fixture_router_with_mutating_policy(mode, 300, ttl);
+            let handle = tokio::spawn(async move {
+                let body = call_body(
+                    1,
+                    "brain_capture",
+                    serde_json::json!({"title": "G", "text": "b"}),
+                );
+                post(
+                    &router,
+                    body,
+                    &token,
+                    &standard_headers("tools/call", Some("brain_capture")),
+                )
+                .await
+            });
+            let pending = wait_for_one_pending(&state).await;
+            assert_eq!(pending.grant_minutes, want);
+            state.approvals.resolve(
+                &pending.id,
+                approval::Decision::Deny,
+                approval::ResolvedVia::Http,
+            );
+            let _ = handle.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_registered_client_name_reaches_the_pending_prompt_sanitized() {
+        use crate::commands::gateway::auth::store::{AppType, RegisteredClient};
+        let (_dir, router, state, token) =
+            fixture_router_with_mutating_policy(policy::PolicyMode::AskOnce, 300, 30);
+        {
+            let ctx = state.auth.get().expect("router build sets the auth ctx");
+            let store = ctx.store.lock().unwrap();
+            store
+                .register_client(RegisteredClient {
+                    client_id: "test-client".to_string(),
+                    client_name: Some(format!("Cla\u{202e}ude\n{}", "z".repeat(500))),
+                    redirect_uris: vec![],
+                    application_type: AppType::Web,
+                    created: 0,
+                })
+                .unwrap();
+        }
+        let handle = tokio::spawn(async move {
+            let body = call_body(
+                1,
+                "brain_capture",
+                serde_json::json!({"title": "Named", "text": "b"}),
+            );
+            post(
+                &router,
+                body,
+                &token,
+                &standard_headers("tools/call", Some("brain_capture")),
+            )
+            .await
+        });
+        let pending = wait_for_one_pending(&state).await;
+        let name = pending.client_name.clone().expect("name looked up");
+        assert!(name.starts_with("Cla\\u{202e}ude\\u{a}zzz"), "{name}");
+        assert!(name.chars().count() <= 65, "capped");
+        let prompt = approval_view::telegram_body(&pending);
+        assert!(prompt.starts_with("\u{1f510} Cla\\u{202e}ude"), "{prompt}");
+        state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Deny,
+            approval::ResolvedVia::Http,
+        );
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
     async fn brain_capture_ask_once_deny_out_of_band_returns_a_policy_error_with_no_file() {
         let (dir, router, state, token) =
             fixture_router_with_mutating_policy(policy::PolicyMode::AskOnce, 300, 30);
@@ -5601,6 +5789,9 @@ mod tests {
                         created: now,
                         expires: now + 300,
                         class: RiskClass::Mutating,
+                        client_name: None,
+                        subject: Default::default(),
+                        grant_minutes: None,
                     })
                     .unwrap_or_else(|e| panic!("filler {i} must fit under the cap: {e:?}")),
             );
@@ -5697,6 +5888,9 @@ mod tests {
                 created: now,
                 expires: now + 300,
                 class: RiskClass::Mutating,
+                client_name: None,
+                subject: Default::default(),
+                grant_minutes: None,
             }
         };
         let deny = approval::Decision::Deny;
@@ -6388,7 +6582,7 @@ mod tests {
             body["text"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("✅ Approved via http"),
+                .contains("💻 Answered on the approvals page · allowed"),
             "the edit must name the channel that actually answered: {body}"
         );
 
@@ -6461,7 +6655,7 @@ mod tests {
             body["text"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("⛔ Denied via http"),
+                .contains("💻 Answered on the approvals page · denied"),
             "{body}"
         );
 
@@ -6524,7 +6718,7 @@ mod tests {
             body["text"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("⏰ Expired — no one answered in time"),
+                .contains("⌛ Timed out · denied automatically, nothing written"),
             "{body}"
         );
 

@@ -309,7 +309,7 @@ fn dialog_timeout_secs(p: &PendingApproval, now: u64) -> u64 {
 }
 
 /// Build the `-e` script text handed to `osascript`: a `display dialog`
-/// with an "Approve"/"Deny" button pair (default button "Approve", so a
+/// with a "Deny"/"Allow" button pair (default button "Allow", so a
 /// stray Return key press never silently denies), embedding `p`'s
 /// `client_id`/`tool`/`summary` — every one of them run through
 /// [`escape_applescript_string`] first (see module docs' "Security"
@@ -319,16 +319,18 @@ fn dialog_timeout_secs(p: &PendingApproval, now: u64) -> u64 {
 /// produces the value). Pure and fully unit-testable without ever invoking
 /// `osascript`.
 fn build_dialog_script(p: &PendingApproval, giving_up_after: u64) -> String {
-    let client_id = escape_applescript_string(&p.client_id);
-    let tool = escape_applescript_string(&p.tool);
-    let summary = escape_applescript_string(&p.summary);
+    let message = super::approval_view::dialog_lines(p, giving_up_after)
+        .iter()
+        .map(|l| escape_applescript_string(l))
+        .collect::<Vec<_>>()
+        .join("\\n");
     format!(
-        "display dialog \"OneBrain gateway approval request\\n\\nClient: {client_id}\\nTool: {tool}\\nSummary: {summary}\" with title \"OneBrain Gateway\" buttons {{\"Deny\", \"Approve\"}} default button \"Approve\" with icon caution giving up after {giving_up_after}"
+        "display dialog \"{message}\" with title \"OneBrain\" buttons {{\"Deny\", \"Allow\"}} default button \"Allow\" with icon caution giving up after {giving_up_after}"
     )
 }
 
 /// Parse `osascript`'s stdout from a completed `display dialog` call (text
-/// form: `button returned:Approve`, optionally followed by more
+/// form: `button returned:Allow`, optionally followed by more
 /// comma-separated fields we don't use) into a [`Decision`]. Returns `None`
 /// for anything that doesn't cleanly parse as one of our two known button
 /// labels — an unexpected shape here is treated exactly like every other
@@ -345,7 +347,7 @@ fn build_dialog_script(p: &PendingApproval, giving_up_after: u64) -> String {
 fn decision_from_button_output(stdout: &str) -> Option<Decision> {
     let first_field = stdout.trim().split(',').next()?.trim();
     match first_field.strip_prefix("button returned:")?.trim() {
-        "Approve" => Some(Decision::Approve),
+        "Allow" => Some(Decision::Approve),
         "Deny" => Some(Decision::Deny),
         _ => None,
     }
@@ -488,6 +490,9 @@ mod tests {
             created: now,
             expires: now + 300,
             class: crate::commands::gateway::policy::RiskClass::Mutating,
+            client_name: None,
+            subject: Default::default(),
+            grant_minutes: None,
         }
     }
 
@@ -605,9 +610,9 @@ mod tests {
     // ── build_dialog_script: the payload appears only escaped ───────────
 
     #[test]
-    fn build_dialog_script_embeds_only_the_escaped_form_of_a_malicious_client_id() {
+    fn build_dialog_script_embeds_only_the_escaped_form_of_a_malicious_client_name() {
         let mut p = sample();
-        p.client_id = r#"" & do shell script "id"#.to_string();
+        p.client_name = Some(r#"" & do shell script "id"#.to_string());
         let script = build_dialog_script(&p, 300);
         assert!(
             !script.contains(r#"" & do shell script "id"#),
@@ -622,10 +627,67 @@ mod tests {
     #[test]
     fn build_dialog_script_has_the_expected_buttons_and_default() {
         let script = build_dialog_script(&sample(), 300);
-        assert!(script.contains("buttons {\"Deny\", \"Approve\"}"));
-        assert!(script.contains("default button \"Approve\""));
-        assert!(script.contains("Client: client-1"));
-        assert!(script.contains("Tool: brain_capture"));
+        assert!(script.contains("buttons {\"Deny\", \"Allow\"}"));
+        assert!(script.contains("default button \"Allow\""));
+        assert!(script.contains("with title \"OneBrain\""));
+    }
+
+    #[test]
+    fn build_dialog_script_golden_for_a_capture() {
+        let mut p = sample();
+        p.client_id = "rKkfrep1IPUdbsIDkOsWPZoYfdIc6cx-qL8Vj1CGY58".to_string();
+        p.client_name = Some("Claude".to_string());
+        p.vault = None;
+        p.subject = crate::commands::gateway::approval_view::ApprovalSubject::new(
+            Some("ทดสอบ approve จากมือถือ 1"),
+            Some(25),
+        );
+        assert_eq!(
+            build_dialog_script(&p, 240),
+            "display dialog \"Claude wants to save a new note to OneBrain\\n\\n\
+             Note title: ทดสอบ approve จากมือถือ 1\\n\
+             Vault: default\\n\
+             Length: 25 characters\\n\\n\
+             Asked by Claude (self-declared name \u{b7} id rKkfrep1\u{2026}Y58) \u{b7} answer within 4 min\" \
+             with title \"OneBrain\" buttons {\"Deny\", \"Allow\"} default button \"Allow\" \
+             with icon caution giving up after 240"
+        );
+    }
+
+    #[test]
+    fn build_dialog_script_unknown_tool_and_unnamed_client() {
+        let mut p = sample();
+        p.tool = "brain_zap".to_string();
+        p.client_name = None;
+        p.subject = Default::default();
+        let script = build_dialog_script(&p, 30);
+        assert!(
+            script.contains("An unnamed app wants to run brain_zap\\n\\nVault: t1\\n\\n"),
+            "{script}"
+        );
+        assert!(
+            script.contains(
+                "Asked by an unnamed app (id client-1) \u{b7} answer in under a minute\""
+            ),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn build_dialog_script_neutralises_a_hostile_client_name() {
+        let mut p = sample();
+        p.client_name = crate::commands::gateway::approval::sanitize_client_name(&format!(
+            "evil\u{202e}\nname{}",
+            "z".repeat(200)
+        ));
+        let title = format!("t\u{202e}\"; do shell script \"x\n{}", "y".repeat(500));
+        p.subject =
+            crate::commands::gateway::approval_view::ApprovalSubject::new(Some(&title), Some(3));
+        let script = build_dialog_script(&p, 300);
+        assert!(!script.contains('\u{202e}'), "{script}");
+        assert!(!script.contains("t\u{202e}\"; do"), "{script}");
+        assert!(!script.contains("evil\nname"), "{script}");
+        assert!(script.len() < 1000, "cap not applied: {}", script.len());
     }
 
     // ── The dialog is time-bounded (round-2 finding A) ───────────────────
@@ -697,7 +759,7 @@ mod tests {
     #[test]
     fn parses_approve_and_deny() {
         assert_eq!(
-            decision_from_button_output("button returned:Approve"),
+            decision_from_button_output("button returned:Allow"),
             Some(Decision::Approve)
         );
         assert_eq!(
@@ -709,7 +771,7 @@ mod tests {
     #[test]
     fn parses_extra_trailing_fields() {
         assert_eq!(
-            decision_from_button_output("button returned:Approve, gave up:false"),
+            decision_from_button_output("button returned:Allow, gave up:false"),
             Some(Decision::Approve)
         );
     }
