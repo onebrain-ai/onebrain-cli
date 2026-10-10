@@ -5,7 +5,6 @@
 
 mod support;
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 use std::path::Path;
 use tempfile::tempdir;
@@ -76,8 +75,7 @@ fn doctor_clean_vault_exits_0() {
     // than ✓. The test asserts the no-error invariant by checking that no fail
     // (`✗`) glyph row is rendered and the footer reports "0 fail" (v3.2.1
     // grouped layout).
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    support::onebrain_cmd()
         .current_dir(d.path())
         .arg("doctor")
         .assert()
@@ -119,8 +117,7 @@ fn doctor_search_check_reads_engine_status_after_reindex() {
     //    markers): the engine opens fresh and reports no last_indexed stamp →
     //    the "never reindexed" arm.
     std::fs::create_dir_all(cache.path().join("search/doctor-it-engine")).unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    support::onebrain_cmd()
         .current_dir(vault.path())
         .env("ONEBRAIN_CACHE_DIR", cache.path())
         .arg("doctor")
@@ -129,8 +126,7 @@ fn doctor_search_check_reads_engine_status_after_reindex() {
         .stdout(predicate::str::contains("never reindexed"));
 
     // Empty-vault reindex: builds the index files, downloads nothing.
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    support::onebrain_cmd()
         .current_dir(vault.path())
         .env("ONEBRAIN_CACHE_DIR", cache.path())
         .args(["search", "reindex"])
@@ -138,8 +134,7 @@ fn doctor_search_check_reads_engine_status_after_reindex() {
         .success();
 
     // 1. Index exists + up to date + model absent → advisory warn.
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    support::onebrain_cmd()
         .current_dir(vault.path())
         .env("ONEBRAIN_CACHE_DIR", cache.path())
         .arg("doctor")
@@ -150,8 +145,7 @@ fn doctor_search_check_reads_engine_status_after_reindex() {
 
     // 2. A new note → pending drift reported from Engine::status.
     std::fs::write(vault.path().join("00-inbox/note.md"), "# hello\n").unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    support::onebrain_cmd()
         .current_dir(vault.path())
         .env("ONEBRAIN_CACHE_DIR", cache.path())
         .arg("doctor")
@@ -271,8 +265,7 @@ fn doctor_search_check_reads_counts_from_matching_daemon() {
     );
     write_daemon_record(home.path(), vault.path(), port);
 
-    let assert = Command::cargo_bin("onebrain")
-        .unwrap()
+    let assert = support::onebrain_cmd()
         .current_dir(vault.path())
         .env("HOME", home.path())
         .env("ONEBRAIN_CACHE_DIR", cache.path())
@@ -322,8 +315,7 @@ fn doctor_search_check_falls_back_direct_when_daemon_unreachable() {
     };
     write_daemon_record(home.path(), vault.path(), dead_port);
 
-    let assert = Command::cargo_bin("onebrain")
-        .unwrap()
+    let assert = support::onebrain_cmd()
         .current_dir(vault.path())
         .env("HOME", home.path())
         .env("ONEBRAIN_CACHE_DIR", cache.path())
@@ -409,8 +401,7 @@ fn doctor_all_green_and_fix_noop_with_fake_model_dir() {
             .join("search/doctor-it-green/models--onebrain-ai--onebrain-rerank-v1"),
     )
     .unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    support::onebrain_cmd()
         .current_dir(vault.path())
         .env("HOME", home.path())
         // Isolate `$PATH` too (not just `$HOME`) so the new `qmd-leftovers`
@@ -421,8 +412,7 @@ fn doctor_all_green_and_fix_noop_with_fake_model_dir() {
         .assert()
         .success();
 
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    support::onebrain_cmd()
         .current_dir(vault.path())
         .env("HOME", home.path())
         // Isolate `$PATH` too (not just `$HOME`) so the new `qmd-leftovers`
@@ -437,8 +427,7 @@ fn doctor_all_green_and_fix_noop_with_fake_model_dir() {
         .stdout(predicate::str::contains("checks · all ok"));
 
     // All checks pass → --fix has nothing to do.
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    support::onebrain_cmd()
         .current_dir(vault.path())
         .env("HOME", home.path())
         // Isolate `$PATH` too (not just `$HOME`) so the new `qmd-leftovers`
@@ -470,8 +459,7 @@ fn doctor_fix_json_reports_legacy_qmd_collection_outcome() {
     // that name it finds under the process-wide cache root.
     let cache = tempdir().unwrap();
 
-    let assert = Command::cargo_bin("onebrain")
-        .unwrap()
+    let assert = support::onebrain_cmd()
         .current_dir(vault.path())
         .env("PATH", "/usr/bin:/bin")
         .env("ONEBRAIN_CACHE_DIR", cache.path())
@@ -529,8 +517,7 @@ fn doctor_fix_json_never_deletes_qmd_leftovers() {
     let config_dir = home.path().join(".config/qmd");
     std::fs::create_dir_all(&config_dir).unwrap();
 
-    let assert = Command::cargo_bin("onebrain")
-        .unwrap()
+    let assert = support::onebrain_cmd()
         .current_dir(vault.path())
         .env("HOME", home.path())
         .env("PATH", "/usr/bin:/bin") // no real qmd binary reachable
@@ -604,8 +591,7 @@ fn doctor_fix_piped_text_mode_never_deletes_qmd_leftovers() {
 
     // Plain text-mode --fix: no --json, no --yes. Under the harness stdin is
     // null and stdout is piped — the auto-proceed route.
-    let assert = Command::cargo_bin("onebrain")
-        .unwrap()
+    let assert = support::onebrain_cmd()
         .current_dir(vault.path())
         .env("HOME", home.path())
         .env("PATH", "/usr/bin:/bin") // no real qmd binary reachable
@@ -645,8 +631,7 @@ fn doctor_missing_folder_exits_1() {
     let d = tempdir().unwrap();
     write_minimal_vault(d.path());
     std::fs::remove_dir_all(d.path().join("01-projects")).unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    support::onebrain_cmd()
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(d.path())
         .arg("doctor")
@@ -663,8 +648,7 @@ fn doctor_missing_folder_exits_1() {
 #[test]
 fn doctor_missing_vault_yml_errors_out() {
     let d = tempdir().unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    support::onebrain_cmd()
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(d.path())
         .arg("doctor")
@@ -679,8 +663,7 @@ fn doctor_missing_vault_yml_errors_out() {
 #[test]
 fn doctor_json_mode_not_in_vault_emits_json_error_envelope() {
     let d = tempdir().unwrap();
-    let assert = Command::cargo_bin("onebrain")
-        .unwrap()
+    let assert = support::onebrain_cmd()
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(d.path())
         .args(["doctor", "--json"])
@@ -710,8 +693,7 @@ fn doctor_fix_migrates_legacy_qmd_collection() {
     // collection must never resolve against the developer's real cache root.
     let cache = tempdir().unwrap();
 
-    let assert = Command::cargo_bin("onebrain")
-        .unwrap()
+    let assert = support::onebrain_cmd()
         .current_dir(d.path())
         .env("PATH", "/usr/bin:/bin")
         .env("ONEBRAIN_CACHE_DIR", cache.path())
@@ -749,8 +731,7 @@ fn doctor_fix_migrates_legacy_qmd_collection() {
 fn doctor_invalid_yaml_falls_back_to_defaults() {
     let d = tempdir().unwrap();
     std::fs::write(d.path().join("vault.yml"), "not: : valid").unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    support::onebrain_cmd()
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(d.path())
         .arg("doctor")
@@ -766,8 +747,7 @@ fn doctor_orphan_checkpoints_warns_without_failing() {
     let cp = d.path().join("07-logs/checkpoint");
     std::fs::create_dir_all(&cp).unwrap();
     std::fs::write(cp.join("2026-05-19-XXX-checkpoint-01.md"), "x").unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    support::onebrain_cmd()
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(d.path())
         .arg("doctor")
@@ -787,8 +767,7 @@ fn doctor_stale_marketplace_warns() {
         r#"{"hooks":{"Stop":[{"hooks":[{"command":"onebrain","args":["checkpoint","stop"]}]}]},"permissions":{"allow":["Bash(onebrain *)"]},"extraKnownMarketplaces":{"onebrain":{"source":{"repo":"kengio/onebrain"}}}}"#,
     )
     .unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    support::onebrain_cmd()
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(d.path())
         .arg("doctor")
@@ -811,8 +790,7 @@ fn doctor_honors_vault_flag() {
     // the flag isn't honoured, walk-up fails and the smoke-test envelope
     // (`error: not_in_vault`) is what we'll see.
     let elsewhere = tempdir().unwrap();
-    let assert = Command::cargo_bin("onebrain")
-        .unwrap()
+    let assert = support::onebrain_cmd()
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(elsewhere.path())
         .args(["doctor", "--vault"])
@@ -858,8 +836,7 @@ fn doctor_fix_migrates_vault_yml_with_vault_flag() {
     assert!(!vault.path().join("onebrain.yml").exists());
     let original = std::fs::read_to_string(vault.path().join("vault.yml")).unwrap();
     let elsewhere = tempdir().unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    support::onebrain_cmd()
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(elsewhere.path())
         // Minimal, deterministic PATH so `doctor --fix` runs against a
@@ -954,8 +931,7 @@ fn doctor_fix_does_not_resurrect_vault_yml_after_migration() {
         std::fs::create_dir_all(vault.path().join(f)).unwrap();
     }
 
-    let _ = Command::cargo_bin("onebrain")
-        .unwrap()
+    let _ = support::onebrain_cmd()
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .env("PATH", "/usr/bin:/bin")
         .args(["doctor", "--fix", "--vault"])
@@ -1021,8 +997,7 @@ fn doctor_fix_text_mode_manual_issues_shows_manual_step_section() {
         r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"onebrain","args":["hook"]}]}]},"permissions":{"allow":["Bash(onebrain *)"]}}"#,
     )
     .unwrap();
-    let assert = Command::cargo_bin("onebrain")
-        .unwrap()
+    let assert = support::onebrain_cmd()
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(vault.path())
         .env("PATH", "/usr/bin:/bin")
@@ -1087,8 +1062,7 @@ fn doctor_fix_text_mode_mixed_auto_and_manual_issues() {
     std::fs::create_dir_all(&cp).unwrap();
     std::fs::write(cp.join("2026-05-19-XXX-checkpoint-01.md"), "x").unwrap();
 
-    let assert = Command::cargo_bin("onebrain")
-        .unwrap()
+    let assert = support::onebrain_cmd()
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(vault.path())
         .env("PATH", "/usr/bin:/bin")
@@ -1153,8 +1127,7 @@ fn doctor_fix_json_mode_emits_fix_array_with_outcomes() {
     )
     .unwrap();
 
-    let assert = Command::cargo_bin("onebrain")
-        .unwrap()
+    let assert = support::onebrain_cmd()
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(vault.path())
         .env("PATH", "/usr/bin:/bin")
@@ -1226,8 +1199,7 @@ fn doctor_fix_preserves_custom_keys_and_backs_up() {
     // and rebuilds that collection's tantivy index (the schema migration). A
     // config-comment test must never reach outside its tempdir.
     let cache = tempdir().unwrap();
-    Command::cargo_bin("onebrain")
-        .unwrap()
+    support::onebrain_cmd()
         .current_dir(elsewhere.path())
         .env("ONEBRAIN_CACHE_DIR", cache.path())
         .env("PATH", "/usr/bin:/bin") // scrub qmd so the probe degrades
@@ -1310,8 +1282,7 @@ fn doctor_fix_prunes_stale_plugin_cache_under_fake_home() {
     let vault = tempdir().unwrap();
     write_minimal_vault(vault.path());
 
-    let assert = Command::cargo_bin("onebrain")
-        .unwrap()
+    let assert = support::onebrain_cmd()
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
         .current_dir(vault.path())
         .env("HOME", home.path())
@@ -1367,8 +1338,7 @@ fn vault_with_config(dir: &Path, config: &str) {
 /// Run `doctor --json` (no fix) and return raw stdout. `ONEBRAIN_CACHE_DIR`
 /// is pointed at a tempdir so the search check never touches the real cache.
 fn run_doctor_json(dir: &Path, cache: &Path) -> String {
-    let assert = Command::cargo_bin("onebrain")
-        .unwrap()
+    let assert = support::onebrain_cmd()
         .current_dir(dir)
         .env("ONEBRAIN_CACHE_DIR", cache)
         .env("PATH", "/usr/bin:/bin")
@@ -1532,8 +1502,7 @@ fn doctor_flags_empty_folder_value_as_report_only() {
 /// plugin-cache can't touch the real machine) and return raw stdout.
 #[cfg(unix)]
 fn run_doctor_fix_json(dir: &Path, cache: &Path, home: &Path) -> String {
-    let assert = Command::cargo_bin("onebrain")
-        .unwrap()
+    let assert = support::onebrain_cmd()
         .current_dir(dir)
         .env("HOME", home)
         .env("ONEBRAIN_CACHE_DIR", cache)
@@ -1993,8 +1962,7 @@ fn doctor_fix_text_mode_partial_outcome_renders_distinct_glyph() {
                default_top_k: 0\n"
         ),
     );
-    let assert = Command::cargo_bin("onebrain")
-        .unwrap()
+    let assert = support::onebrain_cmd()
         .current_dir(d.path())
         .env("HOME", home.path())
         .env("ONEBRAIN_CACHE_DIR", cache.path())
@@ -2145,6 +2113,47 @@ fn check_statuses(v: &serde_json::Value, out: &mut Vec<(String, String)>) {
     }
 }
 
+/// Canary for #436: the sandboxed spawn must hide a "real" `~/.onebrain/gateway.yml`.
+/// The fake real HOME stands in for the process env the test runs under; the
+/// control run (no sandbox) proves the gateway rows really would leak.
+#[cfg(unix)]
+#[test]
+fn sandboxed_spawn_hides_a_real_home_gateway_yml_from_doctor() {
+    let vault = tempdir().unwrap();
+    write_minimal_vault(vault.path());
+    let real_home = tempdir().unwrap();
+    std::fs::create_dir_all(real_home.path().join(".onebrain")).unwrap();
+    std::fs::write(
+        real_home.path().join(".onebrain/gateway.yml"),
+        "port: 1\npolicy:\n  approval_wait_seconds: 900\n",
+    )
+    .unwrap();
+    let gateway_rows = |sandbox: bool| {
+        let mut cmd = assert_cmd::Command::cargo_bin("onebrain").unwrap();
+        cmd.current_dir(vault.path())
+            .env("HOME", real_home.path())
+            .env("USERPROFILE", real_home.path())
+            .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
+            .env("ONEBRAIN_SCHEDULER_NO_ACTIVATE", "1")
+            .env("PATH", "/usr/bin:/bin")
+            .args(["doctor", "--json"]);
+        if sandbox {
+            support::sandbox_env(&mut cmd);
+        }
+        let out = cmd.output().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let mut rows = Vec::new();
+        check_statuses(&v, &mut rows);
+        rows.retain(|(c, _)| c.starts_with("gateway-"));
+        rows
+    };
+    assert!(
+        !gateway_rows(false).is_empty(),
+        "control: an unsandboxed spawn must see the planted gateway.yml"
+    );
+    assert_eq!(gateway_rows(true), Vec::<(String, String)>::new());
+}
+
 #[cfg(unix)]
 #[test]
 fn doctor_shows_gateway_checks_only_when_gateway_yml_exists() {
@@ -2152,8 +2161,7 @@ fn doctor_shows_gateway_checks_only_when_gateway_yml_exists() {
     write_minimal_vault(vault.path());
     let home = tempdir().unwrap();
     let run = || {
-        let out = Command::cargo_bin("onebrain")
-            .unwrap()
+        let out = support::onebrain_cmd()
             .current_dir(vault.path())
             .env("HOME", home.path())
             .env("USERPROFILE", home.path())
@@ -2212,8 +2220,7 @@ fn doctor_reports_an_unparseable_gateway_yml_as_an_error_and_exits_1() {
         "port: [not, a, port\n",
     )
     .unwrap();
-    let out = Command::cargo_bin("onebrain")
-        .unwrap()
+    let out = support::onebrain_cmd()
         .current_dir(vault.path())
         .env("HOME", home.path())
         .env("USERPROFILE", home.path())

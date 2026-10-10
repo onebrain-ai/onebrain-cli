@@ -7,14 +7,82 @@ use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+/// Scratch dir under `target/` (not `/tmp`) so it shares a filesystem with
+/// the template dir in [`fake_onebrain`] and the fake child can be hard-linked.
+fn scratch() -> TempDir {
+    TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap()
+}
+
+/// The fake `onebrain` child is a two-stage script. `onebrain-child` is a
+/// POSIX `sh` front that answers the `search reindex` background path itself
+/// and hands every other invocation to the Python body in `onebrain-child.py`.
+///
+/// Why it is built this way (#437, `stop_dispatches_the_pending_embed_child`
+/// flaked under CPU load):
+///
+/// - **Mechanism (proven).** The Stop hook's background child
+///   `search reindex --pending-only` was spawned fine but was still not
+///   running at the 2 s `BACKGROUND_TIMEOUT` (`hook.rs:17`), so it was killed
+///   before its first line and never wrote its marker. With `hook.rs`
+///   temporarily patched to log, 4 of 50 loaded runs showed
+///   `DIAGTIMEOUT ["search","reindex","--pending-only","--json"] after ~2.0s`
+///   and no spawn error.
+/// - **Cause (ASSUMED, not isolated).** The child is starved on its first exec
+///   of a freshly written file (suspected macOS first-exec scan).
+/// - **The fix that matters: priming.** The template is exec'd once at
+///   creation, so later execs of the same inode are fast. Under 60 burners,
+///   `--test-threads 16`, whole file, 50 runs: priming removed 2/50 failures,
+///   priming present 0/50.
+/// - **Supporting changes, not the fix.** The `sh` front keeps the budgeted
+///   path off Python's start-up; scripts are written once and hard-linked per
+///   test. Neither alone cured it: `sh` front alone failed 8/50, `sh` front
+///   plus hard links failed 4/50 (the diagnostic run above).
+///
+/// The template dir is intentionally left under `target/` (swept by
+/// `cargo clean`).
 fn fake_onebrain(root: &Path) -> PathBuf {
-    let path = root.join("onebrain-child");
-    fs::write(
-        &path,
-        r#"#!/usr/bin/env python3
+    static TEMPLATE: OnceLock<PathBuf> = OnceLock::new();
+    let template = TEMPLATE.get_or_init(|| {
+        let dir = TempDir::new_in(env!("CARGO_TARGET_TMPDIR")).unwrap().keep();
+        for (name, text) in [("onebrain-child", FRONT), ("onebrain-child.py", BODY)] {
+            let path = dir.join(name);
+            fs::write(&path, text).unwrap();
+            let mut permissions = fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).unwrap();
+        }
+        // Prime the first exec (see the doc comment). Must not fail silently:
+        // a failed prime would drop the protection without any signal.
+        let primed = std::process::Command::new(dir.join("onebrain-child"))
+            .args(["search", "reindex"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("prime: spawn the fake child");
+        assert!(primed.success(), "prime: fake child failed: {primed:?}");
+        dir
+    });
+    for name in ["onebrain-child", "onebrain-child.py"] {
+        fs::hard_link(template.join(name), root.join(name)).unwrap();
+    }
+    root.join("onebrain-child")
+}
+
+const FRONT: &str = r#"#!/bin/sh
+if [ "$1" = "search" ] && [ "$2" = "reindex" ]; then
+    if [ -n "$FAKE_REINDEX_FILE" ]; then
+        printf '%s' "$*" > "$FAKE_REINDEX_FILE"
+    fi
+    echo "background output must stay hidden"
+    exit 0
+fi
+exec python3 "$0.py" "$@"
+"#;
+
+const BODY: &str = r#"#!/usr/bin/env python3
 import json
 import os
 import sys
@@ -46,21 +114,9 @@ elif args[:2] == ["session", "init"]:
 elif args[:2] == ["checkpoint", "stop"]:
     if not os.environ.get("FAKE_CHECKPOINT_SILENT"):
         print(json.dumps({"decision": "block", "reason": "15 since start"}))
-elif args[:2] == ["search", "reindex"]:
-    if os.environ.get("FAKE_REINDEX_FILE"):
-        with open(os.environ["FAKE_REINDEX_FILE"], "w", encoding="utf-8") as handle:
-            handle.write(" ".join(args))
-    print("background output must stay hidden")
 else:
     sys.exit(64)
-"#,
-    )
-    .unwrap();
-    let mut permissions = fs::metadata(&path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&path, permissions).unwrap();
-    path
-}
+"#;
 
 fn hook_command(fake: &Path, cache: &Path, event: &str, session_id: &str) -> Command {
     let mut command = Command::cargo_bin("onebrain").unwrap();
@@ -94,7 +150,7 @@ fn context(stdout: &[u8]) -> String {
 
 #[test]
 fn session_start_drains_output_larger_than_a_pipe() {
-    let temp = TempDir::new().unwrap();
+    let temp = scratch();
     let fake = fake_onebrain(temp.path());
 
     let output = hook_command(&fake, temp.path(), "SessionStart", "large-output")
@@ -110,7 +166,7 @@ fn session_start_drains_output_larger_than_a_pipe() {
 
 #[test]
 fn bare_onebrain_override_is_injected_as_the_resolved_absolute_path() {
-    let temp = TempDir::new().unwrap();
+    let temp = scratch();
     let fake = fake_onebrain(temp.path());
     let mut paths = vec![temp.path().to_path_buf()];
     paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
@@ -135,7 +191,7 @@ fn bare_onebrain_override_is_injected_as_the_resolved_absolute_path() {
 
 #[test]
 fn relative_onebrain_override_is_injected_as_the_resolved_absolute_path() {
-    let temp = TempDir::new().unwrap();
+    let temp = scratch();
     let fake = fake_onebrain(temp.path());
     let mut command = hook_command(
         Path::new("./onebrain-child"),
@@ -154,7 +210,7 @@ fn relative_onebrain_override_is_injected_as_the_resolved_absolute_path() {
 
 #[test]
 fn stale_onebrain_override_fails_open_before_session_init() {
-    let temp = TempDir::new().unwrap();
+    let temp = scratch();
     let fake = fake_onebrain(temp.path());
 
     let output = hook_command(&fake, temp.path(), "SessionStart", "stale-override")
@@ -169,7 +225,7 @@ fn stale_onebrain_override_fails_open_before_session_init() {
 
 #[test]
 fn compatible_override_version_probe_uses_the_foreground_budget() {
-    let temp = TempDir::new().unwrap();
+    let temp = scratch();
     let fake = fake_onebrain(temp.path());
 
     let output = hook_command(&fake, temp.path(), "SessionStart", "loaded-host")
@@ -184,7 +240,7 @@ fn compatible_override_version_probe_uses_the_foreground_budget() {
 
 #[test]
 fn background_hook_does_not_probe_the_override_version() {
-    let temp = TempDir::new().unwrap();
+    let temp = scratch();
     let fake = fake_onebrain(temp.path());
     let probe_file = temp.path().join("version-probed");
 
@@ -203,7 +259,7 @@ fn background_hook_does_not_probe_the_override_version() {
 
 #[test]
 fn stop_forwards_checkpoint_and_suppresses_pending_output() {
-    let temp = TempDir::new().unwrap();
+    let temp = scratch();
     let fake = fake_onebrain(temp.path());
 
     let checkpoint = hook_command(&fake, temp.path(), "Stop", "protocol")
@@ -225,7 +281,7 @@ fn stop_forwards_checkpoint_and_suppresses_pending_output() {
 /// dropped `search reindex --pending-only` spawn leaves no marker behind.
 #[test]
 fn stop_dispatches_the_pending_embed_child() {
-    let temp = TempDir::new().unwrap();
+    let temp = scratch();
     let fake = fake_onebrain(temp.path());
     let reindex_file = temp.path().join("pending-embed.args");
 
@@ -251,7 +307,7 @@ fn stop_dispatches_the_pending_embed_child() {
 
 #[test]
 fn silent_stop_emits_an_empty_json_object() {
-    let temp = TempDir::new().unwrap();
+    let temp = scratch();
     let fake = fake_onebrain(temp.path());
 
     let output = hook_command(&fake, temp.path(), "AfterAgent", "quiet-stop")
@@ -265,7 +321,7 @@ fn silent_stop_emits_an_empty_json_object() {
 
 #[test]
 fn timed_out_child_is_killed_reaped_and_fails_open() {
-    let temp = TempDir::new().unwrap();
+    let temp = scratch();
     let fake = fake_onebrain(temp.path());
     let pid_file = temp.path().join("child.pid");
     let completed_file = temp.path().join("child.completed");
@@ -301,7 +357,7 @@ fn timed_out_child_is_killed_reaped_and_fails_open() {
 
 #[test]
 fn outer_hook_dispatch_skips_search_cache_migration_noise() {
-    let temp = TempDir::new().unwrap();
+    let temp = scratch();
     let fake = fake_onebrain(temp.path());
     let mut command = Command::cargo_bin("onebrain").unwrap();
     command
