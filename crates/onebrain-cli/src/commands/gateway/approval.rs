@@ -320,12 +320,17 @@ pub enum ResolvedVia {
     /// waiter's periodic or Allow-time check in `server::await_approval`
     /// (#427). Always a denial.
     Revoked,
+    /// A human allowed the call, but the gateway could not read its auth
+    /// store to confirm the call's credential was still live, so the Allow
+    /// failed closed (`server::await_approval`'s Allow-time check). Always a
+    /// denial.
+    Unverified,
 }
 
 impl ResolvedVia {
     /// The exact lowercase string `audit::AuditEntry::channel` records —
-    /// `"http"`, `"native"`, `"telegram"`, `"shutdown"`, `"disconnect"`, or
-    /// `"revoked"`.
+    /// `"http"`, `"native"`, `"telegram"`, `"shutdown"`, `"disconnect"`,
+    /// `"revoked"`, or `"unverified"`.
     pub fn as_str(self) -> &'static str {
         match self {
             ResolvedVia::Http => "http",
@@ -334,6 +339,7 @@ impl ResolvedVia {
             ResolvedVia::Shutdown => "shutdown",
             ResolvedVia::Disconnect => "disconnect",
             ResolvedVia::Revoked => "revoked",
+            ResolvedVia::Unverified => "unverified",
         }
     }
 }
@@ -766,6 +772,7 @@ mod tests {
             ResolvedVia::Telegram,
             ResolvedVia::Shutdown,
             ResolvedVia::Revoked,
+            ResolvedVia::Unverified,
         ] {
             let approvals = Approvals::new();
             let rx = approvals.register(sample("a1")).unwrap();
@@ -787,6 +794,7 @@ mod tests {
         assert_eq!(ResolvedVia::Shutdown.as_str(), "shutdown");
         assert_eq!(ResolvedVia::Disconnect.as_str(), "disconnect");
         assert_eq!(ResolvedVia::Revoked.as_str(), "revoked");
+        assert_eq!(ResolvedVia::Unverified.as_str(), "unverified");
     }
 
     // ── timeout path: TimedOut + entry dropped from pending ─────────────

@@ -1202,8 +1202,19 @@ async fn outcome_on_disconnect(
 }
 
 /// How often a call waiting for approval re-checks that its own credential
-/// was not revoked meanwhile (#427) — see [`credential_revoked`].
+/// was not revoked meanwhile (#427) — see [`check_access_state`].
 const REVOCATION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// What [`check_access_state`] found about a waiting call's credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccessState {
+    /// Still usable (or merely expired — see [`check_access_state`]).
+    Live,
+    Revoked,
+    /// The store could not be read. The periodic watch keeps waiting on
+    /// this; the Allow-time check fails closed on it.
+    Unknown,
+}
 
 /// Whether the credential behind `principal` was revoked since its request
 /// passed the Bearer gate (#427). "Revoked" means exactly one of:
@@ -1219,13 +1230,12 @@ const REVOCATION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 ///
 /// No IPC with the CLI: like `require_bearer`, this re-reads the store's
 /// files (read-only, no `auth.lock`) on `spawn_blocking`. A store that
-/// cannot be read is NOT treated as revoked — it is logged, and the call
-/// keeps waiting for its human answer; the next request still fails closed
-/// at the Bearer gate. With no auth context (unit-test fixtures that never
+/// cannot be read is [`AccessState::Unknown`] (logged); each caller decides
+/// what that means. With no auth context (unit-test fixtures that never
 /// built the router) there is nothing to check.
-async fn credential_revoked(state: &GatewayState, principal: &Principal) -> bool {
+async fn check_access_state(state: &GatewayState, principal: &Principal) -> AccessState {
     let Some(ctx) = state.auth.get().cloned() else {
-        return false;
+        return AccessState::Live;
     };
     let client_id = principal.client_id.clone();
     let token_id = principal.token_id.clone();
@@ -1239,27 +1249,33 @@ async fn credential_revoked(state: &GatewayState, principal: &Principal) -> bool
     })
     .await
     .unwrap_or_else(|e| Err(anyhow::anyhow!("revocation check task failed: {e}")));
-    checked.unwrap_or_else(|e| {
-        tracing::warn!(
-            error = %e,
-            client_id = %principal.client_id,
-            "could not check whether a waiting call's credential was revoked"
-        );
-        false
-    })
+    match checked {
+        Ok(true) => AccessState::Revoked,
+        Ok(false) => AccessState::Live,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                client_id = %principal.client_id,
+                "could not check whether a waiting call's credential was revoked"
+            );
+            AccessState::Unknown
+        }
+    }
 }
 
-/// Resolves once [`credential_revoked`] says `principal`'s credential is
-/// gone, checking every [`REVOCATION_CHECK_INTERVAL`] (first check one
-/// interval in — the Bearer gate has only just accepted the token). Never
-/// resolves otherwise; [`await_approval`] drops it when the wait ends.
+/// Resolves once [`check_access_state`] says `principal`'s credential is
+/// revoked, checking every [`REVOCATION_CHECK_INTERVAL`] (first check one
+/// interval in — the Bearer gate has only just accepted the token). An
+/// unreadable store keeps waiting: the Allow-time check fails closed on
+/// it, so nothing is written either way. Never resolves otherwise;
+/// [`await_approval`] drops it when the wait ends.
 async fn revocation_watch(state: &GatewayState, principal: &Principal) {
     let start = tokio::time::Instant::now() + REVOCATION_CHECK_INTERVAL;
     let mut tick = tokio::time::interval_at(start, REVOCATION_CHECK_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        if credential_revoked(state, principal).await {
+        if check_access_state(state, principal).await == AccessState::Revoked {
             return;
         }
     }
@@ -1522,12 +1538,20 @@ async fn await_approval(
         outcome = &mut wait => outcome,
     };
     // The Allow-time check: an Allow that arrives between two periodic
-    // checks must not write for a credential revoked in that window.
+    // checks must not write for a credential revoked in that window. It
+    // fails closed: if the store cannot be read, the Allow cannot be
+    // verified, and the call is denied (hub ruling, v3.5.1).
     let outcome = match outcome {
-        WaitOutcome::Decided(approval::Decision::Approve, _)
-            if credential_revoked(state, principal).await =>
-        {
-            WaitOutcome::Decided(approval::Decision::Deny, ResolvedVia::Revoked)
+        WaitOutcome::Decided(approval::Decision::Approve, via) => {
+            match check_access_state(state, principal).await {
+                AccessState::Live => WaitOutcome::Decided(approval::Decision::Approve, via),
+                AccessState::Revoked => {
+                    WaitOutcome::Decided(approval::Decision::Deny, ResolvedVia::Revoked)
+                }
+                AccessState::Unknown => {
+                    WaitOutcome::Decided(approval::Decision::Deny, ResolvedVia::Unverified)
+                }
+            }
         }
         other => other,
     };
@@ -1592,6 +1616,9 @@ async fn await_approval(
                         }
                         ResolvedVia::Revoked => format!(
                             "access was revoked while this call waited for approval [{tool}]"
+                        ),
+                        ResolvedVia::Unverified => format!(
+                            "could not verify access when this call was approved; nothing was written [{tool}]"
                         ),
                         _ => format!("this call was denied by the gateway operator [{tool}]"),
                     },
@@ -2545,7 +2572,7 @@ mod tests {
     ///
     /// "test-client" is also REGISTERED, as every real token's client is
     /// (tokens are only minted for a registered client): a waiting approval
-    /// treats an unregistered client as removed (`credential_revoked`).
+    /// treats an unregistered client as removed (`check_access_state`).
     fn test_auth_ctx(root: &Path) -> (Arc<AuthCtx>, String) {
         use crate::commands::gateway::auth::store::{AppType, RegisteredClient};
         let store = AuthStore::open_at(root.join("gateway-auth")).unwrap();
@@ -5736,6 +5763,41 @@ mod tests {
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["decision"], "denied", "{entries:?}");
         assert_eq!(entries[0]["channel"], "revoked", "{entries:?}");
+    }
+
+    /// Hub ruling (v3.5.1): the Allow-time check fails CLOSED. If the auth
+    /// store cannot be read when the human allows, the call is denied as
+    /// `"unverified"` (not `"revoked"`), nothing is written, no grant.
+    #[tokio::test]
+    async fn an_allow_that_cannot_be_verified_is_denied() {
+        let (dir, router, state, token) =
+            fixture_router_with_mutating_policy(policy::PolicyMode::AskOnce, 300, 30);
+        let (handle, pending) = spawn_pending_capture(&router, &state, &token, "Unverified").await;
+
+        // An injected read error: `list_tokens` fails to parse the file.
+        let tokens_path = dir.path().join("gateway-auth").join("tokens.json");
+        std::fs::write(&tokens_path, b"{ not json").unwrap();
+
+        assert!(state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Approve,
+            approval::ResolvedVia::Http
+        ));
+        let resp = handle.await.unwrap();
+        let message = resp["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a JSON-RPC error: {resp}"));
+        assert!(message.contains("could not verify access"), "{message}");
+        assert_eq!(inbox_note_count(dir.path()), 0, "nothing may be written");
+        assert_eq!(
+            state.grants.len(),
+            0,
+            "an unverified Allow records no grant"
+        );
+        let entries = read_audit_entries(dir.path());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["decision"], "denied", "{entries:?}");
+        assert_eq!(entries[0]["channel"], "unverified", "{entries:?}");
     }
 
     /// #427: an access token that merely EXPIRES mid-wait was not revoked —
