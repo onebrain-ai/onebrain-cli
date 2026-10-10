@@ -16,7 +16,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `onebrain gateway run` — loopback streamable-HTTP MCP endpoint (`/mcp`, protocol
   `2026-07-28` pinned) serving the read-only Brain pack (`capabilities`,
   `brain_search`, `brain_get`, `brain_tasks`) across vaults from
-  `~/.onebrain/gateway.yml`. Loopback only; a remote tunnel lands later in v3.5.
+  `~/.onebrain/gateway.yml`. Loopback bind; remote access via `gateway tunnel` (below).
 - OAuth 2.1 authorization + resource server for the gateway: `/mcp` now requires
   a Bearer access token. RFC 9728/8414 discovery, RFC 7591 dynamic client
   registration (public clients only — no client secrets ever minted), an
@@ -27,7 +27,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   prints or rotates the pairing code independent of a running gateway. See
   [`docs/gateway.md#authentication`](docs/gateway.md#authentication).
 - `gateway.yml` gains a `public_url` key: the gateway's OAuth issuer base URL
-  for the still-unshipped remote tunnel. Validated at `gateway run` startup
+  for the Cloudflare tunnel. Validated at `gateway run` startup
   (must be a bare `https://`, or loopback-only `http://`, origin with no
   path/query/fragment) — an invalid value fails startup naming the key
   instead of silently resolving to a wrong or insecure issuer. See
@@ -115,6 +115,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   revoke on its next request. Revoking by id does not cascade (the output
   points at `--family` / `clients remove`). See
   [`docs/gateway.md#managing-access`](docs/gateway.md#managing-access).
+
+- `onebrain gateway tunnel setup|status` — store a Cloudflare tunnel token (from the Zero Trust dashboard, 0600, never echoed) and set `public_url`; status checks the token, the tunnel agent, and that the public hostname reaches this gateway. See [`docs/gateway.md#use-it-from-your-phone`](docs/gateway.md#use-it-from-your-phone).
+- `onebrain gateway service install|uninstall|status` (macOS) — the gateway and cloudflared as KeepAlive LaunchAgents; logs in `~/Library/Logs/onebrain/` (0600). Re-run `install` after a `gateway.yml` change: it restarts the gateway.
+- `onebrain doctor` Gateway section (config, launch agents, local endpoint, tunnel, auth store, Telegram, approval wait, vault location), shown only when `gateway.yml` exists.
 
 ### Changed
 - **Breaking/Changed:** the default `policy.approval_wait_seconds` dropped from 300 s to 240 s, and values above 270 s are clamped to 270 s with a startup warning (Claude's tool timeout is 300 s).

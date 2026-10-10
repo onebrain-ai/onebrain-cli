@@ -8,7 +8,7 @@ onebrain gateway run --port 0     # let the OS assign an ephemeral port
 ```
 
 - Runs in the foreground until Ctrl-C or SIGTERM.
-- Binds **`127.0.0.1` only** — see [Loopback + no remote exposure yet](#loopback--no-remote-exposure-yet) below.
+- Binds **`127.0.0.1` only** — see [Exposure model](#exposure-model) below.
 - The bound URL prints once to stdout on startup: `gateway listening on http://<bound-addr>/mcp`.
 
 ## What this skeleton ships
@@ -20,7 +20,7 @@ onebrain gateway run --port 0     # let the OS assign an ephemeral port
 - **OAuth 2.1 authentication**: `/mcp` requires a Bearer access token — see [Authentication](#authentication) below. The `/.well-known/*` discovery documents and `/register`/`/authorize`/`/token` stay reachable without one (a client with no token yet must be able to bootstrap OAuth before it has one).
 - **Policy, human approval, and an audit trail** for every tool call — see [Policy & approvals](#policy--approvals) below. `capabilities` reports each tool's risk class, the policy mode currently in force, and which approval channels can actually deliver a prompt on this machine right now — see [`capabilities` truthfulness](#capabilities-truthfulness).
 
-**Not yet shipped** (a later PR in the v3.5 epic): a remote tunnel, so a phone or another machine can reach your gateway safely — see [Loopback + no remote exposure yet](#loopback--no-remote-exposure-yet). `capabilities` already lists the roadmapped `developer`/`files`/`mac` packs with `enabled: false` so a caller can see what's coming without probing for tools that don't exist yet.
+**Remote access:** a Cloudflare tunnel plus macOS LaunchAgents, so a phone can reach your gateway — see [Use it from your phone](#use-it-from-your-phone). `capabilities` already lists the roadmapped `developer`/`files`/`mac` packs with `enabled: false` so a caller can see what's coming without probing for tools that don't exist yet.
 
 ## Zero-config behavior
 
@@ -39,6 +39,8 @@ Set `RUST_LOG` to change that, exactly as for `onebrain daemon`: `RUST_LOG=debug
 
 `gateway run` stops cleanly on Ctrl-C or SIGTERM: any approval still pending is denied (the waiting client gets a "gateway is shutting down" error), and open requests get 5 seconds to finish. Native macOS approval dialogs are withdrawn, and the process exits within about 1 s after that. The Telegram message edit ("Denied via shutdown") can be cut off on a slow network, leaving an Approve button that points at a stopped gateway and does nothing.
 
+Under `gateway service`, stdout and stderr both go to `~/Library/Logs/onebrain/gateway.log` (0600); the pairing code is never written there (`onebrain gateway pair` shows it).
+
 If a gated tool call is failing and you cannot tell why, this is the first place to look — most of the gateway's refusals deliberately tell the *client* very little, and tell the *operator* here instead.
 
 ## `gateway.yml` schema
@@ -50,7 +52,7 @@ Machine-level config at `~/.onebrain/gateway.yml` — deliberately **not** per-v
 | `port` | number | `7717` | Loopback port `gateway run` binds when `--port` is omitted. `--port` on the command line always wins over this. |
 | `default_vault` | path | unset | Vault served when a tool call omits `vault`. Unset falls through to `$ONEBRAIN_VAULT`, then walk-up from the gateway process's cwd — exactly like an explicit CLI `--vault` flag would win over both of those when it IS set. |
 | `vaults` | map (name → path) | `{}` | Named vaults a tool call may select via its `vault` argument. An unknown name is a JSON-RPC `invalid_params` error listing the known names. |
-| `public_url` | string | unset | The gateway's OAuth issuer base URL, for the still-unshipped remote tunnel (see [Loopback + no remote exposure yet](#loopback--no-remote-exposure-yet)). When set, `gateway run` advertises `public_url` as the issuer in every discovery document (`/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`) and in the `/mcp` 401 `WWW-Authenticate` challenge, instead of `http://127.0.0.1:<bound-port>`. Must be a bare origin — `scheme://host[:port]` — with no path, query, or fragment (a single trailing `/` is trimmed automatically; the consent page posts to the root-relative `/authorize`, so a path-prefixed deployment such as `https://example.com/onebrain` cannot work and is refused), no userinfo (any `@` is refused), and a numeric port in range; `http://` is accepted only for a loopback host (`localhost`/`127.0.0.1`/`[::1]`), every other host must use `https://`. `gateway run` validates this at startup and refuses to start on an invalid value (naming the `public_url` key in the error) rather than silently falling back to the loopback issuer. When set, its host is also added to the gateway's allowed `Host` list (see [Exposure hardening](#exposure-hardening-pre-tunnel)). Setting this alone does not expose anything remotely — this build still binds `127.0.0.1` only. |
+| `public_url` | string | unset | The gateway's OAuth issuer base URL, for the Cloudflare tunnel (`onebrain gateway tunnel setup` writes it; see [Use it from your phone](#use-it-from-your-phone)). When set, `gateway run` advertises `public_url` as the issuer in every discovery document (`/.well-known/oauth-protected-resource`, `/.well-known/oauth-authorization-server`) and in the `/mcp` 401 `WWW-Authenticate` challenge, instead of `http://127.0.0.1:<bound-port>`. Must be a bare origin — `scheme://host[:port]` — with no path, query, or fragment (a single trailing `/` is trimmed automatically; the consent page posts to the root-relative `/authorize`, so a path-prefixed deployment such as `https://example.com/onebrain` cannot work and is refused), no userinfo (any `@` is refused), and a numeric port in range; `http://` is accepted only for a loopback host (`localhost`/`127.0.0.1`/`[::1]`), every other host must use `https://`. `gateway run` validates this at startup and refuses to start on an invalid value (naming the `public_url` key in the error) rather than silently falling back to the loopback issuer. When set, its host is also added to the gateway's allowed `Host` list (see [Exposure hardening](#exposure-hardening-pre-tunnel)). Setting this alone does not expose anything remotely — the gateway still binds `127.0.0.1` only; the tunnel does the exposing. After changing it, restart the gateway (`onebrain gateway service install` does). |
 | `policy` | map | see below | Per-risk-class approval policy — see [Policy & approvals](#policy--approvals). |
 | `telegram` | map | see below | Telegram approval-channel credentials — see [Telegram approval channel](#telegram-approval-channel). |
 
@@ -206,6 +208,51 @@ Writing an entry never blocks or fails the tool call it describes — by the tim
 
 The gateway's first WRITE tool: creates a new inbox note (`<inbox-folder>/YYYY-MM-DD-<slug>.md`) from a `title` (optional) and `text` body, classified `RiskClass::Mutating` — so under the default policy it needs a human's `ask_once` approval the first time, then proceeds automatically for `grant_ttl_minutes`. Three independent guards confine every derived path to the vault: **syntactic** (every path component must be a plain, non-`..`, non-absolute segment), **canonicalization** (the resolved parent directory must still live under the canonicalized vault root, catching a symlinked-out folder too), and an **equality check** that the confined path is exactly the path the write will open — the underlying note writer joins the vault root and relative path with no confinement of its own, so anything that resolves elsewhere (even somewhere still inside the vault, via a symlinked inbox) is refused rather than written through a link the guard did not vouch for. So a crafted `title` can never write outside the vault. What the guards do NOT cover, stated plainly: the parent is canonicalized *before* the write, so swapping it for an escaping symlink in the window between the check and the write is not caught — closing that needs handle-relative I/O in the filesystem layer, and it requires an attacker who already has write access inside the vault. The note's filename slug is derived from `title`, falling back to the first words of `text`. It keeps Unicode alphanumerics, so a Thai, Japanese, Korean, or Cyrillic title produces a filename in that script rather than collapsing to a marker. That charset rule is **modelled on** the one `onebrain note new` uses — keep alphanumerics, collapse every run of anything else to a single `-` — but the two are separate helpers and do **not** produce the same filename for the same title. Three deliberate differences, stated so this is not re-derived wrongly later: (1) `onebrain note new` derives no filename from a title at all — the caller supplies the relative path, and the note's *title* is derived from that path's stem; its slug helper only fills the `{{slug}}` template variable. (2) The gateway re-filters the output of Unicode lowercasing, so `İ` becomes `i`; the filesystem helper does not, and keeps the combining mark that `İ` lowercases into. (3) The gateway caps the slug at 60 characters and 120 bytes; the filesystem helper has no cap. That byte half of the cap is what keeps a multi-byte title from overrunning a filesystem name limit — a character cap alone would not, since one character can be four bytes. Only input with no alphanumeric content at all in any script (punctuation-only, emoji-only) falls through to the fixed `capture` marker, and that marker gets a short random suffix so repeated fallbacks in one day do not collide with each other. A same-day, same-slug collision surfaces as a clean tool error naming the vault-relative path, rather than overwriting the existing note. An empty (or whitespace-only) `text` is rejected as `invalid_params` — a capture with no body would write a titled, empty stub indistinguishable from one whose body was lost. A best-effort reindex request follows the write, so `brain_search` can find the new note without waiting for the vault's next scheduled reindex. That request is **detached**: the tool call returns as soon as the note is on disk and does not wait for the daemon, which may need a full cold start. A reindex failure never fails the capture either — the note is already written by that point; the only consequence is that `brain_search` lags until the next reindex.
 
+## Use it from your phone
+
+Create the tunnel in Cloudflare, run two commands on the Mac, then change one setting in the Claude app. The service part is macOS only (see the end of this section for other systems).
+
+**1. Create the tunnel in Cloudflare** (your domain must already be on Cloudflare). Zero Trust → Networks → Tunnels → *Create a tunnel* → *Cloudflared* → name it. On the install screen, copy the command shown: it contains the tunnel token. Then add a *Public hostname*: pick a subdomain (e.g. `brain.example.com`), service type **HTTP**, URL **`http://127.0.0.1:7717`** (or your `port:`). Use `127.0.0.1`, not `localhost`: the gateway listens only on the IPv4 loopback address. Leave the origin's *HTTP Host Header* setting empty and do not rewrite `Host` anywhere: the gateway checks it (see [Exposure hardening](#exposure-hardening-pre-tunnel)).
+
+**2. Store the token and hostname.**
+
+```bash
+brew install cloudflared
+onebrain gateway tunnel setup
+```
+
+Paste the hostname, then the token (or the whole install command; the wizard takes the token out of it). The token is saved to `~/.onebrain/gateway/tunnel.token` (mode 0600) and is never printed; `public_url: 'https://brain.example.com'` is written into `gateway.yml`. Comments in `gateway.yml` are kept where possible; if the file had to be reformatted, the wizard says so. Re-run it any time to rotate the token or change the hostname. Hostnames are checked for shape only, so an internal name such as `.local` or `.internal` is accepted: a phone can reach only a hostname that is publicly routable through Cloudflare.
+
+**3. Run it as a service.**
+
+```bash
+onebrain gateway service install
+```
+
+This installs two LaunchAgents, `com.onebrain.gateway` (`onebrain gateway run`) and `com.onebrain.gateway-tunnel` (`cloudflared tunnel --no-autoupdate --protocol http2 run --token-file …`), that start at login and restart if they die, then waits up to 10 s for the gateway to answer. It prints the program path it used and whether the tunnel token is read from the file (`--token-file`) or passed in the agent's environment.
+
+- **After a `public_url` change, or any `gateway.yml` change, run it again.** The gateway fixes the hosts it accepts at startup, so a new `public_url` only takes effect when the gateway restarts, and `service install` restarts it.
+- **`gateway.yml` must name a vault** (`default_vault:` or `vaults:`). As a service the gateway does not start inside your vault. Keep that vault out of `~/Documents`, `~/Desktop` and iCloud Drive: macOS may block a background agent from reading those folders (`onebrain doctor` warns).
+- **Logs** go to `~/Library/Logs/onebrain/gateway.log` (mode 0600), see [Logs](#logs). The pairing code is not written there; run `onebrain gateway pair` to see it.
+- **Which `onebrain`.** The agent runs the `onebrain` that ran `service install`, or its stable PATH entry (such as the Homebrew bin path) when that is the same file. If the install prints a warning about a `/Cellar/` path, re-run `service install` after `brew upgrade`.
+- **Checking and removing.** `onebrain gateway service status` and `onebrain gateway tunnel status` check the pieces. `onebrain gateway service uninstall` removes both agents and leaves your token and config alone.
+- **Old cloudflared.** If your `cloudflared` has no `--token-file`, the token goes into the tunnel agent's environment instead (its plist is 0600 either way); `brew upgrade cloudflared` avoids that.
+
+**4. Connect the Claude app.** Settings → Connectors → *Add custom connector* → `https://brain.example.com/mcp`. Approve the connection with the pairing code from `onebrain gateway pair`. To cut a phone off later, see [Managing access](#managing-access).
+
+**5. Approve writes over Telegram.** Set up [Telegram approvals](#telegram-approval-channel). Away from the Mac that is the only way to answer a write: `/approvals` answers only on the Mac itself, never through the tunnel. A call waiting for approval keeps its connection alive (a "waiting for human approval" notice, then a keep-alive every 15 s), so it survives Cloudflare's 125-second limit; it gives up after `approval_wait_seconds` (default 240 s, never more than 270 s, because Claude abandons a tool call at 300 s).
+
+**6. Check everything.** `onebrain doctor` shows a **Gateway** section whenever a `gateway.yml` exists: config, launch agents (including a program path that no longer exists, and which tunnel-token mode is in use), local endpoint, tunnel (does `https://<host>` reach *this* gateway?), auth store, Telegram, approval wait, vault location. An unreachable tunnel is a warning, since your network may simply be offline.
+
+**Other systems.** `gateway service` says "not supported yet" off macOS. Keep these two running under your own supervisor (systemd, a terminal multiplexer, …), and restart `gateway run` after changing `public_url`:
+
+```bash
+onebrain gateway run
+cloudflared tunnel --no-autoupdate --protocol http2 run --token-file ~/.onebrain/gateway/tunnel.token
+```
+
+`gateway run` exits cleanly on SIGTERM as well as Ctrl-C (see [Logs](#logs)).
+
 ## Authentication
 
 `/mcp` is an OAuth 2.1 resource server: every request needs `Authorization: Bearer <access-token>`, or it gets a `401` with a `WWW-Authenticate` header pointing at the discovery document below. Getting a token is a standard OAuth 2.1 authorization-code + PKCE flow, gated by a **device-pairing code** — the human-in-the-loop step that stands in for a client secret this authorization server deliberately never issues (see [Token semantics](#token-semantics)).
@@ -305,6 +352,6 @@ The pairing code is **not** rotated after each successful approval. It is this s
 
 **Client ID Metadata Documents (CIMD)** — letting a client identify itself by a `https://` URL instead of going through `/register` — are deferred to a follow-up PR; landing CIMD safely requires an SSRF-safe fetch of that URL (the AS would otherwise follow a client-supplied URL from inside the gateway process), which is its own piece of design work. Every client today registers via `/register` (RFC 7591) instead.
 
-### Loopback + no remote exposure yet
+### Exposure model
 
-The bind address is still hard-coded to `127.0.0.1` — there is no `--bind` flag, no `$ONEBRAIN_BIND`-style escape hatch (unlike [`onebrain serve`](serve.md#containers--self-host--onebrain_bind)), and no config key to change it. OAuth authenticates *who* may call `/mcp`; it does not by itself make exposing this port beyond the local machine safe — do not put it behind a plain reverse proxy or port-forward it to another host. A remote tunnel (so a phone or another machine can reach your gateway through the same pairing flow) is planned for a later PR in the v3.5 epic — until then, `onebrain gateway run` is a localhost-only tool: a local MCP client that wants Streamable HTTP instead of stdio, or a testing/development target.
+The gateway still binds only `127.0.0.1`: no `--bind` flag, no config key. Remote access goes exclusively through the outbound Cloudflare tunnel ([Use it from your phone](#use-it-from-your-phone)). Cloudflare terminates TLS at your hostname and forwards to `http://127.0.0.1:<port>`; the gateway accepts requests only for its own `public_url` host (plus loopback), keeps `/approvals` loopback-only, and still requires OAuth on `/mcp` (details in [Exposure hardening](#exposure-hardening-pre-tunnel)). Do not port-forward 7717 or put it behind any other reverse proxy.

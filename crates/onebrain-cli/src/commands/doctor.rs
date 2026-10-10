@@ -362,6 +362,10 @@ fn all_checks(vault_root: &Path, config: &onebrain_core::VaultConfig) -> Vec<Doc
     results.push(lex_index_check(vault_root));
     results.push(legacy_index_stub_check(vault_root));
     results.push(qmd_leftovers_check_prod(config));
+    // v3.5.0 T3: machine-level gateway rows (empty when ~/.onebrain/gateway.yml
+    // is absent, so vault-only users see no new section). Read-only: probes
+    // HTTP and `launchctl print`, never starts or stops anything.
+    results.extend(crate::commands::gateway::health::doctor_rows());
     results
 }
 
@@ -4647,7 +4651,7 @@ fn print_fix_summary(outcomes: &[(String, FixOutcome)]) {
 /// entry is `(emoji, section header, [check names in order])`. Check names
 /// are the stable `DoctorResult::check` identifiers produced by the check
 /// modules (plus the CLI-layer `search` check appended by [`all_checks`]).
-const DOCTOR_SECTIONS: [(&str, &str, &[&str]); 4] = [
+const DOCTOR_SECTIONS: [(&str, &str, &[&str]); 5] = [
     (
         "⚙️",
         "Config",
@@ -4682,6 +4686,20 @@ const DOCTOR_SECTIONS: [(&str, &str, &[&str]); 4] = [
             "qmd-leftovers",
         ],
     ),
+    (
+        "🌐",
+        "Gateway",
+        &[
+            "gateway-config",
+            "gateway-service",
+            "gateway-local",
+            "gateway-tunnel",
+            "gateway-auth-store",
+            "gateway-telegram",
+            "gateway-approval-wait",
+            "gateway-vault-location",
+        ],
+    ),
 ];
 
 /// Short, scannable display label for a check name (matches the approved
@@ -4710,6 +4728,14 @@ fn display_label(check: &str) -> &str {
         "scheduler-silent-runs" => "scheduled output",
         "legacy-index-stub" => "legacy index stub",
         "qmd-leftovers" => "qmd cleanup",
+        "gateway-config" => "config",
+        "gateway-service" => "launch agents",
+        "gateway-local" => "local endpoint",
+        "gateway-tunnel" => "tunnel",
+        "gateway-auth-store" => "auth store",
+        "gateway-telegram" => "telegram",
+        "gateway-approval-wait" => "approval wait",
+        "gateway-vault-location" => "vault location",
         other => other,
     }
 }
@@ -4835,7 +4861,7 @@ fn display_rows(results: &[DoctorResult]) -> Vec<DisplayRow> {
     rows
 }
 
-/// Bucket `results` into the 4 display sections as [`Section`]s of [`Step`]s.
+/// Bucket `results` into the 5 display sections as [`Section`]s of [`Step`]s.
 ///
 /// NO inline hints (v3.4.8 — every hint moved to the bottom Summary box). The
 /// two legacy-migration checks fold into one `migration` row. Any result whose
@@ -11182,6 +11208,19 @@ mod tests {
                     .any(|(_, _, checks)| checks.contains(&name)),
                 "'{name}' must be assigned to a section, not fall through to Other"
             );
+        }
+    }
+
+    #[test]
+    fn every_gateway_check_has_the_gateway_section_and_a_display_label() {
+        use crate::commands::gateway::health::ALL_CHECKS;
+        let gateway = DOCTOR_SECTIONS
+            .iter()
+            .find(|(_, h, _)| *h == "Gateway")
+            .expect("Gateway section");
+        for name in ALL_CHECKS {
+            assert!(gateway.2.contains(&name), "{name}");
+            assert_ne!(display_label(name), name, "{name} needs a short label");
         }
     }
 
