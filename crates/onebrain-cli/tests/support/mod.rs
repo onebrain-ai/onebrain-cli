@@ -279,6 +279,9 @@ fn fresh_sandbox_dir(kind: &str) -> PathBuf {
 /// this: a later `.env` for the same key overrides the sandbox value.
 pub fn onebrain_cmd() -> assert_cmd::Command {
     let mut cmd = assert_cmd::Command::cargo_bin("onebrain").unwrap();
+    // Pinned here as well as in `sandbox_env`: `cache_isolation_sweep` checks
+    // each spawning function's text for the pin.
+    cmd.env("ONEBRAIN_CACHE_DIR", scratch_cache_root());
     sandbox_env(&mut cmd);
     cmd
 }
