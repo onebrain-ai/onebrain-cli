@@ -43,12 +43,12 @@ pub struct Principal {
 /// token" vs. "a token was presented and it was bad" (`error="invalid_token"`,
 /// standard RFC 6750 §3.1 vocabulary, not new information leakage).
 ///
-/// Binding requirement A (Task 1 review, carried into Task 2): the store
-/// lookup holds `ctx.store`'s lock across the full `check_access` call —
-/// never cloning `AuthStore` out of the mutex. This call is read-only, but
-/// it's the SAME `ctx.store` field Tasks 3-5's mutating `/authorize`/
-/// `/token`/`/register` handlers will lock through, so the discipline is
-/// established here for every future caller to follow.
+/// Binding requirement A, re-ruled for v3.5.1 (#428): there is no
+/// in-process store mutex any more (see `AuthCtx`'s doc comment). The
+/// lookup is read-only, takes no `auth.lock` (writers replace files by
+/// atomic rename, so a read always sees one whole file), and runs on
+/// `spawn_blocking` so its file I/O never occupies a runtime worker — a
+/// stalled `auth.lock` holder can therefore never delay this gate.
 pub async fn require_bearer(
     State(ctx): State<Arc<AuthCtx>>,
     mut req: Request,
@@ -63,10 +63,10 @@ pub async fn require_bearer(
     // and enforcing it would also invalidate every token after a
     // `public_url` change. Hub ruling for v3.5.0 — follow-up: #416
     // (v3.5.x).
-    let checked = {
-        let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
-        store.check_access(&token)
-    };
+    let lookup = ctx.clone();
+    let checked = tokio::task::spawn_blocking(move || lookup.store.check_access(&token))
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("bearer lookup task failed: {e}")));
 
     match checked {
         Ok(Some(record)) => {
@@ -335,19 +335,12 @@ mod tests {
         assert!(www.contains(r#"error="invalid_token""#), "{www}");
     }
 
-    /// Requirement A (Task 1 review, binding on Task 2): `AuthCtx.store`
-    /// MUST be `Mutex<AuthStore>`, with every access holding the lock across
-    /// its full operation — never cloned out. This task only adds a READ
-    /// (`check_access`) through that lock, so there's no double-spend
-    /// scenario to reproduce here yet — that lands with Tasks 3-5's mutating
-    /// `/authorize`/`/token`/`/register` routes, which share this SAME
-    /// `ctx.store`. What this test proves instead: many concurrent requests
-    /// genuinely share ONE `Arc<AuthCtx>` — hence one `Mutex<AuthStore>` —
-    /// and all resolve correctly under real multi-threaded contention
-    /// (`flavor = "multi_thread"` so the lock is actually contended, not
-    /// just cooperatively interleaved on one OS thread).
+    /// Requirement A as re-ruled for v3.5.1 (#428): many concurrent requests
+    /// share ONE `Arc<AuthCtx>` — hence one lock-free `AuthStore` — and all
+    /// resolve correctly under real multi-threaded contention
+    /// (`flavor = "multi_thread"`, each lookup on `spawn_blocking`).
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_check_access_calls_serialize_through_the_shared_mutex() {
+    async fn concurrent_check_access_calls_share_one_store() {
         let dir = tempfile::tempdir().unwrap();
         let store = AuthStore::open_at(dir.path().join("auth")).unwrap();
         let (access, _refresh) = store.issue_token_pair("client-1", "brain").unwrap();

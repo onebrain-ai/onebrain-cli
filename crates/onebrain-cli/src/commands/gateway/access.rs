@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 use super::auth::store::{
-    normalize_id_prefix, AppType, ClientView, RemovedClient, RevokeOutcome, TokenKind,
+    normalize_id_prefix, store_busy, AppType, ClientView, RemovedClient, RevokeOutcome, TokenKind,
     TokenSelector, TokenStatus, TokenView,
 };
 use super::auth::AuthStore;
@@ -100,6 +100,20 @@ fn store_unwritable() -> HintedError {
     )
 }
 
+/// Context for a failed locked mutator: a busy `auth.lock` (#428) says so
+/// and names the holder when the sidecar allows; anything else is
+/// [`store_unwritable`]. The `StoreBusy` stays in the chain either way.
+fn store_write_failed(e: anyhow::Error) -> anyhow::Error {
+    let hinted = match store_busy(&e) {
+        Some(busy) => HintedError::new(
+            busy.to_string(),
+            "wait for that process to finish (resume it if it was suspended with Ctrl-Z), then retry",
+        ),
+        None => store_unwritable(),
+    };
+    e.context(hinted)
+}
+
 // ── Builders (in-process, unit-tested) ───────────────────────────────────
 
 pub(crate) fn tokens_list_env(store: &AuthStore, all: bool) -> Result<Envelope<TokensListData>> {
@@ -130,7 +144,7 @@ pub(crate) fn tokens_revoke_env(
     args: &GatewayTokensRevokeArgs,
 ) -> Result<Envelope<TokensRevokeData>> {
     let selector = selector_from_args(args)?;
-    let outcome = store.revoke_tokens(&selector).context(store_unwritable())?;
+    let outcome = store.revoke_tokens(&selector).map_err(store_write_failed)?;
     revoke_outcome_env(&selector, outcome)
 }
 
@@ -216,7 +230,7 @@ pub(crate) fn clients_remove_env(
     store: &AuthStore,
     client_id: &str,
 ) -> Result<Envelope<ClientsRemoveData>> {
-    match store.remove_client(client_id).context(store_unwritable())? {
+    match store.remove_client(client_id).map_err(store_write_failed)? {
         Some(RemovedClient {
             client_id,
             tokens_revoked,
@@ -664,6 +678,35 @@ mod tests {
         let plain = &hinted(&err).plain;
         assert!(!plain.contains('\u{1b}') && !plain.contains('\n'));
         assert!(plain.contains("evil?[31m?id"), "{plain}");
+    }
+
+    /// #428 holder test: a busy `auth.lock` fails the CLI mutators with a
+    /// message naming the holder pid (from the `auth.lock.holder` sidecar).
+    #[test]
+    fn a_busy_store_fails_revoke_and_remove_naming_the_holder_pid() {
+        let (dir, store) = temp_store();
+        store
+            .register_client(RegisteredClient {
+                client_id: "c1".into(),
+                client_name: None,
+                redirect_uris: vec![],
+                application_type: AppType::Web,
+                created: 0,
+            })
+            .unwrap();
+        let busy = AuthStore::open_at(dir.path().join("gateway"))
+            .unwrap()
+            .with_lock_wait(std::time::Duration::from_millis(100));
+        let _guard = store.lock_exclusive().unwrap();
+        let pid = std::process::id().to_string();
+
+        let err = clients_remove_env(&busy, "c1").unwrap_err();
+        let h = hinted(&err);
+        assert!(h.plain.contains(&format!("pid {pid}")), "{}", h.plain);
+        assert!(h.plain.contains("busy"), "{}", h.plain);
+
+        let err = tokens_revoke_env(&busy, &args(None, Some("c1"), None)).unwrap_err();
+        assert!(hinted(&err).plain.contains(&format!("pid {pid}")));
     }
 
     #[test]

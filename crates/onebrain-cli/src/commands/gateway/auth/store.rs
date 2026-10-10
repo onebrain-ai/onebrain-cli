@@ -36,6 +36,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
@@ -448,8 +449,65 @@ fn resolve_unique(hits: Vec<(String, String)>) -> std::result::Result<Vec<String
 /// is up) is seen on the very next call. Every read-modify-write op holds the
 /// store-wide `auth.lock` (see [`Self::lock_exclusive`]) so two processes can
 /// never lose each other's writes.
+///
+/// The gateway shares ONE `AuthStore` across threads with no in-process
+/// mutex (#428): each `lock_exclusive` call opens its own handle on
+/// `auth.lock`, so that lock serializes threads exactly as it serializes
+/// processes (proven by `two_threads_sharing_one_store_serialize_on_auth_lock`).
 pub struct AuthStore {
     root: PathBuf,
+    /// How long [`Self::lock_exclusive`] waits before giving up with
+    /// [`StoreBusy`]. [`LOCK_WAIT`] everywhere except unit tests.
+    lock_wait: Duration,
+}
+
+/// Upper bound on one wait for `auth.lock` (#428). A CLI suspended with
+/// Ctrl-Z while holding the lock must not stall `/token` forever.
+pub const LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// Who holds `auth.lock`, as recorded in the `auth.lock.holder` sidecar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockHolder {
+    pub pid: u32,
+    pub version: String,
+}
+
+/// `auth.lock` stayed held past [`LOCK_WAIT`]. Returned (inside
+/// `anyhow::Error`) by every locked mutator; detect it with
+/// [`is_store_busy`]. `holder` is `None` when the sidecar is missing or
+/// unreadable (e.g. the holder predates v3.5.1, or is not `onebrain`).
+#[derive(Debug)]
+pub struct StoreBusy {
+    pub holder: Option<LockHolder>,
+}
+
+impl std::fmt::Display for StoreBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let secs = LOCK_WAIT.as_secs();
+        match &self.holder {
+            Some(h) => write!(
+                f,
+                "the gateway auth store is busy — onebrain {} (pid {}) has held auth.lock for over {secs}s",
+                h.version, h.pid
+            ),
+            None => write!(
+                f,
+                "the gateway auth store is busy — another process has held auth.lock for over {secs}s"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StoreBusy {}
+
+/// The [`StoreBusy`] in `e`'s chain, if `auth.lock` was what failed.
+pub fn store_busy(e: &anyhow::Error) -> Option<&StoreBusy> {
+    e.downcast_ref::<StoreBusy>()
+}
+
+/// True when `e` is a [`StoreBusy`] (possibly under added context).
+pub fn is_store_busy(e: &anyhow::Error) -> bool {
+    store_busy(e).is_some()
 }
 
 impl AuthStore {
@@ -470,11 +528,24 @@ impl AuthStore {
     /// tests can point the store at a tempdir instead of the real home.
     pub(crate) fn open_at(root: PathBuf) -> Result<AuthStore> {
         ensure_private_dir(&root)?;
-        Ok(AuthStore { root })
+        Ok(AuthStore {
+            root,
+            lock_wait: LOCK_WAIT,
+        })
+    }
+
+    /// Test-only: a shorter [`LOCK_WAIT`] so busy-path tests don't sleep 5 s.
+    #[cfg(test)]
+    pub(crate) fn with_lock_wait(mut self, wait: Duration) -> AuthStore {
+        self.lock_wait = wait;
+        self
     }
 
     /// Take the store-wide advisory EXCLUSIVE lock (`<root>/auth.lock`,
-    /// created 0600 on first use), blocking until it is free. Every method
+    /// created 0600 on first use), waiting at most [`LOCK_WAIT`] (#428) and
+    /// then failing with a typed [`StoreBusy`] that names the holder from
+    /// the `auth.lock.holder` sidecar when it can. Blocking: async callers
+    /// run it on `spawn_blocking`, never on a runtime worker. Every method
     /// that does load → modify → save holds this for its whole critical
     /// section, so a `onebrain gateway tokens revoke` in one process can
     /// never be lost to a concurrent `rotate_refresh_for_client`/
@@ -507,9 +578,52 @@ impl AuthStore {
         let file = opts
             .open(&path)
             .with_context(|| format!("open gateway auth lock {}", path.display()))?;
-        file.lock()
-            .with_context(|| format!("lock gateway auth store ({})", path.display()))?;
-        Ok(StoreLock { _file: file })
+        let deadline = std::time::Instant::now() + self.lock_wait;
+        let mut pause = Duration::from_millis(5);
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        return Err(StoreBusy {
+                            holder: self.read_holder(),
+                        }
+                        .into());
+                    }
+                    std::thread::sleep(pause.min(deadline - now));
+                    pause = (pause * 2).min(Duration::from_millis(100));
+                }
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(e)
+                        .with_context(|| format!("lock gateway auth store ({})", path.display()));
+                }
+            }
+        }
+        // The holder lives in a sidecar, not in `auth.lock` itself: a
+        // Windows whole-file lock can stop other handles reading the locked
+        // file. Best-effort — a failure only makes a waiter's message generic.
+        let holder = self.holder_path();
+        let record = LockHolder {
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+        if let Err(e) = serde_json::to_vec(&record)
+            .map_err(anyhow::Error::from)
+            .and_then(|b| std::fs::write(&holder, b).map_err(anyhow::Error::from))
+        {
+            tracing::debug!(error = %e, "could not write auth.lock.holder");
+        }
+        Ok(StoreLock {
+            holder,
+            _file: file,
+        })
+    }
+
+    /// Best-effort read of the `auth.lock.holder` sidecar.
+    fn read_holder(&self) -> Option<LockHolder> {
+        let bytes = std::fs::read(self.holder_path()).ok()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
     fn clients_path(&self) -> PathBuf {
@@ -523,6 +637,9 @@ impl AuthStore {
     }
     fn lock_path(&self) -> PathBuf {
         self.root.join("auth.lock")
+    }
+    fn holder_path(&self) -> PathBuf {
+        self.root.join("auth.lock.holder")
     }
     fn pairing_path(&self) -> PathBuf {
         self.root.join("pairing.json")
@@ -1196,6 +1313,7 @@ impl AuthStore {
 pub(crate) fn check_files_parse(root: &Path) -> Result<()> {
     let store = AuthStore {
         root: root.to_path_buf(),
+        lock_wait: LOCK_WAIT,
     };
     store.load_clients()?;
     store.load_codes()?;
@@ -1209,7 +1327,16 @@ pub(crate) fn check_files_parse(root: &Path) -> Result<()> {
 /// `let _guard = …` — `let _ = …` would drop (and unlock) immediately.
 #[must_use = "the auth store lock is released as soon as this guard is dropped"]
 pub(crate) struct StoreLock {
+    holder: PathBuf,
     _file: std::fs::File,
+}
+
+impl Drop for StoreLock {
+    /// Remove the holder sidecar BEFORE the lock is released (`_file` drops
+    /// after this body), so it never names a process that no longer holds it.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.holder);
+    }
 }
 
 // ── File I/O helpers (mirrors `daemon_client::DaemonInfo`) ────────────────
@@ -1243,7 +1370,11 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
 /// Serialize `value` and atomically replace `path` with it: write to a
 /// `.tmp` sibling with owner-only (0600) perms, re-assert 0600 (warn, don't
 /// swallow, on failure — this is a credential file), then rename over the
-/// real path. Mirrors `daemon_client::DaemonInfo::write` exactly.
+/// real path. Mirrors `daemon_client::DaemonInfo::write`, plus durability
+/// (#429): the temp file is fsynced before the rename and, on unix, the
+/// parent directory after it, so a power cut cannot lose a write the caller
+/// was told succeeded. Windows has no directory fsync; there the rename's
+/// own metadata durability is NTFS's. A failed rename removes the temp file.
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent)?;
@@ -1265,6 +1396,8 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         use std::io::Write;
         f.write_all(&bytes)
             .with_context(|| format!("write {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync {}", tmp.display()))?;
     }
     #[cfg(unix)]
     {
@@ -1274,8 +1407,16 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
                 "could not re-assert 0600 on gateway auth store file (may be readable)");
         }
     }
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("rename {} -> {}", tmp.display(), path.display()));
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)
+            .and_then(|d| d.sync_all())
+            .with_context(|| format!("fsync dir {}", parent.display()))?;
+    }
     Ok(())
 }
 
@@ -2160,6 +2301,106 @@ mod tests {
     }
 
     // ── Cross-process advisory lock (T2 / #406) ─────────────────────────
+
+    /// #428 premise: with no in-process `Mutex<AuthStore>`, the gateway's
+    /// threads share ONE `AuthStore` and rely on `auth.lock` alone to
+    /// serialize writers. That only holds because every `lock_exclusive`
+    /// call opens its OWN file handle (flock is per open-file-description,
+    /// `LockFileEx` per handle). Two threads, one shared store: the second
+    /// lock must wait until the first guard drops.
+    #[test]
+    fn two_threads_sharing_one_store_serialize_on_auth_lock() {
+        let (_dir, store) = open_temp();
+        let store = std::sync::Arc::new(store);
+        let first = store.lock_exclusive().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let shared = store.clone();
+        let handle = std::thread::spawn(move || {
+            let guard = shared.lock_exclusive().unwrap();
+            tx.send(()).unwrap();
+            drop(guard);
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "a second thread acquired auth.lock while the first still held it"
+        );
+        drop(first);
+        rx.recv_timeout(std::time::Duration::from_secs(4))
+            .expect("the second thread must acquire auth.lock once it is released");
+        handle.join().unwrap();
+    }
+
+    /// #428: a mutator gives up after the lock wait with a typed
+    /// [`StoreBusy`] naming the holder from the sidecar, writes nothing,
+    /// and the holder's sidecar disappears with its guard.
+    #[test]
+    fn a_mutator_gives_up_with_store_busy_naming_the_holder() {
+        let (dir, store) = open_temp();
+        let (access, _r) = store.issue_token_pair("c1", "brain").unwrap();
+        let other = AuthStore::open_at(dir.path().join("gateway"))
+            .unwrap()
+            .with_lock_wait(std::time::Duration::from_millis(200));
+        let guard = store.lock_exclusive().unwrap();
+
+        let started = std::time::Instant::now();
+        let err = other.revoke_token(&access.token).unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let busy = store_busy(&err).expect("lock timeout must be a typed StoreBusy");
+        assert_eq!(
+            busy.holder,
+            Some(LockHolder {
+                pid: std::process::id(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            })
+        );
+        assert!(
+            err.to_string().contains(&std::process::id().to_string()),
+            "{err}"
+        );
+        assert!(store.check_access(&access.token).unwrap().is_some());
+
+        drop(guard);
+        assert!(
+            !store.root.join("auth.lock.holder").exists(),
+            "the holder sidecar must go away with the guard"
+        );
+        other.revoke_token(&access.token).unwrap();
+        assert!(store.check_access(&access.token).unwrap().is_none());
+    }
+
+    /// A holder that leaves no sidecar (an older CLI, a foreign process)
+    /// still yields `StoreBusy`, with a generic message.
+    #[test]
+    fn store_busy_without_a_sidecar_is_generic() {
+        let (dir, store) = open_temp();
+        let other = AuthStore::open_at(dir.path().join("gateway"))
+            .unwrap()
+            .with_lock_wait(std::time::Duration::from_millis(100));
+        let guard = store.lock_exclusive().unwrap();
+        std::fs::remove_file(store.root.join("auth.lock.holder")).unwrap();
+        let err = other.register_client(client("x")).unwrap_err();
+        let busy = store_busy(&err).expect("typed StoreBusy");
+        assert_eq!(busy.holder, None);
+        assert!(err.to_string().contains("another process"), "{err}");
+        drop(guard);
+    }
+
+    /// #429: a rename that fails (the target is a non-empty directory)
+    /// must not leave the credential-bearing `.json.tmp` behind.
+    #[test]
+    fn a_failed_rename_removes_the_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("tokens.json");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), b"x").unwrap();
+        let err = write_json_atomic(&target, &BTreeMap::<String, String>::new());
+        assert!(err.is_err(), "renaming over a non-empty dir must fail");
+        assert!(
+            !dir.path().join("tokens.json.tmp").exists(),
+            "a failed rename left tokens.json.tmp behind"
+        );
+    }
 
     /// A SECOND `AuthStore` handle on the same root stands in for a second
     /// process (the CLI vs. a running gateway): `flock`/`LockFileEx` locks

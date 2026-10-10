@@ -53,6 +53,7 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::auth::store::is_store_busy;
 use super::auth::{
     mint_secret_32, now_epoch_secs, pkce_s256_matches, AppType, AuthStore, RegisteredClient,
     RotateOutcome, TokenRecord, ACCESS_TTL_SECS,
@@ -155,20 +156,20 @@ pub struct AttemptState {
 /// handlers below now, `/register`/`/authorize`/`/token` in Tasks 3-5 — AND
 /// the `/mcp` Bearer gate ([`super::auth::middleware::require_bearer`]).
 ///
-/// `store` MUST stay `Mutex<AuthStore>` — NEVER cloned out of the mutex — so
-/// every access holds the lock across its full read-modify-write.
-/// `AuthStore`'s mutating methods take a cross-process advisory file lock
-/// (`auth.lock`) per call, which keeps the CLI's `tokens revoke` from being
-/// lost to this process. That lock covers ONE store call, not a sequence of
-/// them, so this mutex is still needed: two concurrent in-process axum
-/// requests could otherwise double-spend a single-use auth code or race past
-/// refresh-token reuse detection. This task only adds a READ (`check_access`,
-/// in the Bearer gate) through the lock; Tasks 3-5's mutating `/authorize`/`/token`/
-/// `/register` handlers share this SAME `store` field and MUST follow the
-/// same hold-the-lock-across-the-whole-operation discipline (Task 1 security
-/// review finding, binding requirement A on this task).
+/// Binding requirement A, re-ruled for v3.5.1 (#428): `store` is a plain
+/// shared `AuthStore` with NO in-process mutex. The old `Mutex<AuthStore>`
+/// was held across `auth.lock` waits, so one stalled CLI holding that lock
+/// parked every gateway request — including `/mcp` reads — behind it.
+/// Serialization now comes from `auth.lock` alone, which works across
+/// threads because each `lock_exclusive` opens its own handle (store.rs
+/// `two_threads_sharing_one_store_serialize_on_auth_lock`). Each single-use
+/// step is atomic under that lock: `consume_code` spends a code exactly
+/// once, `rotate_refresh_for_client` runs the whole reuse-detection cascade
+/// in one locked pass. Every store call from an async handler runs on
+/// `spawn_blocking` (the lock waits up to [`super::auth::store::LOCK_WAIT`],
+/// then fails with `StoreBusy` → 503), never on a runtime worker.
 pub struct AuthCtx {
-    pub store: Mutex<AuthStore>,
+    pub store: AuthStore,
     /// The gateway's own OAuth issuer base URL — e.g. `http://127.0.0.1:7717`
     /// or a configured `public_url` (`gateway::resolve_issuer`). Set exactly
     /// once, from `on_bind` (so a `--port 0` ephemeral bind is resolved
@@ -218,7 +219,7 @@ pub enum PairingCheck {
 impl AuthCtx {
     pub fn new(store: AuthStore) -> Self {
         Self {
-            store: Mutex::new(store),
+            store,
             issuer: OnceLock::new(),
             attempts: Mutex::new(AttemptState::default()),
             registrations: Mutex::new(RegistrationWindow::default()),
@@ -278,10 +279,7 @@ impl AuthCtx {
             attempts.consecutive_failures = 0;
         }
 
-        let verified = {
-            let store = self.store.lock().unwrap_or_else(|p| p.into_inner());
-            store.verify_pairing(code)
-        };
+        let verified = self.store.verify_pairing(code);
 
         match verified {
             Err(e) => PairingCheck::StoreError(e),
@@ -696,10 +694,15 @@ async fn register_client_handler(
     // The cap check and the insert happen under the store's cross-process
     // file lock inside `register_client_capped`, so a concurrent
     // `gateway clients remove` in another process cannot race the count.
-    let saved: anyhow::Result<bool> = {
-        let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
-        store.register_client_capped(registered, MAX_REGISTERED_CLIENTS)
-    };
+    // Off the runtime workers: that lock can wait up to `LOCK_WAIT` (#428).
+    let store_ctx = ctx.clone();
+    let saved = tokio::task::spawn_blocking(move || {
+        store_ctx
+            .store
+            .register_client_capped(registered, MAX_REGISTERED_CLIENTS)
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("register task failed: {e}")));
     match saved {
         Ok(true) => {}
         Ok(false) => {
@@ -718,6 +721,14 @@ async fn register_client_handler(
                      `onebrain gateway clients remove <id>`"
                 ),
             );
+        }
+        Err(e) if is_store_busy(&e) => {
+            tracing::warn!(error = %e, "POST /register: auth store busy");
+            return with_retry_after(oauth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "temporarily_unavailable",
+                "the gateway auth store is busy; retry shortly",
+            ));
         }
         Err(e) => {
             tracing::error!(error = %e, "failed to persist dynamically registered client");
@@ -970,10 +981,7 @@ fn validate_authorize_request(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AuthorizeError::NoRedirect("missing client_id".to_string()))?;
 
-    let client = {
-        let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
-        store.get_client(client_id)
-    };
+    let client = ctx.store.get_client(client_id);
     let client = match client {
         Ok(Some(c)) => c,
         Ok(None) => return Err(AuthorizeError::NoRedirect("unknown client_id".to_string())),
@@ -1136,6 +1144,31 @@ fn html_response(status: StatusCode, html: String) -> Response {
         .into_response()
 }
 
+/// Seconds a client is told to wait (`Retry-After`) after a 503 caused by a
+/// busy `auth.lock` (#428).
+const STORE_BUSY_RETRY_AFTER_SECS: u64 = 2;
+
+fn with_retry_after(mut resp: Response) -> Response {
+    resp.headers_mut().insert(
+        header::RETRY_AFTER,
+        HeaderValue::from(STORE_BUSY_RETRY_AFTER_SECS),
+    );
+    resp
+}
+
+/// Run a handler's store work on `spawn_blocking` (#428): a store call can
+/// wait up to `LOCK_WAIT` on `auth.lock`, and doing that on a runtime worker
+/// would starve every other request (SSE keep-alives included) on it.
+async fn off_worker<F>(work: F) -> Response
+where
+    F: FnOnce() -> Response + Send + 'static,
+{
+    tokio::task::spawn_blocking(work).await.unwrap_or_else(|e| {
+        tracing::error!(error = %e, "gateway auth store task failed");
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })
+}
+
 /// The in-page error the brief calls "400 error page, NEVER redirect" —
 /// used ONLY for the two RFC 6749 §4.1.2.1 preconditions (unknown
 /// `client_id`, unregistered `redirect_uri`) and for genuine server errors.
@@ -1279,7 +1312,11 @@ async fn authorize_get_handler(
     State(ctx): State<Arc<AuthCtx>>,
     Query(params): Query<AuthorizeParams>,
 ) -> Response {
-    match validate_authorize_request(&ctx, &params) {
+    off_worker(move || authorize_get(&ctx, &params)).await
+}
+
+fn authorize_get(ctx: &AuthCtx, params: &AuthorizeParams) -> Response {
+    match validate_authorize_request(ctx, params) {
         Ok(validated) => render_consent_form(&validated, None),
         Err(AuthorizeError::NoRedirect(msg)) => error_page(StatusCode::BAD_REQUEST, &msg),
         Err(AuthorizeError::Redirect {
@@ -1357,8 +1394,13 @@ async fn authorize_post_handler(
             "This authorization request did not come from the gateway's own consent page.",
         );
     }
+    off_worker(move || authorize_post(&ctx, &params)).await
+}
 
-    let validated = match validate_authorize_request(&ctx, &params) {
+/// The store-touching part of [`authorize_post_handler`] (steps 1–3), run
+/// on `spawn_blocking` because `issue_code` waits on `auth.lock` (#428).
+fn authorize_post(ctx: &AuthCtx, params: &AuthorizeParams) -> Response {
+    let validated = match validate_authorize_request(ctx, params) {
         Ok(v) => v,
         Err(AuthorizeError::NoRedirect(msg)) => {
             return error_page(StatusCode::BAD_REQUEST, &msg);
@@ -1394,13 +1436,16 @@ async fn authorize_post_handler(
 
     // Correct code (the limiter was reset by the check above): mint a fresh
     // auth code.
-    let issued = {
-        let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
-        issue_authorize_code(&store, &validated)
-    };
-    match issued {
-        Ok(Some(auth_code)) => redirect_with_code(&ctx, &validated, &auth_code.code),
+    match issue_authorize_code(&ctx.store, &validated) {
+        Ok(Some(auth_code)) => redirect_with_code(ctx, &validated, &auth_code.code),
         Ok(None) => error_page(StatusCode::BAD_REQUEST, "unknown client_id"),
+        Err(e) if is_store_busy(&e) => {
+            tracing::warn!(error = %e, "POST /authorize: auth store busy");
+            with_retry_after(error_page(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The gateway is busy right now. Please try again in a moment.",
+            ))
+        }
         Err(e) => {
             tracing::error!(error = %e, "failed to persist minted authorization code");
             error_page(
@@ -1556,13 +1601,20 @@ fn token_error(status: StatusCode, code: &'static str) -> Response {
         .into_response()
 }
 
-/// The authorization_code grant (RFC 6749 §4.1.3). Synchronous (no `.await`
-/// anywhere in this call tree) so the ENTIRE operation — `consume_code`,
-/// the binding/PKCE checks, `issue_token_pair`, and (on the replay path)
-/// `find_code_record`/`revoke_family` — runs under ONE `ctx.store.lock()`
-/// acquisition, satisfying the binding "hold the lock across the full
-/// read-modify-write" discipline (`AuthCtx`'s doc comment) for the whole
-/// grant, not just its individual store calls.
+/// `/token` answer when `auth.lock` stayed busy past `LOCK_WAIT` (#428):
+/// 503 `{"error":"temporarily_unavailable"}` + `Retry-After`, so a client
+/// retries instead of discarding its code or refresh token.
+fn token_busy() -> Response {
+    with_retry_after(token_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "temporarily_unavailable",
+    ))
+}
+
+/// The authorization_code grant (RFC 6749 §4.1.3). Synchronous, run on
+/// `spawn_blocking` by [`token_handler`]. Each store step is atomic under
+/// `auth.lock` (see `AuthCtx`'s doc comment): `consume_code` spends the code
+/// exactly once, so two concurrent redemptions cannot both mint a pair.
 ///
 /// Order of operations matters for two binding properties:
 /// 1. `consume_code` runs UNCONDITIONALLY FIRST, before any binding/PKCE
@@ -1619,10 +1671,14 @@ fn token_authorization_code_grant(ctx: &AuthCtx, req: &TokenRequest) -> Response
     let redirect_uri = req.redirect_uri.as_deref().unwrap_or_default();
     let code_verifier = req.code_verifier.as_deref().unwrap_or_default();
 
-    let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
+    let store = &ctx.store;
 
     let consumed = match store.consume_code(code) {
         Ok(v) => v,
+        Err(e) if is_store_busy(&e) => {
+            tracing::warn!(error = %e, "POST /token: auth store busy");
+            return token_busy();
+        }
         Err(e) => {
             tracing::error!(error = %e, "auth code store I/O error during /token");
             return oauth_error(
@@ -1663,7 +1719,7 @@ fn token_authorization_code_grant(ctx: &AuthCtx, req: &TokenRequest) -> Response
         return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
     }
 
-    issue_pair_for_consumed_code(&store, &auth_code)
+    issue_pair_for_consumed_code(store, &auth_code)
 }
 
 /// Mint the pair for an already-consumed, binding-checked code.
@@ -1711,6 +1767,10 @@ fn issue_pair_for_consumed_code(store: &AuthStore, auth_code: &super::auth::Auth
             let _ = store.mark_code_minted_family(&auth_code.code, &refresh.family);
             TokenResponse::from_pair(&access, &refresh)
         }
+        Err(e) if is_store_busy(&e) => {
+            tracing::warn!(error = %e, "POST /token: auth store busy");
+            token_busy()
+        }
         Err(e) => {
             tracing::error!(error = %e, "failed to persist minted token pair");
             oauth_error(
@@ -1722,19 +1782,13 @@ fn issue_pair_for_consumed_code(store: &AuthStore, auth_code: &super::auth::Auth
     }
 }
 
-/// The refresh_token grant (RFC 6749 §6). This function acquires
-/// `ctx.store.lock()` ONCE and makes exactly one call through that guard —
+/// The refresh_token grant (RFC 6749 §6). Exactly one store call —
 /// [`super::auth::store::AuthStore::rotate_refresh_for_client`], which performs the
 /// ENTIRE reuse-detection cascade (spend the presented token, mint a fresh
 /// pair in the same family, OR burn the whole family on replay) as one
-/// complete load-modify-save pass over `tokens.json`. `AuthStore` itself
-/// holds NO mutex of its own (it's just a `root: PathBuf` — see its struct
-/// doc comment); locking is entirely the CALLER's responsibility, via
-/// `ctx.store: Mutex<AuthStore>`. `rotate_refresh` is not safe to call
-/// without that lock held across it — it is this function holding the guard
-/// for the single call below that satisfies the "hold the lock across the
-/// full read-modify-write" discipline, not any guarantee `rotate_refresh`
-/// provides on its own.
+/// complete load-modify-save pass over `tokens.json` under `auth.lock`.
+/// That lock alone serializes it against every other thread and process
+/// (#428 — see `AuthCtx`'s doc comment).
 ///
 /// `ReuseDetected` and `Invalid` deliberately share ONE match arm: both are
 /// "this refresh token doesn't work", and RFC 6749 §5.2's `invalid_grant`
@@ -1750,13 +1804,19 @@ fn issue_pair_for_consumed_code(store: &AuthStore, auth_code: &super::auth::Auth
 /// the credential).
 fn token_refresh_grant(ctx: &AuthCtx, req: &TokenRequest) -> Response {
     let refresh_token = req.refresh_token.as_deref().unwrap_or_default();
-    let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
-    match store.rotate_refresh_for_client(refresh_token, req.client_id.as_deref()) {
+    match ctx
+        .store
+        .rotate_refresh_for_client(refresh_token, req.client_id.as_deref())
+    {
         Ok(RotateOutcome::Rotated { access, refresh }) => {
             TokenResponse::from_pair(&access, &refresh)
         }
         Ok(RotateOutcome::ReuseDetected | RotateOutcome::Invalid) => {
             token_error(StatusCode::BAD_REQUEST, "invalid_grant")
+        }
+        Err(e) if is_store_busy(&e) => {
+            tracing::warn!(error = %e, "POST /token: auth store busy");
+            token_busy()
         }
         Err(e) => {
             tracing::error!(error = %e, "refresh token store I/O error during /token");
@@ -1784,11 +1844,12 @@ fn token_refresh_grant(ctx: &AuthCtx, req: &TokenRequest) -> Response {
 /// parse a body. There is no bespoke content-type check to write or get
 /// wrong here.
 async fn token_handler(State(ctx): State<Arc<AuthCtx>>, Form(req): Form<TokenRequest>) -> Response {
-    match req.grant_type.as_deref() {
+    off_worker(move || match req.grant_type.as_deref() {
         Some("authorization_code") => token_authorization_code_grant(&ctx, &req),
         Some("refresh_token") => token_refresh_grant(&ctx, &req),
         _ => token_error(StatusCode::BAD_REQUEST, "unsupported_grant_type"),
-    }
+    })
+    .await
 }
 
 /// The `POST /token` route as its own small `Router` — mirrors
@@ -2529,7 +2590,7 @@ mod tests {
         let client_id = body["client_id"].as_str().unwrap().to_string();
 
         let stored = {
-            let store = ctx.store.lock().unwrap();
+            let store = &ctx.store;
             store.get_client(&client_id).unwrap()
         }
         .unwrap_or_else(|| panic!("client {client_id} was not persisted"));
@@ -2600,7 +2661,7 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["error"], "temporarily_unavailable");
         assert_eq!(
-            ctx.store.lock().unwrap().client_count().unwrap(),
+            ctx.store.client_count().unwrap(),
             MAX_REGISTRATIONS_PER_WINDOW as usize,
             "a rate-limited request must persist nothing"
         );
@@ -2635,10 +2696,7 @@ mod tests {
             description.contains("onebrain gateway clients remove <id>"),
             "{description}"
         );
-        assert_eq!(
-            ctx.store.lock().unwrap().client_count().unwrap(),
-            MAX_REGISTERED_CLIENTS
-        );
+        assert_eq!(ctx.store.client_count().unwrap(), MAX_REGISTERED_CLIENTS);
     }
 
     #[tokio::test]
@@ -2845,7 +2903,7 @@ mod tests {
             application_type: AppType::Web,
             created: now_epoch_secs(),
         };
-        ctx.store.lock().unwrap().register_client(client).unwrap();
+        ctx.store.register_client(client).unwrap();
         client_id
     }
 
@@ -2858,7 +2916,7 @@ mod tests {
             application_type: AppType::Native,
             created: now_epoch_secs(),
         };
-        ctx.store.lock().unwrap().register_client(client).unwrap();
+        ctx.store.register_client(client).unwrap();
         client_id
     }
 
@@ -3159,7 +3217,7 @@ mod tests {
     async fn post_authorize_wrong_pairing_code_rerenders_form_and_mints_no_code() {
         let (dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
         let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
-        ctx.store.lock().unwrap().pairing_code().unwrap(); // ensure one exists
+        ctx.store.pairing_code().unwrap(); // ensure one exists
 
         let mut params = valid_params(&client_id, "https://claude.ai/cb", "s1");
         params.push(("pairing_code", "WRONG-CODE"));
@@ -3189,7 +3247,7 @@ mod tests {
     async fn post_authorize_five_wrong_codes_lock_out_even_a_subsequently_correct_code() {
         let (dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
         let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
-        let real_code = ctx.store.lock().unwrap().pairing_code().unwrap();
+        let real_code = ctx.store.pairing_code().unwrap();
 
         let base = valid_params(&client_id, "https://claude.ai/cb", "s1");
 
@@ -3245,7 +3303,7 @@ mod tests {
     async fn post_authorize_lockout_clears_naturally_after_it_elapses() {
         let (_dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
         let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
-        let real_code = ctx.store.lock().unwrap().pairing_code().unwrap();
+        let real_code = ctx.store.pairing_code().unwrap();
 
         {
             let mut attempts = ctx.attempts.lock().unwrap();
@@ -3267,7 +3325,7 @@ mod tests {
     async fn post_authorize_correct_code_mints_bound_auth_code_and_redirects_with_iss() {
         let (_dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
         let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
-        let real_code = ctx.store.lock().unwrap().pairing_code().unwrap();
+        let real_code = ctx.store.pairing_code().unwrap();
 
         let mut params = valid_params(&client_id, "https://claude.ai/cb", "s1");
         params.push(("pairing_code", real_code.as_str()));
@@ -3298,7 +3356,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        let issued = ctx.store.lock().unwrap().consume_code(&code).unwrap();
+        let issued = ctx.store.consume_code(&code).unwrap();
         let issued = issued
             .unwrap_or_else(|| panic!("no AuthCode minted for the code in the redirect Location"));
         assert_eq!(issued.client_id, client_id);
@@ -3312,7 +3370,7 @@ mod tests {
     async fn post_authorize_replayed_success_mints_a_second_independent_auth_code() {
         let (_dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
         let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
-        let real_code = ctx.store.lock().unwrap().pairing_code().unwrap();
+        let real_code = ctx.store.pairing_code().unwrap();
 
         let mut params = valid_params(&client_id, "https://claude.ai/cb", "s1");
         params.push(("pairing_code", real_code.as_str()));
@@ -3350,7 +3408,7 @@ mod tests {
 
         assert_ne!(code1, code2, "each successful POST must mint a fresh code");
 
-        let store = ctx.store.lock().unwrap();
+        let store = &ctx.store;
         assert!(
             store.consume_code(&code1).unwrap().is_some(),
             "code1 must be independently redeemable"
@@ -3381,7 +3439,7 @@ mod tests {
     {
         let (dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
         let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
-        let real_code = ctx.store.lock().unwrap().pairing_code().unwrap();
+        let real_code = ctx.store.pairing_code().unwrap();
 
         let mut params = valid_params(&client_id, "https://attacker.example/steal", "s1");
         params.push(("pairing_code", real_code.as_str()));
@@ -3410,7 +3468,7 @@ mod tests {
     async fn post_authorize_wrong_code_rerender_still_escapes_client_name_xss() {
         let (_dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
         let client_id = register_web_client(&ctx, Some(XSS_PAYLOAD), "https://claude.ai/cb");
-        ctx.store.lock().unwrap().pairing_code().unwrap();
+        ctx.store.pairing_code().unwrap();
 
         let mut params = valid_params(&client_id, "https://claude.ai/cb", "s1");
         params.push(("pairing_code", "WRONG-CODE"));
@@ -3507,7 +3565,7 @@ mod tests {
         let body = json!({"redirect_uris": ["https://claude.ai/cb"], "client_name": big});
         let resp = post_register_raw(&register, body).await;
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(ctx.store.lock().unwrap().client_count().unwrap(), 0);
+        assert_eq!(ctx.store.client_count().unwrap(), 0);
         let _ = dir;
         for (router, uri) in [
             (token_router(ctx.clone()), "/token"),
@@ -3537,7 +3595,7 @@ mod tests {
     async fn post_authorize_cross_site_fetch_metadata_is_403_and_burns_no_attempt() {
         let (dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
         let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
-        let real_code = ctx.store.lock().unwrap().pairing_code().unwrap();
+        let real_code = ctx.store.pairing_code().unwrap();
         let mut params = valid_params(&client_id, "https://claude.ai/cb", "s1");
         params.push(("pairing_code", real_code.as_str()));
 
@@ -3559,7 +3617,7 @@ mod tests {
     async fn post_authorize_foreign_or_null_origin_is_403_even_with_the_right_code() {
         let (dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
         let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
-        let real_code = ctx.store.lock().unwrap().pairing_code().unwrap();
+        let real_code = ctx.store.pairing_code().unwrap();
         let mut params = valid_params(&client_id, "https://claude.ai/cb", "s1");
         params.push(("pairing_code", real_code.as_str()));
 
@@ -3585,7 +3643,7 @@ mod tests {
         ] {
             let (_dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
             let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
-            let real_code = ctx.store.lock().unwrap().pairing_code().unwrap();
+            let real_code = ctx.store.pairing_code().unwrap();
             let mut params = valid_params(&client_id, "https://claude.ai/cb", "s1");
             params.push(("pairing_code", real_code.as_str()));
             let resp = post_authorize_with_headers(&router, &params, &extra).await;
@@ -3601,7 +3659,7 @@ mod tests {
     async fn post_authorize_null_origin_passes_only_with_same_origin_fetch_metadata() {
         let (_dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
         let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
-        let real_code = ctx.store.lock().unwrap().pairing_code().unwrap();
+        let real_code = ctx.store.pairing_code().unwrap();
         let mut params = valid_params(&client_id, "https://claude.ai/cb", "s1");
         params.push(("pairing_code", real_code.as_str()));
 
@@ -3628,7 +3686,7 @@ mod tests {
     async fn post_authorize_cross_site_wrong_codes_cannot_trip_the_lockout() {
         let (_dir, ctx, router) = authorize_fixture("http://127.0.0.1:7717");
         let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
-        let real_code = ctx.store.lock().unwrap().pairing_code().unwrap();
+        let real_code = ctx.store.pairing_code().unwrap();
         let mut wrong = valid_params(&client_id, "https://claude.ai/cb", "s1");
         wrong.push(("pairing_code", "WRONG-CODE"));
         for _ in 0..(MAX_PAIRING_FAILURES + 1) {
@@ -3683,8 +3741,6 @@ mod tests {
         scope: &str,
     ) -> String {
         ctx.store
-            .lock()
-            .unwrap()
             .issue_code(client_id, redirect_uri, CODE_CHALLENGE, resource, scope)
             .unwrap()
             .code
@@ -4004,12 +4060,7 @@ mod tests {
         let access_token = body1["access_token"].as_str().unwrap().to_string();
 
         assert!(
-            ctx.store
-                .lock()
-                .unwrap()
-                .check_access(&access_token)
-                .unwrap()
-                .is_some(),
+            ctx.store.check_access(&access_token).unwrap().is_some(),
             "sanity: the first-issued access token must be live before the replay"
         );
 
@@ -4019,12 +4070,7 @@ mod tests {
         assert_eq!(body_json(resp2).await, json!({"error": "invalid_grant"}));
 
         assert!(
-            ctx.store
-                .lock()
-                .unwrap()
-                .check_access(&access_token)
-                .unwrap()
-                .is_none(),
+            ctx.store.check_access(&access_token).unwrap().is_none(),
             "access token from the original exchange must be revoked after a code replay"
         );
     }
@@ -4195,12 +4241,7 @@ mod tests {
     async fn token_refresh_grant_rejects_an_access_token() {
         let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
         let router = token_router(ctx.clone());
-        let (access, _refresh) = ctx
-            .store
-            .lock()
-            .unwrap()
-            .issue_token_pair("client1", "brain")
-            .unwrap();
+        let (access, _refresh) = ctx.store.issue_token_pair("client1", "brain").unwrap();
 
         let resp = post_token(
             &router,
@@ -4249,13 +4290,7 @@ mod tests {
         let (_dir, ctx) = ctx_with_issuer("http://127.0.0.1:7717");
         let router = token_router(ctx.clone());
         let (client_id, resource, access, refresh) = exchange_fresh_pair(&ctx, &router).await;
-        let rec = ctx
-            .store
-            .lock()
-            .unwrap()
-            .check_access(&access)
-            .unwrap()
-            .unwrap();
+        let rec = ctx.store.check_access(&access).unwrap().unwrap();
         assert_eq!(rec.resource.as_deref(), Some(resource.as_str()));
 
         let resp = post_token(
@@ -4272,13 +4307,7 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let rec2 = ctx
-            .store
-            .lock()
-            .unwrap()
-            .check_access(&access2)
-            .unwrap()
-            .unwrap();
+        let rec2 = ctx.store.check_access(&access2).unwrap().unwrap();
         assert_eq!(rec2.resource.as_deref(), Some(resource.as_str()));
     }
 

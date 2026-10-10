@@ -578,8 +578,6 @@ mod tests {
         let redirect_uri = "https://claude.ai/cb";
         let client_id = mint_secret_32();
         ctx.store
-            .lock()
-            .unwrap()
             .register_client(RegisteredClient {
                 client_id: client_id.clone(),
                 client_name: None,
