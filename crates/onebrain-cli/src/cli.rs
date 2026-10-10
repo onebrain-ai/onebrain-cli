@@ -114,7 +114,7 @@ pub enum Cmd {
     Checkpoint(CheckpointCmd),
     #[command(hide = true)]
     Daemon(DaemonCmd),
-    /// Serve the OneBrain gateway — MCP over loopback streamable HTTP (Brain pack, read-only).
+    /// Run the OneBrain gateway — a remote MCP server (Brain pack) for the Claude app, bound to loopback and reached through a tunnel.
     #[command(display_order = 19)]
     Gateway(GatewayCmd),
     #[command(display_order = 13)]
@@ -317,7 +317,7 @@ pub enum DaemonVerb {
     },
 }
 // ─────────────────────────────────────────────────────────────────────────
-// gateway (v3.5 — loopback MCP-over-HTTP; Brain pack, read-only)
+// gateway (v3.5 — remote MCP over streamable HTTP; Brain pack)
 // ─────────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug)]
@@ -329,7 +329,7 @@ pub struct GatewayCmd {
 #[derive(Subcommand, Debug)]
 pub enum GatewayVerb {
     /// Run the gateway in the foreground until Ctrl-C or SIGTERM. Binds 127.0.0.1 only
-    /// (no bind flag — remote access isn't offered until auth lands).
+    /// (no bind flag — remote access goes through a tunnel, see `gateway tunnel setup`).
     Run {
         /// Loopback port to bind. 0 = OS-assigned ephemeral port. Overrides
         /// `~/.onebrain/gateway.yml`'s `port` (default 7717) when given.
