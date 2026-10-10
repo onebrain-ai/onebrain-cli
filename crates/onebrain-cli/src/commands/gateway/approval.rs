@@ -166,6 +166,9 @@ pub struct PendingApproval {
     /// "unverified" (see [`PendingApproval::client_line`]). `None` when the
     /// store has no name or the lookup failed.
     pub client_name: Option<String>,
+    /// Structured facts the approval prompts are built from (title / path /
+    /// query, body length) — see [`super::approval_view`].
+    pub subject: super::approval_view::ApprovalSubject,
 }
 
 /// Longest client name (in chars) shown to an approver before an ellipsis.
@@ -182,6 +185,20 @@ pub fn summary_value(s: &str) -> String {
     push_escaped(&mut out, s);
     out.push('"');
     out
+}
+
+/// Escape only control and bidi/separator characters (visibly, as
+/// `\u{..}`); quotes, backslashes and all printable text stay as written.
+pub fn escape_visible(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || is_bidi_or_separator(c) {
+                format!("\\u{{{:x}}}", c as u32)
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
 }
 
 fn push_escaped(out: &mut String, s: &str) {
@@ -242,7 +259,7 @@ pub fn sanitize_client_name(raw: &str) -> Option<String> {
 }
 
 /// First 8 + last 3 chars of a client_id (`rKkfrep1…Y58`); short ids as-is.
-fn short_client_id(id: &str) -> String {
+pub fn client_id_short(id: &str) -> String {
     let n = id.chars().count();
     if n <= 12 {
         return id.to_string();
@@ -250,19 +267,6 @@ fn short_client_id(id: &str) -> String {
     let head: String = id.chars().take(8).collect();
     let tail: String = id.chars().skip(n - 3).collect();
     format!("{head}\u{2026}{tail}")
-}
-
-impl PendingApproval {
-    /// The "who is asking" text shared verbatim by the native dialog and the
-    /// Telegram message: `Claude (unverified name) · id rKkfrep1…Y58`, or
-    /// `id rKkfrep1…Y58` alone when no name is known.
-    pub fn client_line(&self) -> String {
-        let id = short_client_id(&self.client_id);
-        match &self.client_name {
-            Some(name) => format!("{name} (unverified name) \u{b7} id {id}"),
-            None => format!("id {id}"),
-        }
-    }
 }
 
 /// A human operator's response to one [`PendingApproval`] — deliberately a
@@ -665,15 +669,18 @@ mod tests {
     }
 
     #[test]
-    fn client_line_shows_name_and_short_id_or_short_id_alone() {
-        let mut p = sample("a1");
-        p.client_id = "rKkfrep1IPUdbsIDkOsWPZoYfdIc6cx-qL8Vj1CGY58".to_string();
-        assert_eq!(p.client_line(), "id rKkfrep1\u{2026}Y58");
-        p.client_name = Some("Claude".to_string());
+    fn client_id_short_keeps_first_8_and_last_3() {
         assert_eq!(
-            p.client_line(),
-            "Claude (unverified name) \u{b7} id rKkfrep1\u{2026}Y58"
+            client_id_short("rKkfrep1IPUdbsIDkOsWPZoYfdIc6cx-qL8Vj1CGY58"),
+            "rKkfrep1\u{2026}Y58"
         );
+        assert_eq!(client_id_short("client-1"), "client-1");
+    }
+
+    #[test]
+    fn escape_visible_leaves_quotes_and_thai_but_escapes_controls() {
+        assert_eq!(escape_visible("say \"hi\" ทดสอบ"), "say \"hi\" ทดสอบ");
+        assert_eq!(escape_visible("a\u{202e}\nb"), "a\\u{202e}\\u{a}b");
     }
 
     use super::*;
@@ -699,6 +706,7 @@ mod tests {
             expires: now + 300,
             class: RiskClass::Mutating,
             client_name: None,
+            subject: Default::default(),
         }
     }
 
@@ -955,7 +963,7 @@ mod tests {
         assert!(p.expires > p.created, "{p:?}");
         assert_eq!(p.class, RiskClass::Mutating);
 
-        // Serializes to EXACTLY these 9 fields — a JSON object with no extra
+        // Serializes to EXACTLY these 10 fields — a JSON object with no extra
         // keys, so no token / full note body / host path could sneak in
         // through a field this struct doesn't have. (`vault` is a
         // `gateway.yml` vault NAME, never a path — see its own doc comment.)
@@ -972,6 +980,7 @@ mod tests {
                 "created",
                 "expires",
                 "id",
+                "subject",
                 "summary",
                 "tool",
                 "vault"

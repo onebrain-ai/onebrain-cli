@@ -566,12 +566,10 @@ impl TelegramChannel {
         let chat_id = self.chat_id;
         let id = pending.id.clone();
         let expires = pending.expires;
-        let text = format!(
-            "Client: {}\nTool: {}\n\n{}",
-            pending.client_line(),
-            pending.tool,
-            pending.summary
-        );
+        // `body` (no countdown) is what an outcome edit keeps underneath its
+        // headline; `text` adds the countdown for the live prompt only.
+        let body = super::approval_view::telegram_body(pending);
+        let text = super::approval_view::telegram_prompt(pending, now_epoch_secs());
         tokio::task::spawn_blocking(move || {
             let approve_data = format!("a:{id}");
             let deny_data = format!("d:{id}");
@@ -593,7 +591,7 @@ impl TelegramChannel {
                 deny_data.len()
             );
             let keyboard = [
-                ("✅ Approve", approve_data.as_str()),
+                ("✅ Allow", approve_data.as_str()),
                 ("⛔ Deny", deny_data.as_str()),
             ];
             match api.send_message(chat_id, &text, Some(&keyboard)) {
@@ -625,7 +623,7 @@ impl TelegramChannel {
                                 id.clone(),
                                 SentSlot::Live(Sent {
                                     message_id,
-                                    text: text.clone(),
+                                    text: body.clone(),
                                     expires,
                                 }),
                             );
@@ -637,7 +635,7 @@ impl TelegramChannel {
                     // guards a map every other approval's `fire`/
                     // `note_outcome` also needs.
                     if let Some(outcome) = tombstone {
-                        let edited_text = format!("{outcome}\n\n{text}");
+                        let edited_text = format!("{outcome}\n\n{body}");
                         if let Err(e) = api.edit_message_text(chat_id, message_id, &edited_text) {
                             tracing::warn!(
                                 error = %e,
@@ -1891,6 +1889,7 @@ mod tests {
             expires: now + 300,
             class: crate::commands::gateway::policy::RiskClass::Mutating,
             client_name: None,
+            subject: Default::default(),
         }
     }
 
@@ -1913,38 +1912,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fire_names_the_client_as_unverified_with_a_short_id() {
+    async fn fire_names_the_client_and_short_id() {
         let mut p = sample_pending("appr-name");
         p.client_id = "rKkfrep1IPUdbsIDkOsWPZoYfdIc6cx-qL8Vj1CGY58".to_string();
         p.client_name = Some("Claude".to_string());
         let text = fired_text(&p).await;
         assert!(
-            text.starts_with("Client: Claude (unverified name) \u{b7} id rKkfrep1\u{2026}Y58\n"),
+            text.starts_with("\u{1f510} Claude wants to save a new note\n"),
             "{text}"
         );
-        p.client_name = None;
-        let text = fired_text(&p).await;
         assert!(
-            text.starts_with("Client: id rKkfrep1\u{2026}Y58\n"),
+            text.contains(
+                "Asked by Claude \u{b7} self-declared name \u{b7} id rKkfrep1\u{2026}Y58\n"
+            ),
             "{text}"
         );
     }
 
     #[tokio::test]
-    async fn fire_neutralises_a_hostile_client_name() {
+    async fn fire_neutralises_hostile_title_and_stays_under_the_telegram_limit() {
         let mut p = sample_pending("appr-hostile");
         p.client_name = crate::commands::gateway::approval::sanitize_client_name(&format!(
             "evil\u{202e}\nname{}",
             "z".repeat(200)
         ));
+        let title = format!("t\u{202e}\nX{}", "y".repeat(500));
+        p.subject =
+            crate::commands::gateway::approval_view::ApprovalSubject::new(Some(&title), Some(9));
         let text = fired_text(&p).await;
         assert!(!text.contains('\u{202e}'), "{text}");
-        let first = text.lines().next().unwrap();
-        assert!(
-            first.starts_with("Client: evil\\u{202e}\\u{a}name"),
-            "{first}"
+        assert_eq!(
+            text.matches('\n').count(),
+            7,
+            "no injected newlines: {text}"
         );
-        assert!(first.chars().count() < 120, "cap not applied: {first}");
+        assert!(
+            text.chars().count() < 1000,
+            "{} chars",
+            text.chars().count()
+        );
     }
 
     #[tokio::test]
@@ -1966,21 +1972,26 @@ mod tests {
         assert_eq!(method, "sendMessage");
         assert_eq!(body["chat_id"], 5, "{body}");
         let text = body["text"].as_str().unwrap_or_default();
-        // Task 4 review, F8: matches the native dialog's own framing —
-        // client and tool lines above the summary — so a Telegram approver
-        // (very often the one AWAY from the machine the native dialog
-        // would pop on) can see which connected client is asking.
+        // The approver sees who is asking and what, in plain words (the
+        // exact layout is pinned by `approval_view`'s golden tests).
         assert!(
-            text.contains(&format!("Client: {}", pending.client_line())),
+            text.starts_with("\u{1f510} An unnamed app wants to save a new note\n"),
             "{body}"
         );
-        assert!(text.contains(&format!("Tool: {}", pending.tool)), "{body}");
-        assert!(text.contains(&pending.summary), "{body}");
+        assert!(
+            text.contains("Asked by an unnamed app \u{b7} id client-1"),
+            "{body}"
+        );
+        assert!(text.contains("\u{23f3} Answer within 5 min"), "{body}");
+        assert!(
+            !text.contains("brain_capture") && !text.contains("note: Quarterly"),
+            "{body}"
+        );
         let buttons = body["reply_markup"]["inline_keyboard"][0]
             .as_array()
             .unwrap_or_else(|| panic!("no inline keyboard row: {body}"));
         assert_eq!(buttons.len(), 2, "{body}");
-        assert_eq!(buttons[0]["text"], "✅ Approve", "{body}");
+        assert_eq!(buttons[0]["text"], "✅ Allow", "{body}");
         assert_eq!(buttons[0]["callback_data"], "a:appr-1", "{body}");
         assert_eq!(buttons[1]["text"], "⛔ Deny", "{body}");
         assert_eq!(buttons[1]["callback_data"], "d:appr-1", "{body}");
@@ -2030,7 +2041,7 @@ mod tests {
         let text = body["text"].as_str().unwrap_or_default();
         assert!(text.contains("Approved via native"), "{body}");
         assert!(
-            text.contains(&pending.summary),
+            text.contains("An unnamed app wants to save a new note"),
             "the edit must still carry the original summary text: {body}"
         );
 
@@ -2127,7 +2138,7 @@ mod tests {
         let text = body["text"].as_str().unwrap_or_default();
         assert!(text.contains("Expired — no one answered in time"), "{body}");
         assert!(
-            text.contains(&pending.summary),
+            text.contains("An unnamed app wants to save a new note"),
             "the edit must still carry the original summary text: {body}"
         );
         // `edit_message_text` sends an explicit EMPTY keyboard — omitting

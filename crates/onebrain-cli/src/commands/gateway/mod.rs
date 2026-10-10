@@ -27,6 +27,7 @@ pub mod access;
 pub mod approval;
 pub mod approval_native;
 pub mod approval_routes;
+pub mod approval_view;
 pub mod audit;
 pub mod auth;
 pub mod config;

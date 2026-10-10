@@ -59,6 +59,7 @@ use crate::commands::gateway::approval::{
 };
 use crate::commands::gateway::approval_native;
 use crate::commands::gateway::approval_routes::approval_router;
+use crate::commands::gateway::approval_view;
 use crate::commands::gateway::audit::{AuditEntry, AuditLog, Decision, Outcome};
 use crate::commands::gateway::auth::core::{mint_secret_32, now_epoch_secs};
 use crate::commands::gateway::auth::middleware::require_bearer;
@@ -1122,13 +1123,20 @@ async fn announce_approval_wait(
 /// entry (never the raw tool arguments, never a note body — see
 /// `audit::AuditEntry::args_summary`'s own doc comment), so there is no
 /// second summary to keep in sync.
+/// What a gated call tells the approval machinery about itself: the
+/// redacted audit line, plus the structured facts the prompts are built from.
+struct GateCall<'a> {
+    args_summary: &'a str,
+    subject: approval_view::ApprovalSubject,
+}
+
 async fn policy_gate(
     state: &Arc<GatewayState>,
     principal: &Principal,
     tool: &'static str,
     class: RiskClass,
     vault: Option<&str>,
-    args_summary: &str,
+    call: &GateCall<'_>,
     ctx: Option<&RequestContext<RoleServer>>,
 ) -> Result<(Decision, Option<ResolvedVia>), (Decision, Option<ResolvedVia>, ErrorData)> {
     match policy::decide(&state.config.policy, &state.grants, principal, class, vault) {
@@ -1141,7 +1149,7 @@ async fn policy_gate(
             ErrorData::invalid_request(format!("gateway policy denies this call [{tool}]"), None),
         )),
         PolicyOutcome::NeedApproval => {
-            await_approval(state, principal, tool, class, vault, args_summary, ctx).await
+            await_approval(state, principal, tool, class, vault, call, ctx).await
         }
     }
 }
@@ -1252,7 +1260,7 @@ async fn await_approval(
     tool: &'static str,
     class: RiskClass,
     vault: Option<&str>,
-    args_summary: &str,
+    call: &GateCall<'_>,
     ctx: Option<&RequestContext<RoleServer>>,
 ) -> Result<(Decision, Option<ResolvedVia>), (Decision, Option<ResolvedVia>, ErrorData)> {
     let wait_secs = state.config.policy.approval_wait_seconds;
@@ -1266,7 +1274,7 @@ async fn await_approval(
         // copy: this string is shown to a human over `GET /approvals` and
         // handed to `osascript` as a command-line argument. See
         // [`bounded_summary`].
-        summary: bounded_summary(args_summary.to_string()),
+        summary: bounded_summary(call.args_summary.to_string()),
         created: now,
         expires: now.saturating_add(wait_secs),
         class,
@@ -1274,6 +1282,7 @@ async fn await_approval(
             .client_name
             .as_deref()
             .and_then(approval::sanitize_client_name),
+        subject: call.subject.clone(),
     };
     let id = pending.id.clone();
     let rx = match state.approvals.register(pending.clone()) {
@@ -1423,13 +1432,25 @@ async fn await_approval(
             // `telegram_api::BotApi::edit_message_text`'s own doc comment
             // for why that requires an explicit empty keyboard).
             if let Some(t) = &state.telegram {
-                t.note_outcome(&id, &format!("✅ Approved via {}", via.as_str()));
+                t.note_outcome(
+                    &id,
+                    &approval_view::telegram_outcome(
+                        &pending,
+                        approval_view::Outcome::Decided(approval::Decision::Approve, via),
+                    ),
+                );
             }
             Ok((Decision::Approved, Some(via)))
         }
         WaitOutcome::Decided(approval::Decision::Deny, via) => {
             if let Some(t) = &state.telegram {
-                t.note_outcome(&id, &format!("⛔ Denied via {}", via.as_str()));
+                t.note_outcome(
+                    &id,
+                    &approval_view::telegram_outcome(
+                        &pending,
+                        approval_view::Outcome::Decided(approval::Decision::Deny, via),
+                    ),
+                );
             }
             Err((
                 Decision::Denied,
@@ -1450,7 +1471,10 @@ async fn await_approval(
         }
         WaitOutcome::TimedOut => {
             if let Some(t) = &state.telegram {
-                t.note_outcome(&id, "⏰ Expired — no one answered in time");
+                t.note_outcome(
+                    &id,
+                    &approval_view::telegram_outcome(&pending, approval_view::Outcome::TimedOut),
+                );
             }
             Err((
                 Decision::TimedOut,
@@ -1635,7 +1659,10 @@ impl GatewayServer {
             "capabilities",
             RiskClass::ReadOnly,
             None,
-            &args_summary,
+            &GateCall {
+                args_summary: &args_summary,
+                subject: approval_view::ApprovalSubject::default(),
+            },
             Some(&ctx),
         )
         .await
@@ -1705,7 +1732,10 @@ impl GatewayServer {
             "brain_tasks",
             RiskClass::ReadOnly,
             params.vault.as_deref(),
-            &args_summary,
+            &GateCall {
+                args_summary: &args_summary,
+                subject: approval_view::ApprovalSubject::default(),
+            },
             Some(&ctx),
         )
         .await
@@ -1804,7 +1834,10 @@ impl GatewayServer {
             "brain_get",
             RiskClass::ReadOnly,
             params.vault.as_deref(),
-            &args_summary,
+            &GateCall {
+                args_summary: &args_summary,
+                subject: approval_view::ApprovalSubject::new(Some(&params.file), None),
+            },
             Some(&ctx),
         )
         .await
@@ -1902,7 +1935,10 @@ impl GatewayServer {
             "brain_search",
             RiskClass::ReadOnly,
             params.vault.as_deref(),
-            &args_summary,
+            &GateCall {
+                args_summary: &args_summary,
+                subject: approval_view::ApprovalSubject::new(Some(&params.query), None),
+            },
             Some(&ctx),
         )
         .await
@@ -1998,7 +2034,13 @@ impl GatewayServer {
             "brain_capture",
             RiskClass::Mutating,
             params.vault.as_deref(),
-            &args_summary,
+            &GateCall {
+                args_summary: &args_summary,
+                subject: approval_view::ApprovalSubject::new(
+                    params.title.as_deref(),
+                    Some(params.text.chars().count()),
+                ),
+            },
             Some(&ctx),
         )
         .await
@@ -5641,6 +5683,7 @@ mod tests {
                         expires: now + 300,
                         class: RiskClass::Mutating,
                         client_name: None,
+                        subject: Default::default(),
                     })
                     .unwrap_or_else(|e| panic!("filler {i} must fit under the cap: {e:?}")),
             );
@@ -5738,6 +5781,7 @@ mod tests {
                 expires: now + 300,
                 class: RiskClass::Mutating,
                 client_name: None,
+                subject: Default::default(),
             }
         };
         let deny = approval::Decision::Deny;
@@ -6429,7 +6473,7 @@ mod tests {
             body["text"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("✅ Approved via http"),
+                .contains("💻 Answered on the approvals page · allowed"),
             "the edit must name the channel that actually answered: {body}"
         );
 
@@ -6502,7 +6546,7 @@ mod tests {
             body["text"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("⛔ Denied via http"),
+                .contains("💻 Answered on the approvals page · denied"),
             "{body}"
         );
 
@@ -6565,7 +6609,7 @@ mod tests {
             body["text"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("⏰ Expired — no one answered in time"),
+                .contains("⌛ Timed out · denied automatically, nothing written"),
             "{body}"
         );
 
