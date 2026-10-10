@@ -1,6 +1,6 @@
 # OneBrain Gateway — `onebrain gateway run`
 
-`onebrain gateway run` starts a loopback Streamable HTTP MCP server serving a multi-vault tool pack — the v3.5 Gateway epic's shipped-so-far surface. This page covers the `gateway.yml` schema and its defaults, zero-config behavior, OAuth 2.1 authentication, the policy/approval/audit machinery every tool call passes through, and the current (deliberately narrow) security posture. See [`docs/reference/mcp.md`](reference/mcp.md#gateway-streamable-http) for the tool-by-tool reference and [ADR 0019](decisions/0019-native-mcp-server-staged-qmd-cutover.md) for the wider native-MCP architecture this sits alongside.
+`onebrain gateway run` starts a loopback Streamable HTTP MCP server serving a multi-vault tool pack. It is how the Claude app on your phone reaches your vaults, through a Cloudflare tunnel (see [Use it from your phone](#use-it-from-your-phone)). This page covers the `gateway.yml` schema and its defaults, zero-config behavior, OAuth 2.1 authentication, the policy/approval/audit machinery every tool call passes through, and the security posture. See [`docs/reference/mcp.md`](reference/mcp.md#gateway-streamable-http) for the tool-by-tool reference and [ADR 0019](decisions/0019-native-mcp-server-staged-qmd-cutover.md) for the wider native-MCP architecture this sits alongside. The reasoning behind the gateway's design is in ADRs [0036](decisions/0036-remote-mcp-gateway-separate-process.md) to [0043](decisions/0043-gateway-plain-english-approval-prompts.md).
 
 ```bash
 onebrain gateway run              # bind the configured (or default 7717) port
@@ -11,7 +11,7 @@ onebrain gateway run --port 0     # let the OS assign an ephemeral port
 - Binds **`127.0.0.1` only** — see [Exposure model](#exposure-model) below.
 - The bound URL prints once to stdout on startup: `gateway listening on http://<bound-addr>/mcp`.
 
-## What this skeleton ships
+## What it ships
 
 - One loopback HTTP endpoint (`http://127.0.0.1:<port>/mcp`), Streamable HTTP, protocol `2026-07-28` pinned as the negotiation fallback.
 - Five tools — the **Brain pack**: four read-only (`capabilities`, `brain_tasks`, `brain_get`, `brain_search`) plus one write tool, `brain_capture` (see [`brain_capture`](#brain_capture) below) — gated by the [policy engine](#policy--approvals) like every other tool.

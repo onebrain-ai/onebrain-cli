@@ -7,7 +7,7 @@
 ```
 src/
 ├── main.rs              argv → clap → dispatch; help-banner pre-pass; structured-mode error renderer
-├── cli.rs               clap command tree (Cli + Cmd) — 3 root verbs + 13 groups + 8 hidden v3.0 aliases
+├── cli.rs               clap command tree (Cli + Cmd) — 3 root verbs + 4 standalone + 13 groups + 8 hidden aliases
 ├── banner.rs            TTY-only branded wordmark banner + help-banner gating
 ├── exit.rs              CoreError → stable i32 exit-code mapping (walks anyhow chain)
 ├── vault_ctx.rs         CLI-side wiring for onebrain_core vault resolution (resolve/require/hook)
@@ -33,7 +33,8 @@ src/
 │   ├── vault_sync.rs    vault sync — pull plugin tarball + overlay
 │   ├── register_hooks.rs plugin install — .claude/settings.json hook wiring
 │   ├── register_schedule.rs schedule register — launchd plist emission
-│   └── run_skill.rs     skill run — headless claude/gemini spawn (--harness/--model · ONEBRAIN_HEADLESS)
+│   ├── run_skill.rs     skill run — headless claude/gemini spawn (--harness/--model · ONEBRAIN_HEADLESS)
+│   └── gateway/         gateway — remote MCP gateway process, OAuth, policy/approvals, tunnel + service (see below)
 └── v31/
     ├── mod.rs           v3.1 module root
     ├── dispatch.rs      central Cmd → handler dispatcher (the routing brain)
@@ -54,7 +55,7 @@ Binary entry point. `argv → help-banner pre-pass → Cli::parse() → dispatch
 **Connections** — calls: `banner::{argv_requests_help, emit_help_banner}`, `v31::dispatch::{dispatch, output_mode}`, `exit::exit_code_for`, `output::emit`; called by: OS process entry.
 
 ### `src/cli.rs`
-The entire clap surface, locked at v3.1 per spec §2.4. `Cli` (global flags + `command: Cmd`) and `Cmd` (3 root verbs + 24 resource groups + 8 hidden v3.0 aliases). Every group's verb list is a `Subcommand` enum even when unimplemented — the tree shape itself is the v3.1 deliverable.
+The entire clap surface, locked at v3.1 per spec §2.4. `Cli` (global flags + `command: Cmd`) and `Cmd` (3 root verbs (`init`, `update`, `doctor`) + 4 standalone commands (`completions`, `hook`, `mcp`, `serve`) + 13 resource groups (`daemon` hidden) + 8 hidden v3.0 aliases and a hidden `qmd` removal catcher). Every group's verb list is a `Subcommand` enum even when unimplemented — the tree shape itself is the v3.1 deliverable.
 **Key types**
 - `Cli` — global flags `--vault`, `--output {text,json,yaml,table,tsv}`, `--json`, `--yaml` (conflict), `--pretty`, `--no-color`, `--quiet`; all `global = true`.
 - `Cmd` — root: `Init/Update/Doctor`; visible groups: `Checkpoint/Harness/Plugin/Schedule/Session/Skill/Vault`; `hide = true` stub-only groups: `Avatar/Bookmark/Bundle/Config/Daemon/Date/Dream/Frontmatter/Gateway/Inbox/Log/Memory/Note/Pause/Serve/Task`; hidden aliases: `SessionInitAlias/OrphanScanAlias/QmdReindexAlias/RegisterHooksAlias/RegisterScheduleAlias/MigrateAlias/VaultSyncAlias/RunSkillAlias`; `Qmd` (removed v3.4.5) is now a hidden catch-all that emits a migration error rather than a visible group.
@@ -169,6 +170,22 @@ Implements `schedule register` (and the `register-schedule` alias). Six flags ro
 ### `src/commands/run_skill.rs`
 Implements `skill run` (and the `run-skill` alias). The skill name is positional (`skill run daily`) or `--skill <name>` (parity with `run-skill`; clap `conflicts_with` rejects both). `--harness {claude,gemini,codex}` (default claude) picks the runtime and `--model <m>` the model. Prompts use `/onebrain:<name>` for Claude/Gemini and `$onebrain:<name>` for Codex. Codex runs `codex exec --sandbox workspace-write --skip-git-repo-check --ephemeral -C <vault>`; a managed unattended installation also enables trusted hooks. All harnesses inherit the environment, receive null stdin, and propagate their exit code.
 
+### `src/commands/gateway/`
+`onebrain gateway` — the v3.5 remote MCP gateway ([`docs/gateway.md`](../gateway.md), [ADR 0036](../decisions/0036-remote-mcp-gateway-separate-process.md)). A multi-file module; `mod.rs` holds the `run` loop (loopback bind, graceful shutdown on Ctrl-C / SIGTERM) and `pair`. Per-file map:
+
+| File | Role |
+|---|---|
+| `mod.rs` | `run` / `pair`; `public_url` and config validation; shutdown signals. |
+| `config.rs`, `config_write.rs` | `~/.onebrain/gateway.yml` (`GatewayConfig`); comment-preserving writes. |
+| `server.rs` | `GatewayServer` — the rmcp streamable-HTTP handler, the five Brain-pack tools, the policy gate and router assembly. |
+| `host_guard.rs` | `Host` allowlist, `Origin` check, proxy-header refusal ([ADR 0040](../decisions/0040-gateway-pre-tunnel-exposure-hardening.md)). |
+| `oauth_routes.rs`, `auth/` | Discovery, `/register`, `/authorize` (consent), `/token`; bearer middleware; the JSON auth store with its `auth.lock` ([ADR 0037](../decisions/0037-gateway-oauth-authorization-server-and-pairing.md), [0041](../decisions/0041-gateway-auth-store-lock-and-toctou-recheck.md)). |
+| `policy.rs`, `approval.rs`, `audit.rs` | Risk classes and modes, grants, the pending-approval registry, the JSONL audit log ([ADR 0038](../decisions/0038-gateway-policy-engine-and-human-approvals.md)). |
+| `approval_native.rs`, `approval_routes.rs`, `telegram*.rs` | The three approval channels: macOS dialog, loopback `/approvals`, Telegram bot and its setup wizard. |
+| `approval_view.rs` | Plain-English prompt wording ([ADR 0043](../decisions/0043-gateway-plain-english-approval-prompts.md)). |
+| `access.rs` | `gateway tokens list\|revoke`, `gateway clients list\|remove`. |
+| `tunnel.rs`, `service.rs`, `service_plist.rs`, `health.rs` | `tunnel setup\|status`; LaunchAgent install/uninstall/status; plist rendering; the checks shared by `doctor`, `service status` and `tunnel status` ([ADR 0042](../decisions/0042-gateway-tunnel-and-launchagent-service.md)). |
+
 ## `v31/` — command-tree migration & v3.1 verbs
 The v3.1 layer: `dispatch.rs` is the routing brain mapping every `Cmd` variant to a handler; hidden v3.0 aliases call the corresponding new-path handler **after** `migration::print_once`; `hook_rewriter` migrates on-disk `settings.json` hook args; `plugin_update` is the plugin-side overlay workflow (distinct from `commands::update`, which is the CLI binary self-update); `vault_current` is a new informational verb; `stubs` now holds a single `not_implemented` used by the one hybrid arm (`plugin uninstall` for non-Codex harnesses) — the forward-declared surface it used to serve was removed in v3.4.24 (#334).
 
@@ -222,11 +239,16 @@ Turns the forward-declared command surface into clean exits.
 | `init` | `commands/init.rs` | onebrain-fs (`init::run_init`) |
 | `update` | `commands/update.rs` | onebrain-fs (`update::run_update`) |
 | `doctor` | `commands/doctor.rs` | onebrain-fs (`doctor::run_all_checks`) · onebrain-core (config) |
+| `gateway run` · `gateway pair` | `commands/gateway/mod.rs` | onebrain-core (config) · rmcp (streamable HTTP server) · the warm daemon for `brain_search` |
+| `gateway telegram setup` | `commands/gateway/telegram_setup.rs` | none (Telegram Bot API over HTTPS) |
+| `gateway tunnel setup\|status` | `commands/gateway/tunnel.rs` | none (`cloudflared` on `PATH`) |
+| `gateway service install\|uninstall\|status` | `commands/gateway/service.rs` | onebrain-core (scheduler backend `launchctl` seam) |
+| `gateway tokens list\|revoke` · `gateway clients list\|remove` | `commands/gateway/access.rs` | none (`~/.onebrain/gateway/*.json` via `AuthStore`) |
 | `plugin uninstall` (non-Codex harness) | `v31/stubs.rs` | none (exit 72) |
 
 Hidden v3.0 aliases route through the same handlers after a one-time migration notice: `session-init`→`session_init`, `orphan-scan`→`orphan_scan`, `qmd-reindex`→`search_reindex` (dispatches to the native `search reindex` handler, kept for un-migrated hooks), `register-hooks`→`register_hooks`, `register-schedule`→`register_schedule`, `migrate`→`migrate`, `vault-sync`→`vault_sync`, `run-skill`→`run_skill`.
 
 ## Entry points
 - `fn main()` (`src/main.rs`) — process entry; help pre-pass → `Cli::parse()` → dispatch → `process::exit`.
-- The clap tree `Cli` / `Cmd` (`src/cli.rs`) — the entire parsed command surface (3 root verbs + 24 groups + 8 hidden aliases).
+- The clap tree `Cli` / `Cmd` (`src/cli.rs`) — the entire parsed command surface (3 root verbs (`init`, `update`, `doctor`) + 4 standalone commands (`completions`, `hook`, `mcp`, `serve`) + 13 resource groups (`daemon` hidden) + 8 hidden v3.0 aliases and a hidden `qmd` removal catcher).
 - `v31::dispatch::dispatch(cli: Cli) -> Result<()>` (`src/v31/dispatch.rs`) — the command dispatcher that fans every `Cmd` variant out to its handler.

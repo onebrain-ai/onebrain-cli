@@ -40,6 +40,20 @@ Suppress it with `2>/dev/null` if it disturbs a script. See [#332](https://githu
 
 Download links for each target: the [pre-built binaries table](install.md#pre-built-binaries). How the `semantic` cargo feature implements the seam: [`reference/onebrain-search.md`](reference/onebrain-search.md).
 
+## Gateway (v3.5+)
+
+The remote MCP gateway ([`gateway.md`](gateway.md), [ADR 0036](decisions/0036-remote-mcp-gateway-separate-process.md)) is part of the one `onebrain` binary on every target, but not every piece works everywhere:
+
+| Piece | macOS | Linux | Windows |
+|---|---|---|---|
+| `gateway run`, `pair`, `tokens`, `clients`, `telegram setup`, `tunnel setup` / `status` | yes | yes | yes |
+| Approval by Telegram and by the loopback `/approvals` page | yes | yes | yes |
+| Approval by a native dialog | yes (`osascript`) | no | no |
+| `gateway service install` / `uninstall` / `status` (LaunchAgents) | yes | not supported yet | not supported yet |
+| Graceful stop on SIGTERM | yes | yes | Ctrl-C only |
+
+Off macOS, `gateway service` exits with "not supported yet". Run `onebrain gateway run` and `cloudflared tunnel --no-autoupdate --protocol http2 run --token-file ~/.onebrain/gateway/tunnel.token` under your own supervisor (systemd, a terminal multiplexer) and restart `gateway run` after changing `public_url`. Running the gateway needs `cloudflared` only for remote access. `brain_search` also needs the per-vault daemon, so it follows the [search tiers](#search--semantic-vs-keyword) above.
+
 ## OS scheduler backends (v3.4.20+)
 
 `onebrain schedule register` compiles the `onebrain.yml schedule:` block into the platform's own scheduler — there is no bundled daemon:

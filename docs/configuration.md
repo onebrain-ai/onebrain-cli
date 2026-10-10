@@ -6,6 +6,8 @@ scaffolds it as a **self-documenting template**: every key is preceded by a
 you what a knob does and what to put back if you mistune it (v3.4.8,
 [ADR 0026](decisions/0026-config-self-documentation.md)).
 
+> The gateway has its own machine-level file, `~/.onebrain/gateway.yml`, documented in [`gateway.yml` (the gateway's config)](#gatewayyml--the-gateways-config) below.
+
 Two safety nets back the comments:
 
 - **`onebrain doctor`** validates every *present* value against the same
@@ -117,6 +119,39 @@ fns (`onebrain-core`), the embedding/reranker model registries
 (`onebrain-search`), and the shared update-channel constants (`onebrain-fs`)
 — doctor never keeps a second copy of a range, so the table cannot drift
 from the binary you're running.
+
+## `gateway.yml` — the gateway's config
+
+`onebrain gateway` reads `~/.onebrain/gateway.yml`, not `onebrain.yml`: it is machine-level because one gateway serves several vaults. Every key is optional and a missing file behaves like an empty one. The file is read once at startup, so restart the gateway after editing it (`onebrain gateway service install` restarts the LaunchAgent). Full behaviour and security notes: [`gateway.md`](gateway.md). `doctor` checks this file in its Gateway section, not in `config-values`.
+
+| Key | What it does | Default | Valid values |
+|---|---|---|---|
+| `port` | Loopback port `gateway run` binds when `--port` is not given | `7717` | 0-65535 (0 = OS-assigned) |
+| `default_vault` | Vault served when a tool call omits `vault` | *unset* (falls back to `$ONEBRAIN_VAULT`, then walk-up from the process's working directory) | path |
+| `vaults` | Named vaults a tool call may select with its `vault` argument | `{}` | map of name to path |
+| `public_url` | Public origin of the tunnel, used as the OAuth issuer and added to the allowed `Host` list. Written by `gateway tunnel setup` | *unset* (issuer is `http://127.0.0.1:<port>`) | bare origin `https://host[:port]`; `http://` only for a loopback host; no path, query, fragment or userinfo. An invalid value stops `gateway run` from starting |
+| `policy.read_only` | Mode for read-only tools (`capabilities`, `brain_tasks`, `brain_get`, `brain_search`) | `auto` | `auto`, `ask_once`, `ask_always`, `deny` |
+| `policy.mutating` | Mode for write tools (`brain_capture`) | `ask_once` | `auto`, `ask_once`, `ask_always`, `deny` |
+| `policy.destructive` | Mode for destructive tools (none ship yet) | `ask_always` | `auto`, `ask_once`, `ask_always`, `deny` |
+| `policy.grant_ttl_minutes` | How long an `ask_once` approval keeps covering the same client, vault and risk class | `30` | integer minutes |
+| `policy.approval_wait_seconds` | How long a call waits for a human before it is denied | `240` | seconds; values above `270` are clamped with a startup warning; `0` denies at once |
+| `telegram.bot_token` | Bot token from `@BotFather` for the approval channel. Never logged or echoed | *empty* (channel off) | string. Written by `gateway telegram setup` |
+| `telegram.chat_id` | Private chat the bot sends prompts to; only presses from this user id count | `0` (channel off) | positive integer; a group or channel id (negative) leaves the channel off |
+
+A partial `policy:` block fills only the keys it omits. The Telegram channel is active only when both `telegram` keys hold valid values.
+
+```yaml
+port: 7717
+default_vault: /Users/you/ob-1
+vaults:
+  personal: /Users/you/ob-1
+  work: /Users/you/ob-work
+public_url: https://brain.example.com
+policy:
+  mutating: ask_once
+  grant_ttl_minutes: 30
+  approval_wait_seconds: 240
+```
 
 ## Recovering from a bad edit
 

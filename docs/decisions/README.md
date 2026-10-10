@@ -63,5 +63,13 @@ ADRs are immutable once accepted — if a decision changes, write a new ADR that
 | [0033](0033-per-vault-daemon-slots.md) | Per-vault daemon slots: multi-vault warm daemons on one machine (ephemeral ports, no-steal) | accepted |
 | [0034](0034-heading-search-schema-selfheal-rerank-gate-decouple.md) | Heading search enables the lex schema; self-heal over a hard error; rerank gate decoupled from the confidence band | accepted |
 | [0035](0035-native-codex-harness.md) | Native Codex harness, managed plugin opt-in, and chat-scoped session identity | accepted |
+| [0036](0036-remote-mcp-gateway-separate-process.md) | Remote MCP gateway as a separate `onebrain gateway` process in the same binary (streamable HTTP, loopback bind) | accepted |
+| [0037](0037-gateway-oauth-authorization-server-and-pairing.md) | Built-in OAuth 2.1 authorization server with device pairing (public DCR clients, PKCE, rotating refresh, RFC 8707 resource recorded) | accepted |
+| [0038](0038-gateway-policy-engine-and-human-approvals.md) | Policy engine with risk tiers and human approvals (auto / ask_once / ask_always / deny, grants, three channels, audit) | accepted |
+| [0039](0039-gateway-approval-keepalive-and-wait-clamp.md) | Approval keep-alive over SSE, wait clamp (240 s / 270 s), SIGTERM handling | accepted |
+| [0040](0040-gateway-pre-tunnel-exposure-hardening.md) | Pre-tunnel exposure hardening: Host/Origin guard, loopback-only `/approvals`, registration caps, CSRF consent | accepted |
+| [0041](0041-gateway-auth-store-lock-and-toctou-recheck.md) | Cross-process auth-store lock, post-mint registration re-check, `rust-version 1.89` | accepted |
+| [0042](0042-gateway-tunnel-and-launchagent-service.md) | Tunnel + service: Cloudflare token file, KeepAlive LaunchAgents, macOS-only for now | accepted |
+| [0043](0043-gateway-plain-english-approval-prompts.md) | Plain-English approval prompts built from structured fields | accepted |
 
 > These ADRs distill the public-facing rationale; the full design notes live in the project tracker. Numbers are stable IDs assigned at authoring time — see each ADR's **Date** for chronology.

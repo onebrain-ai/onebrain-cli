@@ -1,6 +1,6 @@
 # Architecture
 
-OneBrain CLI is a five-crate Cargo workspace. Only the binary ships; the library crates exist to keep responsibilities separated and testable.
+OneBrain CLI is a six-crate Cargo workspace. Only the binary ships; the library crates exist to keep responsibilities separated and testable.
 
 ```
 onebrain-cli          Binary crate — clap dispatch over the v3.1 command tree,
@@ -13,6 +13,9 @@ onebrain-cli          Binary crate — clap dispatch over the v3.1 command tree,
   ├─ onebrain-fs      Vault walks · frontmatter parsing · plugin tarball overlay
   │                   · init bootstrap · doctor checks · update install path · backups.
   │                   Knows about the filesystem.
+  │
+  ├─ onebrain-token   Token-optimization transforms · level ladder · honesty backstop
+  │                   · gain telemetry types · redb token cache. Standalone.
   │
   ├─ onebrain-cache   Session token resolution · checkpoint cadence state
   │                   · search status detection.
@@ -30,6 +33,8 @@ The arrow points *down* — higher crates depend on lower ones, never the revers
 onebrain-cli ──▶ onebrain-fs ──▶ onebrain-core
        │                              ▲
        ├────────▶ onebrain-cache ─────┘
+       │
+       ├────────▶ onebrain-token      (standalone — no workspace deps)
        │
        └────────▶ onebrain-search     (standalone — no workspace deps)
 ```
@@ -51,6 +56,43 @@ Taking `onebrain doctor --json` as the worked example:
 4. Back in the binary, the report is wrapped in the canonical `Envelope<T>` and handed to `serialize_for_mode`, which renders text / JSON / YAML based on the resolved `OutputMode`.
 
 The same shape holds for every command: **parse → resolve → do work in a library crate → render in the binary.** The library never decides output format; the binary never decides business logic.
+
+## The gateway process (v3.5)
+
+`onebrain gateway run` is a second long-lived process in the same binary ([ADR 0036](decisions/0036-remote-mcp-gateway-separate-process.md)). It is the only surface meant to be reachable from outside, and it lives entirely in `onebrain-cli` (`src/commands/gateway/`, see the [module map](reference/onebrain-cli.md#srccommandsgateway)).
+
+```
+ Claude app (phone)
+      │ HTTPS
+      ▼
+ Cloudflare edge ──▶ cloudflared (LaunchAgent, outbound-only tunnel)
+                          │ http://127.0.0.1:7717   (original Host forwarded)
+                          ▼
+ onebrain gateway run  (LaunchAgent, binds 127.0.0.1 only)
+   ├─ host_guard      Host / Origin / proxy-header checks on every route
+   ├─ /.well-known/*, /register, /authorize, /token     OAuth 2.1 server  (oauth_routes, auth/)
+   ├─ /mcp            bearer middleware ▶ rmcp streamable HTTP ▶ GatewayServer (Brain pack)
+   │                      └─ policy gate ▶ approval registry ▶ audit log
+   ├─ /approvals      loopback-only operator page
+   └─ approval channels: macOS dialog · /approvals · Telegram bot
+                          │ loopback HTTP
+                          ▼
+              per-vault warm daemon (unchanged, ADR 0033)  ·  vault files
+```
+
+Request path for a gated write such as `brain_capture`: `host_guard` → bearer check (scope covers the pack) → policy class and mode → if approval is needed, register a pending approval, open an SSE stream with keep-alives ([ADR 0039](decisions/0039-gateway-approval-keepalive-and-wait-clamp.md)) and prompt every configured channel → first answer wins → run the tool → append one audit line. Reads go through the same gate with mode `auto`. `brain_search` is always routed to the vault's daemon; the gateway never opens a search engine itself.
+
+**State.** Config is `~/.onebrain/gateway.yml` (machine-level, read once at startup). Runtime data lives under `~/.onebrain/gateway/`, directory `0700`, files `0600`:
+
+| Path | Contents |
+|---|---|
+| `clients.json`, `codes.json`, `tokens.json`, `pairing.json` | OAuth clients, pending authorization codes, access and refresh token records, the pairing code. |
+| `auth.lock` | Advisory lock held across every read-modify-write of the four files ([ADR 0041](decisions/0041-gateway-auth-store-lock-and-toctou-recheck.md)). |
+| `audit/YYYY-MM.jsonl` | Append-only audit log, one redacted JSON line per tool call. |
+| `tunnel.token` | The Cloudflare tunnel token, written by `gateway tunnel setup`. |
+| `telegram-<hash>.offset` | Telegram `getUpdates` cursor, keyed by a hash of the bot token. |
+
+On macOS, `gateway service install` also writes `~/Library/LaunchAgents/com.onebrain.gateway.plist` and `com.onebrain.gateway-tunnel.plist`, with logs in `~/Library/Logs/onebrain/` ([ADR 0042](decisions/0042-gateway-tunnel-and-launchagent-service.md)).
 
 ## Why `publish = false`
 
@@ -76,6 +118,7 @@ Figures are the v3.0.0 rewrite-milestone dogfood (against the v2.3.3 Bun CLI). T
 
 ## Where to go next
 
+- The gateway's setup, config and security model: [`gateway.md`](gateway.md).
 - The *why* behind specific choices: [`decisions/`](decisions/).
 - The Rust idioms these crates use: [`rust-patterns.md`](rust-patterns.md).
 - Crate-by-crate source map, plus the [`onebrain mcp` API reference](reference/mcp.md): [`reference/`](reference/).
