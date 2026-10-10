@@ -21,15 +21,29 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 
 use super::super::oauth_routes::AuthCtx;
+use super::store::display_id;
 
 /// Identity attached to `req.extensions_mut()` by [`require_bearer`] on a
 /// successful check — the only way a downstream handler learns who's
 /// calling (there's no session/cookie state in this design). Cheap to clone;
 /// carries no secret — the raw token itself never leaves the store lookup.
+///
+/// `family` and `token_id` exist for the approval path (#427): a call that
+/// waits for a human re-checks that its OWN credential was not revoked
+/// meanwhile (`server::credential_revoked`), and an `ask_once` grant is
+/// scoped to the token family (`policy::GrantKey`). Neither is serialized
+/// anywhere — not on `/approvals`, not in the audit log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
     pub client_id: String,
     pub scope: String,
+    /// The presented token's `family` (stable across refresh rotation, new
+    /// on every fresh consent). An internal correlation id, not a credential.
+    pub family: String,
+    /// `store::display_id` of the presented token: the same id
+    /// `tokens list` shows, so a revocation check can find this exact token
+    /// in `AuthStore::list_tokens` without the raw value leaving this layer.
+    pub token_id: String,
 }
 
 /// Axum middleware guarding the `/mcp` nest: requires a live, unrevoked,
@@ -71,8 +85,10 @@ pub async fn require_bearer(
     match checked {
         Ok(Some(record)) => {
             req.extensions_mut().insert(Principal {
+                token_id: display_id(&record.token),
                 client_id: record.client_id,
                 scope: record.scope,
+                family: record.family,
             });
             next.run(req).await
         }

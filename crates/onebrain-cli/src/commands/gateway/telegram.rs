@@ -85,7 +85,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -402,6 +402,41 @@ fn sweep_expired(sent: &mut HashMap<String, SentSlot>) {
     sent.retain(|_, s| s.expires() > now);
 }
 
+/// How often [`TelegramChannel::drain_edits`] re-checks without a
+/// notification.
+const DRAIN_RECHECK: Duration = Duration::from_millis(100);
+
+/// Telegram calls that still owe an approval prompt its final edit (#430):
+/// [`TelegramChannel::fire`]'s whole closure (the send, plus the deferred
+/// tombstone edit it may issue) and [`TelegramChannel::note_outcome`]'s
+/// spawned edit. Each holds one [`EditGuard`]; the last guard dropped wakes
+/// [`TelegramChannel::drain_edits`].
+#[derive(Default)]
+struct EditTracker {
+    in_flight: AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+/// One in-flight Telegram call counted by [`EditTracker`]. Decrements on
+/// drop — including a panic unwinding the `spawn_blocking` closure that
+/// owns it — so the count can never wedge above zero.
+struct EditGuard(Arc<EditTracker>);
+
+impl EditGuard {
+    fn new(tracker: &Arc<EditTracker>) -> Self {
+        tracker.in_flight.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(tracker))
+    }
+}
+
+impl Drop for EditGuard {
+    fn drop(&mut self) {
+        if self.0.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
 /// The Telegram approval channel (Gateway PR 5, Task 4): sends an approval
 /// prompt with inline Approve/Deny buttons ([`Self::fire`]) and edits it
 /// once the approval resolves, from WHATEVER channel resolved it
@@ -465,6 +500,9 @@ pub struct TelegramChannel {
     /// for why [`poll_loop`]'s persisted-offset file must be keyed by bot
     /// identity at all (Task 5 review, F9).
     token_key: String,
+    /// Sends and outcome edits still running — what
+    /// [`Self::drain_edits`] waits out at shutdown (#430).
+    edits: Arc<EditTracker>,
 }
 
 impl TelegramChannel {
@@ -482,7 +520,54 @@ impl TelegramChannel {
             sent: Arc::new(Mutex::new(HashMap::new())),
             polling: Arc::new(AtomicBool::new(false)),
             token_key: token_key(&cfg.bot_token),
+            edits: Arc::new(EditTracker::default()),
         }
+    }
+
+    /// Wait, at most `limit`, until no prompt still owes Telegram its
+    /// outcome edit (#430): no [`Self::fire`] or [`Self::note_outcome`]
+    /// call is in flight AND no unexpired [`SentSlot::Live`] prompt is left
+    /// unedited. `true` iff that state was reached in time.
+    ///
+    /// Called by `gateway run`'s shutdown after `Approvals::deny_all`, so
+    /// the "Gateway stopped" edits land before the runtime is torn down
+    /// (which would otherwise cut a slow `editMessageText` short and leave
+    /// the Allow/Deny buttons live). The `Live` half matters: `deny_all`
+    /// only WAKES each waiter, and a waiter may not have reached
+    /// `note_outcome` yet when this is first polled — its prompt is still a
+    /// `Live` entry then, with nothing in flight. `note_outcome` takes the
+    /// entry and counts its edit under the same `sent` lock, so this never
+    /// sees a gap between the two.
+    pub async fn drain_edits(&self, limit: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + limit;
+        loop {
+            let notified = self.edits.idle.notified();
+            tokio::pin!(notified);
+            // Register before checking, so a guard dropped between the
+            // check and the await still wakes this loop.
+            notified.as_mut().enable();
+            if self.edits_settled() {
+                return true;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            // Every in-flight call ends in a guard drop (a notification);
+            // the short re-check only catches a `Live` entry that expires
+            // with no call ever touching it again.
+            let _ = tokio::time::timeout_at(deadline.min(now + DRAIN_RECHECK), notified).await;
+        }
+    }
+
+    /// See [`Self::drain_edits`]. Reads both halves under the `sent` lock.
+    fn edits_settled(&self) -> bool {
+        let sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
+        let now = now_epoch_secs();
+        self.edits.in_flight.load(Ordering::SeqCst) == 0
+            && !sent
+                .values()
+                .any(|slot| matches!(slot, SentSlot::Live(s) if s.expires > now))
     }
 
     /// How many entries — live prompts AND [`SentSlot::Resolved`]
@@ -570,7 +655,11 @@ impl TelegramChannel {
         // headline; `text` adds the countdown for the live prompt only.
         let body = super::approval_view::telegram_body(pending);
         let text = super::approval_view::telegram_prompt(pending, now_epoch_secs());
+        // Counted from HERE, before the closure is even scheduled, so a
+        // shutdown drain can never observe this send as not-yet-started.
+        let guard = EditGuard::new(&self.edits);
         tokio::task::spawn_blocking(move || {
+            let _guard = guard;
             let approve_data = format!("a:{id}");
             let deny_data = format!("d:{id}");
             // Task 4 review, F3: Telegram hard-caps `callback_data` at 64
@@ -695,7 +784,10 @@ impl TelegramChannel {
         let live = {
             let mut sent = self.sent.lock().unwrap_or_else(|e| e.into_inner());
             match sent.remove(approval_id) {
-                Some(SentSlot::Live(s)) => Some(s),
+                // The edit is counted while `sent` is still locked: a
+                // shutdown drain sees either the `Live` entry or the count,
+                // never neither (see `drain_edits`).
+                Some(SentSlot::Live(s)) => Some((s, EditGuard::new(&self.edits))),
                 // A tombstone is already standing for this id — a repeat
                 // call. Put it back rather than dropping it: the in-flight
                 // `fire` it was left for has not returned yet, and it is
@@ -728,9 +820,12 @@ impl TelegramChannel {
                 }
             }
         };
-        let Some(Sent {
-            message_id, text, ..
-        }) = live
+        let Some((
+            Sent {
+                message_id, text, ..
+            },
+            guard,
+        )) = live
         else {
             return;
         };
@@ -739,6 +834,7 @@ impl TelegramChannel {
         let id = approval_id.to_string();
         let edited_text = format!("{outcome}\n\n{text}");
         tokio::task::spawn_blocking(move || {
+            let _guard = guard;
             if let Err(e) = api.edit_message_text(chat_id, message_id, &edited_text) {
                 tracing::warn!(
                     error = %e,
@@ -2054,6 +2150,93 @@ mod tests {
             2,
             "a second note_outcome for the same id must not edit again"
         );
+    }
+
+    /// #430: the shutdown drain waits for a SLOW outcome edit to actually
+    /// land, not merely to be started.
+    #[tokio::test]
+    async fn drain_edits_waits_for_a_slow_outcome_edit_to_land() {
+        let state = MockState::default();
+        state.set_response(
+            "sendMessage",
+            serde_json::json!({ "ok": true, "result": { "message_id": 78 } }),
+        );
+        state.set_delay("editMessageText", Duration::from_millis(600));
+        let server = MockServer::start(state.clone());
+        let _env = crate::test_env::set_var(TELEGRAM_API_BASE_ENV, server.base.as_str());
+
+        let channel = TelegramChannel::new(&configured());
+        channel.fire(&sample_pending("appr-drain-1"));
+        wait_for_requests(&state, 1).await;
+        channel.note_outcome(
+            "appr-drain-1",
+            "⏹ Gateway stopped · denied, nothing written",
+        );
+
+        assert!(channel.drain_edits(Duration::from_secs(5)).await);
+        assert!(
+            state.requests().iter().any(|(m, _)| m == "editMessageText"),
+            "drain_edits returned before the edit landed: {:?}",
+            state.requests()
+        );
+    }
+
+    /// #430: at shutdown `deny_all` only WAKES each waiter; one that has
+    /// not reached `note_outcome` yet leaves a live prompt and nothing in
+    /// flight. The drain must wait for that prompt's edit too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_edits_waits_for_a_prompt_whose_outcome_is_not_noted_yet() {
+        let state = MockState::default();
+        state.set_response(
+            "sendMessage",
+            serde_json::json!({ "ok": true, "result": { "message_id": 79 } }),
+        );
+        state.set_delay("editMessageText", Duration::from_millis(300));
+        let server = MockServer::start(state.clone());
+        let _env = crate::test_env::set_var(TELEGRAM_API_BASE_ENV, server.base.as_str());
+
+        let channel = Arc::new(TelegramChannel::new(&configured()));
+        channel.fire(&sample_pending("appr-drain-2"));
+        wait_for_requests(&state, 1).await;
+        let late = {
+            let channel = channel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                channel.note_outcome(
+                    "appr-drain-2",
+                    "⏹ Gateway stopped · denied, nothing written",
+                );
+            })
+        };
+
+        assert!(channel.drain_edits(Duration::from_secs(5)).await);
+        assert!(
+            state.requests().iter().any(|(m, _)| m == "editMessageText"),
+            "drain_edits returned before the late edit landed: {:?}",
+            state.requests()
+        );
+        late.await.unwrap();
+    }
+
+    /// The drain is bounded: a prompt nobody ever edits makes it give up at
+    /// `limit` and report `false`, never hang the shutdown.
+    #[tokio::test]
+    async fn drain_edits_gives_up_at_its_limit() {
+        let state = MockState::default();
+        state.set_response(
+            "sendMessage",
+            serde_json::json!({ "ok": true, "result": { "message_id": 80 } }),
+        );
+        let server = MockServer::start(state.clone());
+        let _env = crate::test_env::set_var(TELEGRAM_API_BASE_ENV, server.base.as_str());
+
+        let channel = TelegramChannel::new(&configured());
+        channel.fire(&sample_pending("appr-drain-3"));
+        wait_for_requests(&state, 1).await;
+
+        let started = Instant::now();
+        assert!(!channel.drain_edits(Duration::from_millis(300)).await);
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     /// The map's whole bound, over BOTH slot shapes (Task 4 review, F1;

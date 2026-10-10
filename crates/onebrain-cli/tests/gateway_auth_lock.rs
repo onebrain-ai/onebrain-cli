@@ -62,6 +62,17 @@ fn plant_valid_access_token(home: &Path, token: &str) {
         ".onebrain/gateway/tokens.json",
         &serde_json::to_string_pretty(&serde_json::Value::Object(tokens)).unwrap(),
     );
+    // The token's client is registered too, as for every real token: a call
+    // waiting for approval treats an unregistered client as removed (#427).
+    let client = serde_json::json!({ "auth-lock-e2e": {
+        "client_id": "auth-lock-e2e", "client_name": null, "redirect_uris": [],
+        "application_type": "native", "created": now,
+    }});
+    write(
+        home,
+        ".onebrain/gateway/clients.json",
+        &serde_json::to_string_pretty(&client).unwrap(),
+    );
 }
 
 fn wait_for_gateway_url(child: &mut std::process::Child, stdout: &Path) -> String {

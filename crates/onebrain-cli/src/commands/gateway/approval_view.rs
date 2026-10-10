@@ -248,6 +248,12 @@ pub fn telegram_outcome(
                 (ResolvedVia::Disconnect, _) => {
                     "\u{26d4} Denied \u{b7} the app disconnected, nothing written".to_string()
                 }
+                (ResolvedVia::Revoked, _) => {
+                    "\u{26d4} Access was revoked \u{b7} nothing was written".to_string()
+                }
+                (ResolvedVia::Unverified, _) => {
+                    "\u{26d4} Could not verify access \u{b7} nothing was written".to_string()
+                }
                 (ResolvedVia::Telegram, true) => format!(
                     "\u{2705} Allowed \u{b7} {}{}",
                     allowed_detail(p),
@@ -510,6 +516,14 @@ mod tests {
         assert_eq!(
             o(Outcome::Decided(Deny, ResolvedVia::Disconnect)),
             "\u{26d4} Denied \u{b7} the app disconnected, nothing written"
+        );
+        assert_eq!(
+            o(Outcome::Decided(Deny, ResolvedVia::Revoked)),
+            "\u{26d4} Access was revoked \u{b7} nothing was written"
+        );
+        assert_eq!(
+            o(Outcome::Decided(Deny, ResolvedVia::Unverified)),
+            "\u{26d4} Could not verify access \u{b7} nothing was written"
         );
     }
 

@@ -142,21 +142,16 @@ pub struct PendingApproval {
     pub client_id: String,
     pub tool: String,
     /// The vault the call named (its own `vault` argument), or `None` for
-    /// the default resolution chain — carried so that resolving this
-    /// approval records the SAME [`super::policy::GrantKey`] the waiter
-    /// would (`approval_routes::resolve_approval` and
-    /// `server::await_approval` must not disagree about a grant's scope).
-    /// Not a secret: it is a `gateway.yml` vault NAME, never a host path,
+    /// the default resolution chain — the scope the operator is asked to
+    /// approve (the waiter's [`super::policy::GrantKey`] uses the same
+    /// value). Not a secret: it is a `gateway.yml` vault NAME, never a host path,
     /// and the operator is already shown it inside `summary`.
     pub vault: Option<String>,
     pub summary: String,
     pub created: u64,
     pub expires: u64,
-    /// The [`RiskClass`] this call was gated at — recorded so a
-    /// `Decision::Approve` resolution knows which `(client, class)` grant to
-    /// record via [`super::policy::Grants::record`] (Task 2 review's binding
-    /// requirement A — see `approval_routes::resolve_approval`'s doc
-    /// comment for the actual wiring). Not a secret: an operator reviewing
+    /// The [`RiskClass`] this call was gated at (the waiter records the
+    /// matching grant on an Allow — `server::await_approval`). Not a secret: an operator reviewing
     /// the pending list benefits from seeing exactly what class of access is
     /// being asked for, same as `tool`/`summary`.
     pub class: RiskClass,
@@ -276,8 +271,9 @@ pub fn client_id_short(id: &str) -> String {
 /// DIFFERENT type from `audit::Decision` (`Auto`/`Approved`/`Denied`/
 /// `TimedOut`, an OUTCOME record) even though the names echo each
 /// other: this is the human's raw INPUT (`Approve`/`Deny`), which
-/// `approval_routes::resolve_approval` translates into effects (waking the
-/// waiter, and on `Approve`, recording a [`super::policy::Grants`] entry).
+/// every channel hands to [`Approvals::resolve`] to wake the waiter, which
+/// alone turns an `Approve` into effects (the write, and a
+/// [`super::policy::Grants`] entry) after its revocation check.
 /// Always qualify as `approval::Decision` at any use site that also sees
 /// `audit::Decision`, so the two can't be confused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -319,11 +315,22 @@ pub enum ResolvedVia {
     /// The client went away while its call waited (`server::await_approval`
     /// saw the request's cancellation token fire) — smoke V F2.
     Disconnect,
+    /// The waiting call's own credential was revoked while it waited
+    /// (`tokens revoke`, `tokens revoke --client`, `clients remove`) — the
+    /// waiter's periodic or Allow-time check in `server::await_approval`
+    /// (#427). Always a denial.
+    Revoked,
+    /// A human allowed the call, but the gateway could not read its auth
+    /// store to confirm the call's credential was still live, so the Allow
+    /// failed closed (`server::await_approval`'s Allow-time check). Always a
+    /// denial.
+    Unverified,
 }
 
 impl ResolvedVia {
     /// The exact lowercase string `audit::AuditEntry::channel` records —
-    /// `"http"`, `"native"`, `"telegram"`, `"shutdown"`, or `"disconnect"`.
+    /// `"http"`, `"native"`, `"telegram"`, `"shutdown"`, `"disconnect"`,
+    /// `"revoked"`, or `"unverified"`.
     pub fn as_str(self) -> &'static str {
         match self {
             ResolvedVia::Http => "http",
@@ -331,6 +338,8 @@ impl ResolvedVia {
             ResolvedVia::Telegram => "telegram",
             ResolvedVia::Shutdown => "shutdown",
             ResolvedVia::Disconnect => "disconnect",
+            ResolvedVia::Revoked => "revoked",
+            ResolvedVia::Unverified => "unverified",
         }
     }
 }
@@ -762,6 +771,8 @@ mod tests {
             ResolvedVia::Native,
             ResolvedVia::Telegram,
             ResolvedVia::Shutdown,
+            ResolvedVia::Revoked,
+            ResolvedVia::Unverified,
         ] {
             let approvals = Approvals::new();
             let rx = approvals.register(sample("a1")).unwrap();
@@ -782,6 +793,8 @@ mod tests {
         assert_eq!(ResolvedVia::Telegram.as_str(), "telegram");
         assert_eq!(ResolvedVia::Shutdown.as_str(), "shutdown");
         assert_eq!(ResolvedVia::Disconnect.as_str(), "disconnect");
+        assert_eq!(ResolvedVia::Revoked.as_str(), "revoked");
+        assert_eq!(ResolvedVia::Unverified.as_str(), "unverified");
     }
 
     // ── timeout path: TimedOut + entry dropped from pending ─────────────

@@ -47,7 +47,6 @@ use serde::{Deserialize, Serialize};
 use super::approval::{self, PendingApproval};
 use super::approval_view;
 use super::oauth_routes::{AuthCtx, PairingCheck};
-use super::policy::{GrantKey, PolicyMode};
 use super::server::GatewayState;
 
 /// The operator credential header this whole surface is gated on — see the
@@ -162,41 +161,19 @@ struct ResolveResponse {
 
 /// `POST /approvals/{id}`: resolve one pending approval.
 ///
-/// On a `Decision::Approve` that actually resolved something, this is also
-/// the gateway's first PRODUCTION caller of
-/// [`super::policy::Grants::record`] (Task 2 review, binding requirement A)
-/// — using a config-derived TTL (`PolicyConfig::grant_ttl_minutes * 60`),
-/// not a test's hardcoded value. Approving one call grants the SAME
-/// `(client, vault, class)` triple every subsequent `ask_once` call until
-/// that grant expires — that is the entire point of `ask_once` vs.
-/// `ask_always` (see `policy.rs`'s decision table doc comment). A
-/// `Decision::Deny` records nothing: denial is never "ask less often next
-/// time."
-///
-/// **Nothing is recorded under `ask_always` either**, whichever channel the
-/// approval arrived through. `decide` already ignores grants in that mode,
-/// so today this only avoids writing an entry nothing reads — but "always
-/// ask" must never be capable of producing standing consent, and leaving a
-/// live grant in the map for a mode whose whole meaning is "ask every time"
-/// is a trap for the next refactor of `decide`. `server::await_approval`
-/// applies the identical guard on the waiter side.
-///
-/// The pending entry's `client_id`/`vault`/`class` are snapshotted from
-/// [`super::approval::Approvals::list`] BEFORE calling
-/// [`super::approval::Approvals::resolve`], because `resolve` REMOVES the
-/// entry as part of its own first-responder-wins contract (see that
-/// method's doc comment) — this is the last point that information is still
-/// available. If a concurrent resolve or a timeout wins the race instead,
-/// `resolve` below simply returns `false` and nothing is recorded: never a
-/// grant for a call that was actually denied, timed out, or already handled
-/// by someone else.
+/// Records NO grant, on purpose (#427). An `ask_once` grant is recorded in
+/// exactly one place for every channel — HTTP, native dialog, Telegram —
+/// `server::await_approval`'s Allow path, AFTER its Allow-time revocation
+/// check passes. Recording here, at click time, would leave standing
+/// consent behind for a call whose credential was revoked while it waited:
+/// the call is denied, but after a single-token `tokens revoke <id>` the
+/// family lives on through a refresh, and that grant would auto-allow the
+/// client's next call.
 async fn resolve_approval(
     State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     Json(body): Json<ResolveRequest>,
 ) -> Response {
-    let snapshot = state.approvals.list().into_iter().find(|p| p.id == id);
-
     // This IS the operator HTTP surface — see the module docs' "Design
     // decision" section — so every resolution through here is, by
     // definition, `ResolvedVia::Http`. `server::record_audit` reads this
@@ -216,24 +193,14 @@ async fn resolve_approval(
             .into_response();
     }
 
-    if body.decision == approval::Decision::Approve {
-        if let Some(p) = snapshot {
-            if state.config.policy.mode_for(p.class) != PolicyMode::AskAlways {
-                let ttl_secs = state.config.policy.grant_ttl_minutes.saturating_mul(60);
-                state
-                    .grants
-                    .record(GrantKey::new(p.client_id, p.vault, p.class), ttl_secs);
-            }
-        }
-    }
-
     (StatusCode::OK, Json(ResolveResponse { id, resolved: true })).into_response()
 }
 
 /// Build the `/approvals` router: `GET /approvals` + `POST /approvals/{id}`,
 /// both gated by [`require_pairing_header`]. `state` gives the handlers
-/// access to [`super::approval::Approvals`] (`state.approvals`) and
-/// [`super::policy::Grants`] (`state.grants`); `auth_ctx` is the pairing
+/// access to [`super::approval::Approvals`] (`state.approvals`) — they
+/// never touch [`super::policy::Grants`]; only `server::await_approval`
+/// records a grant. `auth_ctx` is the pairing
 /// gate's own state, applied as a `.layer` — see `require_bearer`'s
 /// identical `from_fn_with_state` shape in `auth/middleware.rs` for the
 /// precedent this mirrors (a middleware-level state, independent of the
@@ -658,98 +625,26 @@ mod tests {
         );
     }
 
-    // ── Requirement A: approving wires a real, config-derived-TTL grant ──
+    // ── #427: the route never records a grant itself ─────────────────────
 
+    /// The waiter (`server::await_approval`) is the ONLY place a grant is
+    /// recorded, after its Allow-time revocation check; the HTTP route must
+    /// not record one at click time. With no waiter in this fixture, an
+    /// Approve over HTTP must leave the grant map empty.
     #[tokio::test]
-    async fn approving_records_a_grant_using_the_config_derived_ttl() {
+    async fn approving_over_http_records_no_grant_itself() {
         let (_dir, router, state, code) = fixture();
         let mut pending = sample_pending("a1");
         pending.client_id = "client-x".to_string();
         pending.class = RiskClass::Mutating;
         let _rx = state.approvals.register(pending).unwrap();
 
-        let key = GrantKey::new("client-x", Some("t1".to_string()), RiskClass::Mutating);
-        assert!(!state.grants.has(&key), "no grant before approval");
-
         let resp = post_resolve(&router, "a1", Some(&code), "approve").await;
         assert_eq!(resp.status(), StatusCode::OK);
-
-        assert!(
-            state.grants.has(&key),
-            "approving must record a grant for the SAME (client, vault, class) triple"
-        );
-    }
-
-    /// "Always ask" must never produce standing consent. `decide` already
-    /// ignores grants under `ask_always`, so this is defence in depth — but
-    /// a live grant sitting in the map for that mode is exactly the trap a
-    /// later refactor of `decide` would fall into. The default config has
-    /// `destructive: ask_always`, so a `Destructive` pending entry exercises
-    /// it without a custom config.
-    #[tokio::test]
-    async fn approving_under_ask_always_records_no_grant() {
-        let (_dir, router, state, code) = fixture();
         assert_eq!(
-            state.config.policy.mode_for(RiskClass::Destructive),
-            PolicyMode::AskAlways,
-            "fixture precondition: the default config must make Destructive ask_always"
-        );
-        let mut pending = sample_pending("a1");
-        pending.client_id = "client-z".to_string();
-        pending.class = RiskClass::Destructive;
-        let _rx = state.approvals.register(pending).unwrap();
-
-        let resp = post_resolve(&router, "a1", Some(&code), "approve").await;
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        assert!(
-            !state.grants.has(&GrantKey::new(
-                "client-z",
-                Some("t1".to_string()),
-                RiskClass::Destructive
-            )),
-            "an approval under ask_always must never leave standing consent behind"
-        );
-    }
-
-    /// The DENY condition, isolated.
-    ///
-    /// This deliberately uses `Mutating`, which the default config maps to
-    /// `ask_once` — a class where an APPROVE would record a grant (proven
-    /// directly above by
-    /// `approving_records_a_grant_using_the_config_derived_ttl`, which uses
-    /// the same class and the same fixture). An earlier revision used
-    /// `Destructive`, which the default config maps to `ask_always`: the
-    /// inner "never record under ask_always" guard then suppressed the grant
-    /// on its own, so the test passed identically with the decision check
-    /// deleted and proved nothing about denial. With `Mutating`, the
-    /// `decision == Approve` condition is the ONLY thing left that can keep
-    /// this grant out of the map — verified by deleting that condition and
-    /// watching this test, and only this test, fail.
-    #[tokio::test]
-    async fn denying_does_not_record_a_grant() {
-        let (_dir, router, state, code) = fixture();
-        assert_eq!(
-            state.config.policy.mode_for(RiskClass::Mutating),
-            PolicyMode::AskOnce,
-            "fixture precondition: the class under test must NOT be ask_always, or the \
-             ask_always guard would suppress the grant regardless of the decision"
-        );
-        let mut pending = sample_pending("a1");
-        pending.client_id = "client-y".to_string();
-        pending.class = RiskClass::Mutating;
-        let _rx = state.approvals.register(pending).unwrap();
-
-        let resp = post_resolve(&router, "a1", Some(&code), "deny").await;
-        assert_eq!(resp.status(), StatusCode::OK);
-
-        assert!(
-            !state.grants.has(&GrantKey::new(
-                "client-y",
-                Some("t1".to_string()),
-                RiskClass::Mutating
-            )),
-            "denying must never record a grant"
+            state.grants.len(),
+            0,
+            "only the waiter, after its revocation check, may record a grant"
         );
     }
 }

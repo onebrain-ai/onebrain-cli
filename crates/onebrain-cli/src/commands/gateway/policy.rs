@@ -32,10 +32,15 @@
 //! correctly the day a `files` pack ships — no change needed to the
 //! membership test itself, only to what gets passed in as `pack`.
 //!
-//! ## Grant scope: `(client, vault, risk class)` — and deliberately NOT the tool
+//! ## Grant scope: `(client, token family, vault, risk class)` — and deliberately NOT the tool
 //!
-//! A grant is keyed by the calling client, the VAULT the call names, and the
-//! call's [`RiskClass`] ([`GrantKey`]). The vault belongs in the key because
+//! A grant is keyed by the calling client, the token FAMILY it presented,
+//! the VAULT the call names, and the call's [`RiskClass`] ([`GrantKey`]).
+//! The family is in the key so a grant dies with the consent it came from
+//! (#427): `tokens revoke --client` / `clients remove` revoke every token,
+//! and a client that consents again gets a fresh family, so a grant
+//! recorded before the revoke can never apply to it. A family is stable
+//! across refresh rotation, so ordinary token refreshes keep the grant. The vault belongs in the key because
 //! the gateway is explicitly multi-vault and the consent a human gives is
 //! always shown to them WITH a vault (`args_summary` and the native dialog
 //! both render `vault=…`): approving one `brain_capture` into `ob-1` must not
@@ -304,14 +309,23 @@ impl PolicyConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GrantKey {
     client_id: String,
+    /// The token family the approved call presented
+    /// ([`Principal::family`]) — see the module doc's "Grant scope".
+    family: String,
     vault: Option<String>,
     class: RiskClass,
 }
 
 impl GrantKey {
-    pub fn new(client_id: impl Into<String>, vault: Option<String>, class: RiskClass) -> Self {
+    pub fn new(
+        client_id: impl Into<String>,
+        family: impl Into<String>,
+        vault: Option<String>,
+        class: RiskClass,
+    ) -> Self {
         Self {
             client_id: client_id.into(),
+            family: family.into(),
             vault,
             class,
         }
@@ -353,14 +367,20 @@ impl Grants {
             .is_some_and(|&expires| expires > now_epoch_secs())
     }
 
+    /// How many grants are recorded (live or expired) — for tests that
+    /// must prove a path recorded NOTHING, whatever the key.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
     /// Record (or replace) a grant for `key`, expiring `ttl_secs` from now.
     ///
-    /// First given a real production caller by Gateway PR 4, Task 3:
-    /// `approval_routes::resolve_approval` calls this on every
-    /// `approval::Decision::Approve` resolution, using a config-derived TTL
-    /// (`PolicyConfig::grant_ttl_minutes * 60`) rather than a test's
-    /// hardcoded value — see that function's doc comment. `decide` only
-    /// ever READS grants via [`Self::has`]; this is the only writer.
+    /// The one production caller is `server::await_approval`'s Allow path,
+    /// after its Allow-time revocation check (#427) — for every approval
+    /// channel; no channel records its own. It uses a config-derived TTL
+    /// (`PolicyConfig::grant_ttl_minutes * 60`). `decide` only ever READS
+    /// grants via [`Self::has`]; this is the only writer.
     ///
     /// Uses `saturating_add`, not a bare `+` (Task 2 review, binding
     /// requirement A) — now that a production caller can pass an
@@ -421,6 +441,7 @@ pub fn decide(
         PolicyMode::AskOnce => {
             let key = GrantKey::new(
                 principal.client_id.clone(),
+                principal.family.clone(),
                 vault.map(str::to_string),
                 class,
             );
@@ -449,6 +470,8 @@ mod tests {
         Principal {
             client_id: "client-1".to_string(),
             scope: scope.to_string(),
+            family: "fam-1".to_string(),
+            token_id: "0123456789ab".to_string(),
         }
     }
 
@@ -572,7 +595,10 @@ mod tests {
             PolicyOutcome::Allow,
             "auto must allow with no grant"
         );
-        grants.record(GrantKey::new("client-1", None, RiskClass::ReadOnly), 3600);
+        grants.record(
+            GrantKey::new("client-1", "fam-1", None, RiskClass::ReadOnly),
+            3600,
+        );
         assert_eq!(
             decide(&cfg, &grants, &p, RiskClass::ReadOnly, None),
             PolicyOutcome::Allow,
@@ -596,7 +622,10 @@ mod tests {
         let cfg = cfg_with(PolicyMode::Deny, PolicyMode::AskOnce, PolicyMode::Deny);
         let grants = Grants::new();
         let p = principal("brain");
-        grants.record(GrantKey::new("client-1", None, RiskClass::Mutating), 3600);
+        grants.record(
+            GrantKey::new("client-1", "fam-1", None, RiskClass::Mutating),
+            3600,
+        );
         assert_eq!(
             decide(&cfg, &grants, &p, RiskClass::Mutating, None),
             PolicyOutcome::Allow
@@ -614,7 +643,10 @@ mod tests {
         // "expires now", and `has` requires `expires > now`, which is false
         // the instant it's recorded. That IS an expired grant for `has`'s
         // purposes, so ttl_secs: 0 is the direct way to construct one here.
-        grants.record(GrantKey::new("client-1", None, RiskClass::Mutating), 0);
+        grants.record(
+            GrantKey::new("client-1", "fam-1", None, RiskClass::Mutating),
+            0,
+        );
         assert_eq!(
             decide(&cfg, &grants, &p, RiskClass::Mutating, None),
             PolicyOutcome::NeedApproval,
@@ -628,7 +660,7 @@ mod tests {
         let grants = Grants::new();
         let p = principal("brain");
         grants.record(
-            GrantKey::new("client-1", None, RiskClass::Destructive),
+            GrantKey::new("client-1", "fam-1", None, RiskClass::Destructive),
             3600,
         );
         assert_eq!(
@@ -648,7 +680,10 @@ mod tests {
             PolicyOutcome::Deny
         );
         // Even with a grant present (grants are irrelevant to `deny`).
-        grants.record(GrantKey::new("client-1", None, RiskClass::ReadOnly), 3600);
+        grants.record(
+            GrantKey::new("client-1", "fam-1", None, RiskClass::ReadOnly),
+            3600,
+        );
         assert_eq!(
             decide(&cfg, &grants, &p, RiskClass::ReadOnly, None),
             PolicyOutcome::Deny
@@ -695,29 +730,82 @@ mod tests {
     #[test]
     fn grants_has_is_false_for_an_unrecorded_key() {
         let grants = Grants::new();
-        assert!(!grants.has(&GrantKey::new("nobody", None, RiskClass::ReadOnly)));
+        assert!(!grants.has(&GrantKey::new("nobody", "fam-1", None, RiskClass::ReadOnly)));
     }
 
     #[test]
     fn grants_are_scoped_by_client_vault_and_risk_class() {
         let grants = Grants::new();
-        grants.record(GrantKey::new("client-a", None, RiskClass::Mutating), 3600);
-        assert!(grants.has(&GrantKey::new("client-a", None, RiskClass::Mutating)));
+        grants.record(
+            GrantKey::new("client-a", "fam-1", None, RiskClass::Mutating),
+            3600,
+        );
+        assert!(grants.has(&GrantKey::new(
+            "client-a",
+            "fam-1",
+            None,
+            RiskClass::Mutating
+        )));
         assert!(
-            !grants.has(&GrantKey::new("client-b", None, RiskClass::Mutating)),
+            !grants.has(&GrantKey::new(
+                "client-b",
+                "fam-1",
+                None,
+                RiskClass::Mutating
+            )),
             "a grant must not leak to a different client"
         );
         assert!(
-            !grants.has(&GrantKey::new("client-a", None, RiskClass::Destructive)),
+            !grants.has(&GrantKey::new(
+                "client-a",
+                "fam-1",
+                None,
+                RiskClass::Destructive
+            )),
             "a grant must not leak to a different risk class for the same client"
         );
         assert!(
             !grants.has(&GrantKey::new(
                 "client-a",
+                "fam-1",
                 Some("ob-2".to_string()),
                 RiskClass::Mutating
             )),
             "a grant for the default vault must not leak to a NAMED vault"
+        );
+    }
+
+    /// #427: a grant belongs to the consent it came from. After
+    /// `tokens revoke --client` the same client consents again and gets a
+    /// NEW token family; the old family's grant must not satisfy `ask_once`
+    /// for it. Asserted through `decide`, which every tool handler consults.
+    #[test]
+    fn a_grant_for_one_token_family_does_not_satisfy_ask_once_for_another() {
+        let cfg = cfg_with(PolicyMode::Deny, PolicyMode::AskOnce, PolicyMode::Deny);
+        let grants = Grants::new();
+        grants.record(
+            GrantKey::new("client-1", "fam-1", None, RiskClass::Mutating),
+            3600,
+        );
+        assert_eq!(
+            decide(
+                &cfg,
+                &grants,
+                &principal("brain"),
+                RiskClass::Mutating,
+                None
+            ),
+            PolicyOutcome::Allow,
+            "the family the grant was recorded for is allowed"
+        );
+        let reconsented = Principal {
+            family: "fam-2".to_string(),
+            ..principal("brain")
+        };
+        assert_eq!(
+            decide(&cfg, &grants, &reconsented, RiskClass::Mutating, None),
+            PolicyOutcome::NeedApproval,
+            "a new family (a fresh consent) must be asked again"
         );
     }
 
@@ -733,7 +821,12 @@ mod tests {
         let p = principal("brain");
 
         grants.record(
-            GrantKey::new("client-1", Some("vault-a".to_string()), RiskClass::Mutating),
+            GrantKey::new(
+                "client-1",
+                "fam-1",
+                Some("vault-a".to_string()),
+                RiskClass::Mutating,
+            ),
             3600,
         );
         assert_eq!(
@@ -782,7 +875,7 @@ mod tests {
     #[test]
     fn recording_a_grant_again_replaces_its_expiry() {
         let grants = Grants::new();
-        let key = GrantKey::new("client-a", None, RiskClass::Mutating);
+        let key = GrantKey::new("client-a", "fam-1", None, RiskClass::Mutating);
         grants.record(key.clone(), 0); // expires immediately
         assert!(!grants.has(&key));
         grants.record(key.clone(), 3600); // re-grant, now live
@@ -793,14 +886,14 @@ mod tests {
     /// (a bare `+`) would panic in a debug build the moment a caller passes
     /// a `ttl_secs` anywhere near `u64::MAX` — exactly the kind of value a
     /// pathological (or merely very large) `grant_ttl_minutes` config could
-    /// produce once a real caller (Gateway PR 4, Task 3's
-    /// `approval_routes::resolve_approval`) exists. `saturating_add` must
+    /// produce once a real caller (`server::await_approval`'s Allow path)
+    /// exists. `saturating_add` must
     /// instead clamp to `u64::MAX` — "never expires" — and the grant must
     /// still read as live.
     #[test]
     fn record_with_a_massive_ttl_saturates_instead_of_overflowing() {
         let grants = Grants::new();
-        let key = GrantKey::new("client-1", None, RiskClass::Mutating);
+        let key = GrantKey::new("client-1", "fam-1", None, RiskClass::Mutating);
         grants.record(key.clone(), u64::MAX);
         assert!(
             grants.has(&key),
