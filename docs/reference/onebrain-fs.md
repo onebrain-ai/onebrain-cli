@@ -46,7 +46,7 @@ src/
 │   ├── backlinks.rs      backlinks — incoming [[wikilink]] scan (+ --include-archive)
 │   ├── orphans.rs        orphans — notes with zero incoming wikilinks (exclusion set)
 │   ├── append.rs         append_note — section-aware append (atomic tmp+rename)
-│   ├── new.rs            new_note — --template + inline --frontmatter (atomic write)
+│   ├── new.rs            new_note / new_note_titled — --template + inline --frontmatter (atomic write); _titled takes an explicit H1 (brain_capture)
 │   ├── archive.rs        archive_note — move to <root>/YYYY/MM/ (date-injectable)
 │   └── move.rs           move_note — transactional vault-wide wikilink rewrite + rollback
 ├── register_hooks/       harness hook wiring
