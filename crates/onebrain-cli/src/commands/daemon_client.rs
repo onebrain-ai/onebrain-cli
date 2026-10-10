@@ -1588,10 +1588,14 @@ mod tests {
     }
 
     /// #426: the gateway logs this error's chain on a `brain_search` 503, so it
-    /// must name the live holder of the daemon's vault index — here, this test
-    /// process holding the engine.
+    /// must name the live holder of the daemon's vault index — here a live
+    /// other process recorded as a daemon (this test process just holds the
+    /// lock for it). A daemon holder's hint names THIS vault's stop command.
     #[test]
     fn daemon_engine_busy_names_the_vault_index_holder() {
+        use crate::commands::search_lock_holder::test_support::{
+            holder, write_sidecar, OtherProcess,
+        };
         let vault = tempdir().unwrap();
         let cache = tempdir().unwrap();
         let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
@@ -1603,14 +1607,19 @@ mod tests {
         let cache_dir = crate::commands::search_common::collection_cache_dir("dc-busy-holder");
         let _held =
             onebrain_search::engine::Engine::open(&cache_dir, "multilingual-e5-small").unwrap();
+        let other = OtherProcess::spawn();
+        write_sidecar(&cache_dir, &holder(other.pid(), "daemon", "0.0.1"));
 
-        let vault_id = canonical_vault_id(vault.path());
-        let err = daemon_engine_busy(vault_id.as_deref());
+        let vault_id = canonical_vault_id(vault.path()).unwrap();
+        let err = daemon_engine_busy(Some(&vault_id));
         assert!(onebrain_search::error::is_engine_busy(&err), "{err:#}");
         let msg = format!("{err:#}");
-        assert!(msg.starts_with("daemon holds no engine — "), "{msg}");
         assert!(
-            msg.contains(&format!("(pid {})", std::process::id())),
+            msg.starts_with(&format!(
+                "daemon holds no engine — the search index is in use by onebrain daemon 0.0.1 \
+                 (pid {}) — from before an upgrade, stop it with `onebrain daemon stop --vault ",
+                other.pid()
+            )),
             "{msg}"
         );
     }

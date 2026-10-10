@@ -338,13 +338,17 @@ pub(crate) fn status_data(
 
     // #426: name the lock holder (read from its sidecar in the cache dir) — the
     // same collection whether the busy signal came direct or via the daemon.
-    let busy_holder = if busy {
-        cache_dir
-            .as_deref()
-            .map(crate::commands::search_lock_holder::busy_message)
-    } else {
-        None
-    };
+    let busy_holder = busy.then(|| {
+        cache_dir.as_deref().map_or_else(
+            || crate::commands::search_lock_holder::GENERIC_BUSY.to_string(),
+            |dir| {
+                crate::commands::search_lock_holder::busy_message(
+                    dir,
+                    Some(resolved.root.as_path()),
+                )
+            },
+        )
+    });
 
     let current_model_missing =
         cfg!(feature = "semantic") && collection.is_some() && model_size_bytes.is_none();
@@ -960,23 +964,18 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
         );
     } else if d.busy {
         lines.push(String::new());
-        match &d.busy_holder {
-            // #426: "The search index is in use by onebrain mcp 3.4.25 (pid N) — …"
-            Some(holder) => {
-                let mut chars = holder.chars();
-                let first = chars.next().map(|c| c.to_uppercase().collect::<String>());
-                lines.push(format!(
-                    "💡  {}{}",
-                    first.unwrap_or_default(),
-                    chars.as_str()
-                ));
-            }
-            None => lines.push(
-                "💡  Index is locked by another process (e.g. the `onebrain mcp` server) — \
-                 retry `onebrain search status` once it exits"
-                    .to_string(),
-            ),
-        }
+        // #426: "The search index is in use by onebrain mcp 3.4.25 (pid N) — …"
+        let holder = d
+            .busy_holder
+            .as_deref()
+            .unwrap_or(crate::commands::search_lock_holder::GENERIC_BUSY);
+        let mut chars = holder.chars();
+        let first = chars.next().map(|c| c.to_uppercase().collect::<String>());
+        lines.push(format!(
+            "💡  {}{}",
+            first.unwrap_or_default(),
+            chars.as_str()
+        ));
     } else if d.current_model_missing && d.reindexing.is_none() {
         lines.push(String::new());
         lines.push(
@@ -1539,9 +1538,10 @@ mod tests {
             "busy must never read up to date: {s}"
         );
         assert!(s.contains("    Docs          unknown"), "{s}");
-        // The hint points at retry, not reindex.
+        // The hint names the holder (here: unknown → the generic sentence),
+        // not reindex.
         assert!(
-            s.contains("💡") && s.contains("locked by another process"),
+            s.contains("💡  The search index is in use by another onebrain process"),
             "{s}"
         );
         assert!(

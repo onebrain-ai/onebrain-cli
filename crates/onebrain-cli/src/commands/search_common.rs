@@ -429,7 +429,7 @@ pub(crate) fn map_engine_open_error(err: anyhow::Error, cache_dir: &Path) -> any
         // #426: name the holder when its sidecar says who it is.
         return anyhow::Error::new(onebrain_core::CoreError::EngineBusy(format!(
             "{} (index at {})",
-            crate::commands::search_lock_holder::busy_message(cache_dir),
+            crate::commands::search_lock_holder::busy_message(cache_dir, None),
             cache_dir.display()
         )));
     }

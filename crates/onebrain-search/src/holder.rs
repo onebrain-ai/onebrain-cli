@@ -118,8 +118,13 @@ pub(crate) struct HolderGuard {
 impl HolderGuard {
     /// Record this process as the holder at `path`. Best-effort: a failed write
     /// costs only the holder's name in a loser's busy message, never the open.
+    /// But it must not leave an OLDER record standing — we hold the lock now,
+    /// so any existing record is stale, and a live pid in it (recycled, or a
+    /// process that merely outlived its lock) would be misnamed as the holder.
     pub(crate) fn record(path: PathBuf) -> Self {
-        let _ = write_at(&path, &HolderInfo::current());
+        if write_at(&path, &HolderInfo::current()).is_err() {
+            let _ = std::fs::remove_file(&path);
+        }
         HolderGuard { path }
     }
 }
@@ -193,6 +198,24 @@ mod tests {
 
         let _engine = Engine::open(dir.path(), "multilingual-e5-small").unwrap();
         assert_eq!(read_holder(dir.path()).unwrap().pid, std::process::id());
+    }
+
+    /// #426: when our own record can't be written, a stale record from an
+    /// earlier holder must not survive under us. The write is made to fail by
+    /// occupying its temp path with a directory.
+    #[test]
+    fn failed_write_removes_a_stale_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = CollectionLayout::new(dir.path()).holder_path();
+        write_at(&path, &other_holder()).unwrap();
+        std::fs::create_dir(path.with_extension(format!("holder.{}.tmp", std::process::id())))
+            .unwrap();
+
+        let _engine = Engine::open(dir.path(), "multilingual-e5-small").unwrap();
+        assert!(
+            read_holder(dir.path()).is_none(),
+            "a stale holder record survived under a live new holder"
+        );
     }
 
     /// The loser of the lock race must not touch the winner's sidecar.
