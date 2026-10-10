@@ -1,6 +1,6 @@
 ---
-latest_version: 3.4.25
-released: 2026-08-28
+latest_version: 3.5.0
+released: 2026-10-10
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -10,191 +10,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
 
-## [3.5.0] — Unreleased — Gateway
+## [3.5.0] — 2026-10-10 — Gateway
 
-### Added
-- `onebrain gateway run` — loopback streamable-HTTP MCP endpoint (`/mcp`, protocol
-  `2026-07-28` pinned) serving the read-only Brain pack (`capabilities`,
-  `brain_search`, `brain_get`, `brain_tasks`) across vaults from
-  `~/.onebrain/gateway.yml`. Loopback bind; remote access via `gateway tunnel` (below).
-- OAuth 2.1 authorization + resource server for the gateway: `/mcp` now requires
-  a Bearer access token. RFC 9728/8414 discovery, RFC 7591 dynamic client
-  registration (public clients only — no client secrets ever minted), an
-  `/authorize` consent page gated by a device-pairing code (5-wrong-attempt/60s
-  lockout), and `/token` authorization-code exchange (PKCE S256, single-use
-  codes) plus rotating refresh tokens with reuse detection (a replayed refresh
-  token revokes its whole token family). `onebrain gateway pair [--rotate]`
-  prints or rotates the pairing code independent of a running gateway. See
-  [`docs/gateway.md#authentication`](docs/gateway.md#authentication).
-- `gateway.yml` gains a `public_url` key: the gateway's OAuth issuer base URL
-  for the Cloudflare tunnel. Validated at `gateway run` startup
-  (must be a bare `https://`, or loopback-only `http://`, origin with no
-  path/query/fragment) — an invalid value fails startup naming the key
-  instead of silently resolving to a wrong or insecure issuer. See
-  [`docs/gateway.md#gatewayyml-schema`](docs/gateway.md#gatewayyml-schema).
-- Gateway policy engine + human approvals + audit trail (Gateway PR 4): every
-  tool call is classified `read_only`/`mutating`/`destructive` and checked
-  against a per-class mode (`auto`/`ask_once`/`ask_always`/`deny`) under a new
-  `gateway.yml` `policy:` block — read-only tools default to `auto`
-  (unchanged behavior), writes default to `ask_once`, and a future destructive
-  tool would default to `ask_always`. A call that needs approval blocks until
-  a human answers it, through either a native macOS `display dialog` prompt
-  (`osascript`) or the new operator `GET`/`POST /approvals` HTTP surface —
-  gated by the gateway's pairing code, deliberately OUTSIDE the connector
-  Bearer layer, so a connector's own access token can never self-approve its
-  own pending call. An approved `ask_once` call records a TTL-bounded grant
-  (`grant_ttl_minutes`, default 30) so later calls from the same client, for
-  the same vault and risk class, don't need to ask again — the vault is part
-  of the consent scope, so approving a write into one vault never authorizes
-  writes into another, and an `ask_always` approval records no grant at all.
-  The pending-approval registry is bounded (16 overall, 4 per client): past
-  either limit a gated call is refused with a policy error instead of
-  queueing another human prompt. Every tool call — allowed, denied, approved, or timed
-  out — is appended as one JSON line to
-  `~/.onebrain/gateway/audit/YYYY-MM.jsonl` (redacted args summary only,
-  never a raw note body or credential). See
-  [`docs/gateway.md#policy--approvals`](docs/gateway.md#policy--approvals).
-- `brain_capture` — the gateway's first WRITE tool: creates a new inbox note
-  from a `title`/`text`, confined to the vault by three independent guards (a
-  syntactic plain-relative-path check, post-canonicalization confinement that
-  catches a symlinked-out folder, and an equality check that the confined path
-  is exactly the path the write will open), gated by the policy engine above
-  (`RiskClass::Mutating`). An empty `text` is rejected as `invalid_params`;
-  a same-day title collision returns a clean tool error naming the
-  vault-relative path; the follow-up search reindex is detached, so the call
-  returns as soon as the note is on disk rather than waiting on a daemon cold
-  start. See
-  [`docs/gateway.md#brain_capture`](docs/gateway.md#brain_capture).
-- `capabilities` now reports each tool's risk class and the policy mode
-  currently in force for it, plus an `approval_channels` object
-  (`native`/`http`/`telegram`) naming which approval channels can actually
-  deliver a prompt on this machine right now — a caller is never told a
-  write can be approved through a channel that cannot carry the prompt to a
-  human. See
-  [`docs/gateway.md#capabilities-truthfulness`](docs/gateway.md#capabilities-truthfulness).
-- **Telegram approval channel (Gateway PR 5).** `onebrain gateway telegram
-  setup` walks through wiring up a dedicated bot — paste a `@BotFather`
-  token, send a one-time code back to the bot to prove identity (never
-  arrival order or a plain "press START"), and the wizard writes
-  `gateway.yml`'s new `telegram.bot_token`/`telegram.chat_id` keys and sends
-  a confirmation message. A blocked call now also fires an inline-keyboard
-  prompt (✅ Approve / ⛔ Deny) to that chat, carrying the same
-  Client/Tool/bounded-summary framing the native dialog shows — never the
-  raw tool-call body — and edits the message to show the outcome (clearing
-  the keyboard) once ANY channel resolves it. A demand-driven background
-  poller (one thread per process, spawned on first need) watches for the
-  button press via `getUpdates`, persists its cursor to a bot-token-keyed
-  offset file after every batch — so a clean restart resumes from where it
-  left off, a crash between a batch and its persisted cursor at worst
-  re-fetches and re-handles a few already-seen updates on the next start
-  (harmless: approvals are in-memory and per-process, so a stale resolve
-  is just a no-op), and rotating the bot token starts that new bot with a
-  clean cursor instead of inheriting a stale one — and exits again once
-  nothing is left pending (bounded by one ≤25s long-poll cycle past the
-  last pending approval). Authorization has no pairing code at all — a
-  button press is accepted iff its sender's
-  Telegram id matches the configured `chat_id`, which must be a private
-  (positive-id) chat; a dedicated bot is required, since Telegram allows
-  only one `getUpdates` consumer per token and the OneBrain Claude Code
-  plugin's own bot already holds that slot for its own, unrelated,
-  vault-level `notifications.telegram_chat_id` integration.
-  `capabilities.approval_channels.telegram` reports whether a bot is
-  configured, not whether it's currently reachable, and an audit-log
-  line's `channel` field can now name `"telegram"` alongside its existing
-  `"native"`/`"http"` values whenever a human resolved the call through
-  it — still `null` for `auto`, a policy `denied` with no human involved,
-  or a `timedout` call, exactly as before. See
-  [`docs/gateway.md#telegram-approval-channel`](docs/gateway.md#telegram-approval-channel).
+Adds the OneBrain gateway: a remote MCP endpoint so the Claude app's custom connector (and other remote-MCP clients) can reach your vault from your phone over a Cloudflare tunnel, with OAuth, policy, human approvals and an audit log.
 
-- `onebrain gateway tokens list [--all]` and `tokens revoke <id> | --client <client_id> | --family <family>`
-  (exactly one selector), plus `onebrain gateway clients list` and
-  `clients remove <client_id>` (deletes the registration, revokes its tokens,
-  deletes its pending codes). Token values are never printed: tokens and
-  families are shown by a 12-hex SHA-256 id, and a unique prefix of 4+ chars
-  works. Works with or without `gateway run`; a running gateway honours a
-  revoke on its next request. Revoking by id does not cascade (the output
-  points at `--family` / `clients remove`). See
-  [`docs/gateway.md#managing-access`](docs/gateway.md#managing-access).
+- **Remote MCP gateway.** `onebrain gateway run` serves the Brain pack (`capabilities`, `brain_search`, `brain_get`, `brain_tasks`) over streamable HTTP (MCP `2026-07-28`) on `127.0.0.1:7717`, across vaults listed in `~/.onebrain/gateway.yml`.
+- **OAuth 2.1 with device pairing.** Discovery, dynamic client registration (public clients only), PKCE S256, rotating refresh tokens with reuse detection. Consent needs the pairing code (`onebrain gateway pair [--rotate]`) and locks for 60 s after 5 wrong attempts.
+- **First write tool, gated by policy.** `brain_capture` creates inbox notes confined to the vault. Each call is classified read-only / mutating / destructive and checked against per-class `policy:` modes (`auto`/`ask_once`/`ask_always`/`deny`). Every call is appended, redacted, to `~/.onebrain/gateway/audit/YYYY-MM.jsonl`.
+- **Human approvals.** Answer from a native macOS dialog, the loopback-only `/approvals` page, or a dedicated Telegram bot (`onebrain gateway telegram setup`). Prompts are plain English: who is asking (self-declared name + short id), what (title, vault, length), how long a single Allow lasts under `ask_once`, and when the request expires. Waiting calls stream SSE keep-alives so they survive tunnel timeouts (default wait 240 s, clamped at 270 s). A client disconnect, SIGTERM or Ctrl-C denies pending approvals and writes nothing.
+- **Phone access via Cloudflare and LaunchAgents.** `onebrain gateway tunnel setup|status` stores the Cloudflare tunnel token (0600) and sets `public_url`. `onebrain gateway service install|uninstall|status` (macOS) runs the gateway and cloudflared (`--protocol http2`) as KeepAlive LaunchAgents.
+- **Access management.** `onebrain gateway tokens list|revoke` and `clients list|remove` show hashed ids, never token values. They work with or without a running gateway, which honours a change on its next request through a cross-process `auth.lock`.
+- **Exposure hardening.** A Host/Origin guard against DNS rebinding; `/approvals` is loopback-only; `/register` caps (rate, 50 clients, field and body limits); a CSRF-hardened consent page; RFC 8707 `resource` on tokens; the pairing code prints only on a TTY; `onebrain doctor` gains a Gateway section.
+- **Breaking / changed.** A tunnel must forward the original `Host`. `gateway run` no longer prints the pairing code when stdout is not a terminal. `approval_wait_seconds` defaults to 240 s and values above 270 s are clamped with a warning. `gateway run` logs through `tracing` (`RUST_LOG`). The audit `args_summary` format changed (quoted values, no `Some`/`None`). `rust-version = "1.89"`.
 
-- `onebrain gateway tunnel setup|status` — store a Cloudflare tunnel token (from the Zero Trust dashboard, 0600, never echoed) and set `public_url`; status checks the token, the tunnel agent, and that the public hostname reaches this gateway. See [`docs/gateway.md#use-it-from-your-phone`](docs/gateway.md#use-it-from-your-phone).
-- `onebrain gateway service install|uninstall|status` (macOS) — the gateway and cloudflared as KeepAlive LaunchAgents; logs in `~/Library/Logs/onebrain/` (0600). Re-run `install` after a `gateway.yml` change: it restarts the gateway.
-- `onebrain doctor` Gateway section (config, launch agents, local endpoint, tunnel, auth store, Telegram, approval wait, vault location), shown only when `gateway.yml` exists.
-- Gateway approval prompts (Telegram + macOS dialog) rewritten in plain English: what is being asked (`Claude wants to save a new note`), the note title / vault / length (never the body), who asked (self-declared client name + short id) and a countdown; Telegram messages are edited to a clear outcome (`✅ Allowed`, `⛔ Denied`, `⌛ Timed out`, ...). Non-ASCII titles show as written; control/bidi characters stay visibly escaped. `GET /approvals` gains a `description`. The audit `args_summary` format changed too: values are quoted and `Some(..)`/`None` is gone (`vault=default` when unset).
-
-### Changed
-- **Breaking/Changed:** the default `policy.approval_wait_seconds` dropped from 300 s to 240 s, and values above 270 s are clamped to 270 s with a startup warning (Claude's tool timeout is 300 s).
-- Approval-gated tool calls now reply as SSE: an immediate "waiting for human approval" notice, 15 s keep-alives, then the result — so they survive Cloudflare's proxy response timeout (roughly 100–125 s). Other calls stay plain JSON. The gateway declares the MCP `logging` capability for that notice.
-- `gateway run` exits cleanly on SIGTERM as well as Ctrl-C: pending approvals are denied, native dialogs withdrawn, and open requests get 5 s.
-- A client disconnect while its call awaits approval denies that approval and writes nothing.
-- `onebrain gateway run` now installs a `tracing` subscriber (stderr, honouring
-  `RUST_LOG`, default `info`). It previously installed none, so every operator
-  diagnostic the gateway emits — a failed audit write, a degenerate
-  `approval_wait_seconds: 0`, a call refused at the pending-approval cap, the
-  full error behind a deliberately-sanitized client message — went nowhere. The
-  pairing code and `gateway listening on …` lines remain plain stdout, unchanged.
-- Gateway note filenames now keep **Unicode** alphanumerics, so a Thai,
-  Japanese, Korean, or Cyrillic `brain_capture` title produces a filename in
-  that script. Previously any title without ASCII letters sanitized to nothing
-  and fell through to a fixed `capture` slug, so only ONE such capture could
-  succeed per day and every later one failed as a same-day collision. The length
-  cap is now byte-aware as well as character-aware, and a capture that genuinely
-  has no usable text to name it (an emoji-only title and body) gets a short
-  random suffix instead of colliding with every other one that day.
-- MCP: rmcp 2.1.0 → 3.0.1 — protocol `2026-07-28` baseline for the remote MCP
-  gateway; stdio server and all 4 tools unchanged; legacy `initialize`
-  negotiation (2025-03-26 / 2025-11-25) now guarded by an integration test.
-- README roadmap re-synced to the 2026-08-28 renumber: Gateway v3.5 · Council
-  v3.6 · Studio/Surfaces v3.7 · Terminal v3.8 · Bootstrap v3.9 · cleanup v3.10
-  · bundles v3.11+.
-- Workspace declares `rust-version = "1.89"` (the cross-process store lock uses std `File::lock`).
-
-### Security
-- The operator `/approvals` surface is now rate-limited by the SAME
-  five-failures/60-second lockout `POST /authorize` applies to the pairing code,
-  on one shared counter. It previously verified that code directly, so the one
-  credential standing between a caller and self-approval accepted unlimited,
-  unthrottled, unlogged guesses — reachable with no OAuth token at all.
-- The native macOS approval dialog is now time-bounded (`giving up after`, sized
-  to the call's own remaining `approval_wait_seconds`), so it dismisses itself
-  when the call it belongs to gives up. Previously it stayed up indefinitely: a
-  human could click Approve on a prompt that silently did nothing, and each
-  abandoned dialog pinned a blocking-pool thread until the process exited.
-- `args_summary` is bounded before it is written to the audit log or shown as an
-  approval prompt. Tool handlers interpolate raw caller-supplied parameters into
-  it and the audit log has no size cap or rotation, so a client could previously
-  grow that file by a megabyte per call through a read-only tool needing neither
-  approval nor a grant.
-- Gateway pre-tunnel hardening ([#404](https://github.com/onebrain-ai/onebrain-cli/issues/404)):
-  every route now refuses a `Host` that is not loopback (`localhost`/`127.0.0.1`/`[::1]`)
-  or the `public_url` host (`403`; missing/malformed `400`), closing DNS rebinding
-  against `/register`, `/authorize` and `/token`; `/mcp`'s own host check now
-  includes the `public_url` host. State-changing requests with a foreign `Origin`
-  are refused (`/mcp` excepted). `/approvals` answers only on a loopback host and
-  refuses any request carrying a reverse-proxy header. **Breaking:** requests
-  through a tunnel that does not forward the original `Host` now fail.
-- `POST /register` is bounded: 10 per minute globally (`429` + `Retry-After`),
-  50 stored clients (`429` naming `onebrain gateway clients remove <id>`),
-  `client_name` ≤ 100 characters, `redirect_uri` ≤ 2048 bytes; `/register`,
-  `/token` and `/authorize` bodies are capped at 64 KiB (`413`).
-- `POST /authorize` refuses cross-site submissions (any `Sec-Fetch-Site`
-  other than `same-origin`/`none`, or a foreign `Origin`) before checking the pairing code,
-  so a forged form cannot succeed or trip the lockout. The consent page shows
-  the full redirect address, labels the client name as unverified (isolated in
-  `<bdi>`), and sends `Referrer-Policy: same-origin` (was `no-referrer`).
-- Tokens record their RFC 8707 `resource` (not yet enforced, [#416](https://github.com/onebrain-ai/onebrain-cli/issues/416));
-  a refresh naming a different `client_id` is rejected (`invalid_grant`).
-- `public_url` and native redirect URIs accept `http://[::1]`; `public_url`
-  rejects path prefixes, userinfo, non-numeric ports and an empty host.
-- **Breaking:** `gateway run` prints the pairing code only when stdout is a
-  terminal; under a service or redirect it points to `onebrain gateway pair`.
-- The gateway's token/client store takes a cross-process advisory lock
-  (`~/.onebrain/gateway/auth.lock`) around every read-modify-write, so a
-  `tokens revoke` from the CLI can't be silently undone by a token refresh the
-  running gateway writes at the same moment.
-- `/authorize` and `/token` re-check that the client is still registered after
-  minting, so a client removed mid-exchange (`clients remove` from another
-  terminal) gets nothing usable. The 50-client cap on `/register` is now counted
-  and inserted under the same lock.
+### Upgrade notes
+Re-run `onebrain gateway service install` after upgrading so the LaunchAgent points at the new binary. See [`docs/gateway.md`](docs/gateway.md) ("Use it from your phone") for setup.
 
 ## [3.4.25] — 2026-08-28 — Keep Codex hooks alive
 
