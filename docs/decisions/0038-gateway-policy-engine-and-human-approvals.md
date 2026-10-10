@@ -1,6 +1,6 @@
 # 0038 — Policy engine with risk tiers and human approvals
 
-- **Status:** accepted
+- **Status:** accepted · revisited by [0046](0046-approvals-honour-revocation-and-shutdown-edits.md) (grants are per token family and recorded only by the waiter; waiting calls honour revocation)
 - **Date:** 2026-10
 - **Follows:** [0036](0036-remote-mcp-gateway-separate-process.md), [0037](0037-gateway-oauth-authorization-server-and-pairing.md).
 - **PRs:** [#408](https://github.com/onebrain-ai/onebrain-cli/pull/408) (policy, approvals, audit, `brain_capture`), [#409](https://github.com/onebrain-ai/onebrain-cli/pull/409) (Telegram channel), [#415](https://github.com/onebrain-ai/onebrain-cli/pull/415) (disconnect / shutdown denial).

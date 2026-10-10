@@ -133,7 +133,7 @@ from the binary you're running.
 | `policy.read_only` | Mode for read-only tools (`capabilities`, `brain_tasks`, `brain_get`, `brain_search`) | `auto` | `auto`, `ask_once`, `ask_always`, `deny` |
 | `policy.mutating` | Mode for write tools (`brain_capture`) | `ask_once` | `auto`, `ask_once`, `ask_always`, `deny` |
 | `policy.destructive` | Mode for destructive tools (none ship yet) | `ask_always` | `auto`, `ask_once`, `ask_always`, `deny` |
-| `policy.grant_ttl_minutes` | How long an `ask_once` approval keeps covering the same client, vault and risk class | `30` | integer minutes |
+| `policy.grant_ttl_minutes` | How long an `ask_once` approval keeps covering the same client, token family (login), vault and risk class | `30` | integer minutes |
 | `policy.approval_wait_seconds` | How long a call waits for a human before it is denied | `240` | seconds; values above `270` are clamped with a startup warning; `0` denies at once |
 | `telegram.bot_token` | Bot token from `@BotFather` for the approval channel. Never logged or echoed | *empty* (channel off) | string. Written by `gateway telegram setup` |
 | `telegram.chat_id` | Private chat the bot sends prompts to; only presses from this user id count | `0` (channel off) | positive integer; a group or channel id (negative) leaves the channel off |
@@ -201,13 +201,13 @@ doc/pending counts from the daemon instead of reporting the index as locked.
 
 **Index & state checks** include:
 
-- **search** — Is there an index, and is it current? Checks collection name, presence on disk, total doc count, pending/unembedded count.
+- **search** — Is there an index, and is it current? Checks collection name, presence on disk, total doc count, pending/unembedded count. If another process holds the index lock, the row is a `warn` that reads "engine busy: the search index is in use by onebrain <role> <version> (pid N) — …" (from v3.5.1) or the generic upgrade hint.
 - **lex-index** — Is the keyword (tantivy BM25) index actually alive? Detects the silent failure mode where an interrupted schema migration (v3.4.16 upgrade) leaves the tantivy index empty while the chunk metadata table still holds chunks — every keyword search would return nothing. Touches no vault files, but opening the engine is itself the rebuild self-heal. Resolution failures (no collection, no index on disk) degrade to `ok/"skipped"` rather than false-positive warnings. A busy engine is the exception: a running daemon holds the collection lock for its whole lifetime, and that is exactly the configuration in which this is the *only* check that can see a dead index — so it reports `warn` "could not verify the keyword index" (never auto-fixable) rather than an ok-rendered skip. The complete set of outcomes:
 
   | Outcome | Status | Repair |
   |---|---|---|
   | healthy, or resolution skipped (no collection / no index on disk) | `ok` | — |
-  | **could not verify** — engine busy (daemon holds the lock) | `warn` | not auto-fixable; stop the daemon and re-run |
+  | **could not verify** — engine busy (another process holds the lock) | `warn` | not auto-fixable; the row names the holder when it can (v3.5.1, [ADR 0045](decisions/0045-name-the-search-index-lock-holder.md)); stop or restart it and re-run |
   | **dead** — keyword index empty while the collection holds N chunk(s) | `error` | `doctor --fix` (preferred; rebuilds from stored metadata only), or `search reindex --force` |
   | **orphaned** — stored chunk metadata empty while the keyword index still holds N doc(s) | `error` | **`search reindex --force` only** — `doctor --fix` cannot repair it, because the metadata a rebuild would read is itself gone |
   | **excess docs** — keyword index holds more docs than the collection has chunks (duplicates/orphans skew BM25 ranking) | `warn` | `doctor --fix`, or `search reindex --force` |

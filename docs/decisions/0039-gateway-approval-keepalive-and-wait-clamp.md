@@ -1,6 +1,6 @@
 # 0039 — Approval keep-alive over SSE, wait clamp (240 s / 270 s) and SIGTERM handling
 
-- **Status:** accepted
+- **Status:** accepted · revisited by [0046](0046-approvals-honour-revocation-and-shutdown-edits.md) (shutdown waits up to 2 s for Telegram edits)
 - **Date:** 2026-10
 - **Follows:** [0038](0038-gateway-policy-engine-and-human-approvals.md).
 - **PRs:** [#415](https://github.com/onebrain-ai/onebrain-cli/pull/415); the service side is in [#419](https://github.com/onebrain-ai/onebrain-cli/pull/419).
