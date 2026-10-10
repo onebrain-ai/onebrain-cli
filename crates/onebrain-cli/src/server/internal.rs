@@ -116,6 +116,17 @@ pub(super) fn open_held_engine(vault_root: &Path) -> Option<SharedEngine> {
             spawn_reranker_warm_thread(shared.clone(), reranker_model, cache_dir);
             Some(shared)
         }
+        // #426: lock contention names the holder (e.g. an `onebrain mcp` from
+        // before an upgrade), so the daemon log says what to restart.
+        Err(e) if onebrain_search::error::is_engine_busy(&e) => {
+            tracing::warn!(
+                vault = %vault_root.display(),
+                holder = %crate::commands::search_lock_holder::busy_message_for_vault(vault_root),
+                "daemon holds no engine — search index is locked by another process; \
+                 search falls back to per-request open"
+            );
+            None
+        }
         Err(e) => {
             tracing::warn!(
                 vault = %vault_root.display(),

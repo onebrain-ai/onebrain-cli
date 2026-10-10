@@ -630,7 +630,9 @@ impl DaemonHandle {
             // A 503 is the daemon holding no engine (another process owns the
             // redb lock) — classify as EngineBusy so the caller reports honest
             // E_ENGINE_BUSY, not an opaque E_INTERNAL. See `classify_daemon_ureq`.
-            Err(ureq::Error::StatusCode(503)) => Err(daemon_engine_busy()),
+            Err(ureq::Error::StatusCode(503)) => {
+                Err(daemon_engine_busy(self.info.vault.as_deref()))
+            }
             Err(e) => Err(anyhow::anyhow!("daemon get: {e}")),
         }
     }
@@ -735,7 +737,9 @@ impl DaemonHandle {
             Ok(mut resp) => Ok(Some(read_json(&mut resp)?)),
             // Route absent on an older daemon → skip optimization (not an error).
             Err(ureq::Error::StatusCode(404)) => Ok(None),
-            Err(ureq::Error::StatusCode(503)) => Err(daemon_engine_busy()),
+            Err(ureq::Error::StatusCode(503)) => {
+                Err(daemon_engine_busy(self.info.vault.as_deref()))
+            }
             Err(e) => Err(anyhow::anyhow!("daemon ledger check: {e}")),
         }
     }
@@ -782,7 +786,9 @@ impl DaemonHandle {
         match op(self) {
             Ok(mut resp) => Ok(Some(read_json(&mut resp)?)),
             Err(ureq::Error::StatusCode(404)) => Ok(None),
-            Err(ureq::Error::StatusCode(503)) => Err(daemon_engine_busy()),
+            Err(ureq::Error::StatusCode(503)) => {
+                Err(daemon_engine_busy(self.info.vault.as_deref()))
+            }
             Err(e) => Err(anyhow::anyhow!("daemon token GET {path}: {e}")),
         }
     }
@@ -864,7 +870,7 @@ fn with_retry(
             ensure_running(expected.as_deref().map(Path::new))
                 .context("respawn daemon after transport failure")
         },
-        classify_daemon_ureq,
+        |e| classify_daemon_ureq(e, expected.as_deref()),
     )?;
     read_json(&mut resp)
 }
@@ -889,9 +895,9 @@ fn with_retry(
 /// request can only come from the
 /// engine-contention paths — `require_engine` on `/api/internal/*` or
 /// `map_search_failure` on `/api/vault/search` — never the no-vault guard.
-fn classify_daemon_ureq(e: ureq::Error) -> anyhow::Error {
+fn classify_daemon_ureq(e: ureq::Error, vault: Option<&str>) -> anyhow::Error {
     if matches!(e, ureq::Error::StatusCode(503)) {
-        return daemon_engine_busy();
+        return daemon_engine_busy(vault);
     }
     anyhow::anyhow!("daemon request: {e}")
 }
@@ -899,9 +905,18 @@ fn classify_daemon_ureq(e: ureq::Error) -> anyhow::Error {
 /// The typed engine-busy error for a daemon that holds no engine (503). Mirrors
 /// the direct path's `onebrain_search` classification so `is_engine_busy` on the
 /// chain is `true` for both the direct lock and the routed-503 case.
-fn daemon_engine_busy() -> anyhow::Error {
+///
+/// `vault` is the daemon's bound vault. The context names whoever holds that
+/// vault's index lock when its holder sidecar says so (#426) — e.g. an
+/// `onebrain mcp` from before an upgrade — so the gateway log and routed CLI
+/// verbs tell the user what to restart.
+fn daemon_engine_busy(vault: Option<&str>) -> anyhow::Error {
+    let holder = match vault {
+        Some(v) => crate::commands::search_lock_holder::busy_message_for_vault(Path::new(v)),
+        None => crate::commands::search_lock_holder::GENERIC_BUSY.to_string(),
+    };
     anyhow::Error::new(onebrain_search::error::EngineBusy)
-        .context("daemon holds no engine — the search index is locked by another process")
+        .context(format!("daemon holds no engine — {holder}"))
 }
 
 /// Generic "try, and on a retryable error reconnect + try ONCE more" core.
@@ -1565,16 +1580,54 @@ mod tests {
     // ── classify_daemon_ureq: 503 → typed EngineBusy, else opaque ──────────
     #[test]
     fn classify_daemon_ureq_maps_503_to_engine_busy() {
-        let err = classify_daemon_ureq(ureq::Error::StatusCode(503));
+        let err = classify_daemon_ureq(ureq::Error::StatusCode(503), None);
         assert!(
             onebrain_search::error::is_engine_busy(&err),
             "a daemon 503 (engine-less) must classify as EngineBusy, got: {err:#}"
         );
     }
 
+    /// #426: the gateway logs this error's chain on a `brain_search` 503, so it
+    /// must name the live holder of the daemon's vault index — here, this test
+    /// process holding the engine.
+    #[test]
+    fn daemon_engine_busy_names_the_vault_index_holder() {
+        let vault = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+        std::fs::write(
+            vault.path().join("onebrain.yml"),
+            "search:\n  collection: dc-busy-holder\n",
+        )
+        .unwrap();
+        let cache_dir = crate::commands::search_common::collection_cache_dir("dc-busy-holder");
+        let _held =
+            onebrain_search::engine::Engine::open(&cache_dir, "multilingual-e5-small").unwrap();
+
+        let vault_id = canonical_vault_id(vault.path());
+        let err = daemon_engine_busy(vault_id.as_deref());
+        assert!(onebrain_search::error::is_engine_busy(&err), "{err:#}");
+        let msg = format!("{err:#}");
+        assert!(msg.starts_with("daemon holds no engine — "), "{msg}");
+        assert!(
+            msg.contains(&format!("(pid {})", std::process::id())),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn daemon_engine_busy_without_a_vault_is_generic() {
+        let err = daemon_engine_busy(None);
+        assert!(
+            err.to_string()
+                .ends_with(crate::commands::search_lock_holder::GENERIC_BUSY),
+            "{err}"
+        );
+    }
+
     #[test]
     fn classify_daemon_ureq_leaves_other_status_opaque() {
-        let err = classify_daemon_ureq(ureq::Error::StatusCode(500));
+        let err = classify_daemon_ureq(ureq::Error::StatusCode(500), None);
         assert!(
             !onebrain_search::error::is_engine_busy(&err),
             "a non-503 status must NOT be EngineBusy, got: {err:#}"

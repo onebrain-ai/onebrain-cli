@@ -640,7 +640,7 @@ fn read_lock_pid(lock_path: &Path) -> Option<u32> {
 /// leader): the lock's PID is the `daemon start` PROCESS, not the setsid daemon,
 /// so it must not be gated on session-leadership.
 #[cfg(unix)]
-fn pid_exists(pid: u32) -> bool {
+pub(crate) fn pid_exists(pid: u32) -> bool {
     use nix::errno::Errno;
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
@@ -656,12 +656,12 @@ fn pid_exists(pid: u32) -> bool {
 /// and that creator is the `daemon start` process, not the detached daemon, so
 /// it must not be gated on running our own image the way [`is_alive`] is.
 #[cfg(windows)]
-fn pid_exists(pid: u32) -> bool {
+pub(crate) fn pid_exists(pid: u32) -> bool {
     win_proc::exists(pid)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn pid_exists(_pid: u32) -> bool {
+pub(crate) fn pid_exists(_pid: u32) -> bool {
     // No cheap raw probe wired here; assume live so we never reclaim a lock we
     // can't verify is stale (conservative — matches `LockOwner::Unknown`).
     true

@@ -426,9 +426,10 @@ pub(crate) fn rerank_settings_from_config(cfg: &RerankerConfig) -> RerankSetting
 /// report lock contention uniformly (v3.4.6).
 pub(crate) fn map_engine_open_error(err: anyhow::Error, cache_dir: &Path) -> anyhow::Error {
     if onebrain_search::error::is_engine_busy(&err) {
+        // #426: name the holder when its sidecar says who it is.
         return anyhow::Error::new(onebrain_core::CoreError::EngineBusy(format!(
-            "index at {} is locked by another process (e.g. the `onebrain mcp` server) — \
-             retry once it releases the lock",
+            "{} (index at {})",
+            crate::commands::search_lock_holder::busy_message(cache_dir),
             cache_dir.display()
         )));
     }
@@ -445,11 +446,9 @@ pub(crate) fn map_engine_open_error(err: anyhow::Error, cache_dir: &Path) -> any
 /// context (an opaque `E_INTERNAL`).
 pub(crate) fn map_daemon_error(err: anyhow::Error, ctx: &'static str) -> anyhow::Error {
     if onebrain_search::error::is_engine_busy(&err) {
-        return anyhow::Error::new(onebrain_core::CoreError::EngineBusy(
-            "the search index is held by another process (e.g. an `onebrain mcp` \
-             server, possibly from before an upgrade) — retry once it releases the engine"
-                .to_string(),
-        ));
+        // The daemon client already named the holder (#426) in the error's
+        // outermost context; carry that sentence through.
+        return anyhow::Error::new(onebrain_core::CoreError::EngineBusy(err.to_string()));
     }
     err.context(ctx)
 }
@@ -891,6 +890,8 @@ mod tests {
             ),
             "an engine-busy daemon error must become CoreError::EngineBusy, got: {mapped:#}"
         );
+        // #426: the daemon client's holder sentence is carried through.
+        assert!(mapped.to_string().contains("via daemon"), "{mapped:#}");
     }
 
     #[test]

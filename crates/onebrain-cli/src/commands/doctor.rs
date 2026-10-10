@@ -1708,6 +1708,20 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
                     );
                 }
             },
+            // #426: lock contention names the holder (e.g. an `onebrain mcp`
+            // from before an upgrade) rather than a bare "engine busy".
+            Err(e) if crate::commands::search_common::is_engine_busy_error(&e) => {
+                return finish(
+                    DoctorResult::warn(
+                        "search",
+                        format!(
+                            "engine busy: {}",
+                            crate::commands::search_lock_holder::busy_message(&cache_dir)
+                        ),
+                    )
+                    .with_details(vec![format!("collection: {collection}")]),
+                );
+            }
             Err(e) => {
                 return finish(
                     DoctorResult::warn("search", format!("engine unavailable: {e}"))
@@ -6826,6 +6840,39 @@ mod tests {
             r.details
                 .iter()
                 .any(|d| d.contains("reranker_downloaded: false")),
+            "{r:?}"
+        );
+    }
+
+    /// #426: when the index lock is held, the search row names the holder —
+    /// here this test process, which holds the engine.
+    #[test]
+    fn native_search_check_names_the_lock_holder_when_busy() {
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("1")),
+        ]);
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "search:\n  collection: doctor-unit-busy-holder\n",
+        )
+        .unwrap();
+        let cache_dir =
+            crate::commands::search_common::collection_cache_dir("doctor-unit-busy-holder");
+        let _held =
+            onebrain_search::engine::Engine::open(&cache_dir, "multilingual-e5-small").unwrap();
+
+        let r = native_search_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Warn, "{r:?}");
+        assert!(
+            r.message
+                .starts_with("engine busy: the search index is in use by onebrain "),
+            "{r:?}"
+        );
+        assert!(
+            r.message.contains(&format!("(pid {})", std::process::id())),
             "{r:?}"
         );
     }

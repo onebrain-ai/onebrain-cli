@@ -753,11 +753,17 @@ pub struct Engine {
     /// [`Engine::skip_reranker_fetch_for_tests`].
     skip_reranker_fetch: bool,
     meta: Database,
+    /// This process's lock-holder sidecar (#426) — see [`crate::holder`].
+    /// Must stay declared before `_collection_lock`.
+    _holder: crate::holder::HolderGuard,
     /// Held for the engine's whole lifetime purely for its exclusive-open
     /// side effect (never read/written to) — see
     /// [`CollectionLayout::lock_path`] (#223). Reuses redb's own
     /// crash-safe, process-exclusive open (auto-released by the OS if this
     /// process dies) rather than adding a new file-locking dependency.
+    ///
+    /// Declared AFTER `_holder`: fields drop in declaration order, so the
+    /// holder sidecar is removed before this lock is released (#426).
     _collection_lock: Database,
 }
 
@@ -881,6 +887,11 @@ impl Engine {
         let lock_path = layout.lock_path();
         let collection_lock = Database::create(&lock_path)
             .with_context(|| format!("acquiring collection lock at {}", lock_path.display()))?;
+        // Name ourselves as the holder (#426) the moment the lock is ours, so a
+        // loser can say who holds it even during a slow migrate/repopulate
+        // below. Bound AFTER `collection_lock`, so an early `?` return drops it
+        // (removing the sidecar) before the lock is released.
+        let holder = crate::holder::HolderGuard::record(layout.holder_path());
 
         // Eager migration on the write path, now under the collection lock:
         // fold any legacy flat artifacts (and `models--*` dirs) into the
@@ -956,6 +967,7 @@ impl Engine {
             chunk_corruption_logged: std::cell::Cell::new(false),
             skip_reranker_fetch: false,
             meta,
+            _holder: holder,
             _collection_lock: collection_lock,
         };
         if needs_repopulate {

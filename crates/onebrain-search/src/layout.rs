@@ -202,6 +202,14 @@ impl CollectionLayout {
         self.root.join(".collection.lock")
     }
 
+    /// Path to the lock-holder sidecar — `<root>/.collection.lock.holder`,
+    /// right next to [`CollectionLayout::lock_path`] (#426). The current
+    /// holder of the collection lock records who it is here (see
+    /// [`crate::holder`]) so a process that loses the lock race can name it.
+    pub fn holder_path(&self) -> PathBuf {
+        self.root.join(".collection.lock.holder")
+    }
+
     /// Resolve an index artifact (`"tantivy"`, `"vectors"`, or
     /// `"engine.redb"`) to wherever it actually lives: `<root>/index/<name>`
     /// if present, else the legacy `<root>/<name>`. For a fresh collection

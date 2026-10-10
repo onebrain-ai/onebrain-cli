@@ -118,6 +118,11 @@ pub(crate) struct SearchStatusData {
     /// index). Rides a `W_STATUS_UNREADABLE` warning on the envelope.
     #[serde(skip_serializing_if = "Option::is_none")]
     status_error: Option<String>,
+    /// When `busy`: who holds the index lock, as one sentence (#426) — the
+    /// named holder, or the generic upgrade hint. Text-mode hint and the
+    /// `W_ENGINE_BUSY` warning only; never serialized (no wire change).
+    #[serde(skip)]
+    busy_holder: Option<String>,
     /// `false` in a lex-only build (no `semantic` feature): no ONNX runtime,
     /// so embedding-backed verbs (`vsearch`, hybrid `query`, `model set`) are
     /// unavailable and `reindex` indexes keyword-only. See ADR 0017.
@@ -163,12 +168,14 @@ pub fn run(vault_flag: Option<PathBuf>, mode: &OutputMode) -> Result<()> {
     // empty index. Both keep exit 0 — `status` is a report, not a failure.
     let busy = data.busy;
     let status_error = data.status_error.clone();
+    let busy_holder = data.busy_holder.clone();
     let mut envelope = Envelope::ok("search.status", Some(vault_info), data);
     if busy {
+        let holder = busy_holder
+            .unwrap_or_else(|| crate::commands::search_lock_holder::GENERIC_BUSY.to_string());
         envelope = envelope.with_warning(
             "W_ENGINE_BUSY",
-            "search index is locked by another process (e.g. the `onebrain mcp` server) — \
-             doc/pending counts are unknown until it releases the lock",
+            format!("{holder}; doc/pending counts are unknown until the lock is released"),
         );
     } else if let Some(msg) = status_error {
         envelope = envelope.with_warning(
@@ -329,6 +336,16 @@ pub(crate) fn status_data(
             }
         };
 
+    // #426: name the lock holder (read from its sidecar in the cache dir) — the
+    // same collection whether the busy signal came direct or via the daemon.
+    let busy_holder = if busy {
+        cache_dir
+            .as_deref()
+            .map(crate::commands::search_lock_holder::busy_message)
+    } else {
+        None
+    };
+
     let current_model_missing =
         cfg!(feature = "semantic") && collection.is_some() && model_size_bytes.is_none();
 
@@ -362,6 +379,7 @@ pub(crate) fn status_data(
         reindexing,
         busy,
         status_error,
+        busy_holder,
         semantic_available: cfg!(feature = "semantic"),
         reranker_model: reranker.model,
         reranker_ready: reranker.ready,
@@ -519,6 +537,7 @@ pub(crate) fn status_data_for(
         // A live engine that already answered `status()` above is readable by
         // construction — never the unreadable-index case.
         status_error: None,
+        busy_holder: None,
         semantic_available: cfg!(feature = "semantic"),
         reranker_model: reranker.model,
         reranker_ready: reranker.ready,
@@ -604,6 +623,7 @@ pub(crate) fn status_data_from_daemon(
         reindexing,
         busy: false,
         status_error: None,
+        busy_holder: None,
         semantic_available: cfg!(feature = "semantic"),
         reranker_model: reranker.model,
         reranker_ready: reranker.ready,
@@ -940,11 +960,23 @@ fn render_text(env: &Envelope<SearchStatusData>) -> String {
         );
     } else if d.busy {
         lines.push(String::new());
-        lines.push(
-            "💡  Index is locked by another process (e.g. the `onebrain mcp` server) — \
-             retry `onebrain search status` once it exits"
-                .to_string(),
-        );
+        match &d.busy_holder {
+            // #426: "The search index is in use by onebrain mcp 3.4.25 (pid N) — …"
+            Some(holder) => {
+                let mut chars = holder.chars();
+                let first = chars.next().map(|c| c.to_uppercase().collect::<String>());
+                lines.push(format!(
+                    "💡  {}{}",
+                    first.unwrap_or_default(),
+                    chars.as_str()
+                ));
+            }
+            None => lines.push(
+                "💡  Index is locked by another process (e.g. the `onebrain mcp` server) — \
+                 retry `onebrain search status` once it exits"
+                    .to_string(),
+            ),
+        }
     } else if d.current_model_missing && d.reindexing.is_none() {
         lines.push(String::new());
         lines.push(
@@ -1030,6 +1062,7 @@ mod tests {
                 reindexing: None,
                 busy: false,
                 status_error: None,
+                busy_holder: None,
                 semantic_available: true,
                 reranker_model: "onebrain-rerank-v1".to_string(),
                 reranker_ready: false,
@@ -1517,6 +1550,29 @@ mod tests {
         );
     }
 
+    /// #426: the busy hint names the lock holder, and the holder stays out of
+    /// the JSON (no wire change).
+    #[test]
+    fn text_busy_hint_names_the_holder_json_does_not() {
+        let mut e = env(Some("ob-1"), false);
+        {
+            let d = e.data.as_mut().unwrap();
+            d.busy = true;
+            d.busy_holder = Some(
+                "the search index is in use by onebrain mcp 3.4.25 (pid 42) — from before an \
+                 upgrade, restart that agent session (Claude Code / Codex / Gemini)"
+                    .to_string(),
+            );
+        }
+        let s = render_text(&e);
+        assert!(
+            s.contains("💡  The search index is in use by onebrain mcp 3.4.25 (pid 42)"),
+            "{s}"
+        );
+        let v = serde_json::to_value(e.data.as_ref().unwrap()).unwrap();
+        assert!(v.get("busy_holder").is_none(), "{v}");
+    }
+
     #[test]
     fn json_busy_reports_null_counts_and_flag() {
         // Bug B: machine consumers must see `busy: true` and null (not zero)
@@ -1972,6 +2028,7 @@ mod tests {
             reindexing: None,
             busy: false,
             status_error: None,
+            busy_holder: None,
             semantic_available: cfg!(feature = "semantic"),
             reranker_model: "onebrain-rerank-v1".to_string(),
             reranker_ready: false,
