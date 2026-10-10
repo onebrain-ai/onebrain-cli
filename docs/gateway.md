@@ -118,7 +118,13 @@ Every shipped channel resolves the SAME pending-approval registry — whichever 
 
 The check is repeated once more at the moment of an Allow. If the credential was revoked in between, the Allow writes nothing, records no grant, and is audited as `revoked`. If the auth store cannot be read at that moment, the Allow cannot be verified and fails closed: the call is denied as `unverified`, nothing is written, and no grant is recorded. (If the store cannot be read during the periodic check, the gateway just keeps waiting and relies on the Allow-time check.)
 
-Note that `tokens revoke <id>` ends only that one token, so the client can refresh and continue on the same family; to cut a client off completely use `tokens revoke --client` or `clients remove`.
+Note that `tokens revoke <id>` ends only that one token, so the client can refresh and continue on the same family. To cut access off, use `tokens revoke --family <family>` (one login), `tokens revoke --client <client_id>` (every login of one client) or `clients remove <client_id>`. A token that is no longer in the store at all counts as revoked.
+
+Honest limits of this check:
+
+- **A narrow window remains** between the Allow-time check and the write. A revoke that lands within those milliseconds can still let that one write through.
+- **A Telegram toast can briefly say ✅.** On a revoke race the button press may be acknowledged with a ✅ toast before the message is edited to "Access was revoked".
+- **Dead grants stay in memory.** Grants for token families that no longer exist are kept until the gateway restarts. They never match again, because a new consent gets a new family.
 
 If the client goes away while its call waits (the HTTP stream closes), the pending approval is denied (audit channel `disconnect`), any open prompt is withdrawn, and nothing is written; an approval that races the disconnect resolves as a denial. **Known gap:** cancellation is detected by transport close only. rmcp 3.0.1 in stateless mode ignores `notifications/cancelled`, so a client that sends it but keeps the stream open leaves its approval pending until `approval_wait_seconds` expires.
 
@@ -300,7 +306,7 @@ Tokens are never printed. Each one is shown by a 12-character **id**: the first 
 |---|---|
 | `onebrain gateway tokens list` | Live tokens: id, kind (access/refresh), client, family, status, issued, expires. |
 | `onebrain gateway tokens list --all` | Also expired and revoked tokens still on disk, with `status` live, expired or revoked (the gateway purges expired ones at startup). |
-| `onebrain gateway tokens revoke <id>` | Revokes **that one token only**. It does not cascade: revoking an access token does not stop a client that still holds a live refresh token. The output hints at the two rows below. |
+| `onebrain gateway tokens revoke <id>` | Revokes **that one token only**. It does not cascade: revoking an access token does not stop a client that still holds a live refresh token, and a waiting approval on a revoked access token is denied but the client can refresh and carry on. The output hints at the two rows below. |
 | `onebrain gateway tokens revoke --family <family>` | Revokes every token from one login (access and refresh). The client must pair again. |
 | `onebrain gateway tokens revoke --client <client_id>` | Revokes every token held by one client, but not its pending authorization codes (600 s TTL), so a code exchange already in flight can still mint a pair. For a full cut-off use `clients remove`. A client id that matches nothing is reported without echoing the value. |
 | `onebrain gateway clients list` | Registered clients, with how many live tokens each holds. |

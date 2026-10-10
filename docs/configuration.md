@@ -133,7 +133,7 @@ from the binary you're running.
 | `policy.read_only` | Mode for read-only tools (`capabilities`, `brain_tasks`, `brain_get`, `brain_search`) | `auto` | `auto`, `ask_once`, `ask_always`, `deny` |
 | `policy.mutating` | Mode for write tools (`brain_capture`) | `ask_once` | `auto`, `ask_once`, `ask_always`, `deny` |
 | `policy.destructive` | Mode for destructive tools (none ship yet) | `ask_always` | `auto`, `ask_once`, `ask_always`, `deny` |
-| `policy.grant_ttl_minutes` | How long an `ask_once` approval keeps covering the same client, vault and risk class | `30` | integer minutes |
+| `policy.grant_ttl_minutes` | How long an `ask_once` approval keeps covering the same client, token family (login), vault and risk class | `30` | integer minutes |
 | `policy.approval_wait_seconds` | How long a call waits for a human before it is denied | `240` | seconds; values above `270` are clamped with a startup warning; `0` denies at once |
 | `telegram.bot_token` | Bot token from `@BotFather` for the approval channel. Never logged or echoed | *empty* (channel off) | string. Written by `gateway telegram setup` |
 | `telegram.chat_id` | Private chat the bot sends prompts to; only presses from this user id count | `0` (channel off) | positive integer; a group or channel id (negative) leaves the channel off |
