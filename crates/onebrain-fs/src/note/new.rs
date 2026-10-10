@@ -59,6 +59,24 @@ pub fn new_note(
     frontmatter: &[String],
     force: bool,
 ) -> Result<NewResult> {
+    new_note_titled(vault_root, rel_path, template, frontmatter, force, None)
+}
+
+/// [`new_note`] with an explicit `heading`.
+///
+/// `heading` feeds ONLY the minimal note's `# <title>` H1 (after
+/// [`sanitize_title`]); template `{{title}}`/`{{slug}}` substitution keeps
+/// its stem-derived meaning, and a template-backed note has no generated H1
+/// so `heading` is unused there. `None`, or a title that sanitizes to nothing,
+/// falls back to the file stem — the `note new` behaviour.
+pub fn new_note_titled(
+    vault_root: &Path,
+    rel_path: &Path,
+    template: Option<&str>,
+    frontmatter: &[String],
+    force: bool,
+    heading: Option<&str>,
+) -> Result<NewResult> {
     let abs = vault_root.join(rel_path);
 
     let exists = abs.exists();
@@ -79,7 +97,12 @@ pub fn new_note(
             let substituted = substitute(&raw, &today, &title, &slug(&title));
             merge_frontmatter(&substituted, &pairs, &today)
         }
-        None => minimal_note(&title, &pairs, &today),
+        None => {
+            let h1 = heading
+                .and_then(sanitize_title)
+                .unwrap_or_else(|| title.clone());
+            minimal_note(&h1, &pairs, &today)
+        }
     };
 
     if let Some(parent) = abs.parent() {
@@ -106,6 +129,35 @@ fn title_from_path(rel_path: &Path) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or("Untitled")
         .to_string()
+}
+
+/// Max chars kept from a caller-supplied heading.
+const MAX_TITLE_CHARS: usize = 200;
+
+/// Control, bidi-override and zero-width characters that must never reach an
+/// H1 (terminal escapes, NUL, text-direction spoofing, invisible padding).
+fn is_unsafe_title_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+}
+
+/// Sanitize a caller-supplied heading: drop control/bidi/zero-width chars,
+/// collapse all whitespace (newlines included) to single spaces, strip
+/// leading `#`s, trim, cap at [`MAX_TITLE_CHARS`] chars (char-boundary
+/// safe). The input is bounded first so a huge title is never fully copied.
+/// `None` if nothing is left.
+fn sanitize_title(raw: &str) -> Option<String> {
+    // Whitespace controls (\n, \t) must collapse to a space, not vanish.
+    let bounded: String = raw
+        .chars()
+        .take(MAX_TITLE_CHARS * 4)
+        .filter(|c| c.is_whitespace() || !is_unsafe_title_char(*c))
+        .collect();
+    let one_line = bounded.split_whitespace().collect::<Vec<_>>().join(" ");
+    let stripped = one_line.trim_start_matches('#').trim();
+    let capped: String = stripped.chars().take(MAX_TITLE_CHARS).collect();
+    let out = capped.trim_end();
+    (!out.is_empty()).then(|| out.to_string())
 }
 
 /// Kebab-case `title`: lowercase, runs of non-alphanumerics collapse to a
@@ -319,6 +371,62 @@ mod tests {
         assert!(out.contains(&format!("created: {today}")), "got: {out}");
         assert!(out.contains("# New Topic"), "got: {out}");
         assert!(out.starts_with("---\n"));
+    }
+
+    fn titled(rel: &str, heading: Option<&str>) -> String {
+        let dir = tempdir().unwrap();
+        new_note_titled(dir.path(), Path::new(rel), None, &[], false, heading).unwrap();
+        read(dir.path(), rel)
+    }
+
+    #[test]
+    fn titled_thai_heading_replaces_stem_h1() {
+        let out = titled(
+            "00-inbox/2026-10-10-ทดสอบ-approve-3.md",
+            Some("ทดสอบ approve 3"),
+        );
+        assert!(out.contains("\n# ทดสอบ approve 3\n"), "got: {out}");
+        assert!(!out.contains("# 2026-10-10"), "got: {out}");
+    }
+
+    #[test]
+    fn titled_multiline_heading_collapses_to_one_line_and_strips_hashes() {
+        let out = titled("a/stem.md", Some("## first line\n\n  second\tline  "));
+        assert!(out.contains("\n# first line second line\n"), "got: {out}");
+    }
+
+    #[test]
+    fn titled_empty_or_blank_heading_falls_back_to_stem() {
+        for h in [Some(""), Some("  \n\t "), Some("###"), None] {
+            let out = titled("a/My Stem.md", h);
+            assert!(out.contains("\n# My Stem\n"), "{h:?} got: {out}");
+        }
+    }
+
+    #[test]
+    fn titled_long_thai_heading_is_capped_without_panicking() {
+        let long = "ทดสอบ".repeat(100); // 500 chars, 3 bytes each
+        let out = titled("a/stem.md", Some(&long));
+        let h1 = out.lines().find(|l| l.starts_with("# ")).unwrap();
+        assert_eq!(h1.chars().count(), 2 + MAX_TITLE_CHARS, "got: {h1}");
+        assert!(long.starts_with(&h1[2..]));
+    }
+
+    #[test]
+    fn titled_heading_drops_control_bidi_and_zero_width_chars() {
+        let out = titled(
+            "a/stem.md",
+            Some("A\0B\x1b[31mC\u{202E}D\u{200B}E\u{FEFF}F\u{2066}G\u{2069}H"),
+        );
+        assert!(out.contains("\n# AB[31mCDEFGH\n"), "got: {out:?}");
+        assert!(!out.contains('\x1b') && !out.contains('\0'), "got: {out:?}");
+    }
+
+    #[test]
+    fn new_note_keeps_stem_h1() {
+        let dir = tempdir().unwrap();
+        new_note(dir.path(), Path::new("a/Stem Name.md"), None, &[], false).unwrap();
+        assert!(read(dir.path(), "a/Stem Name.md").contains("\n# Stem Name\n"));
     }
 
     #[test]
