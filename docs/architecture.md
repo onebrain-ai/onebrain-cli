@@ -1,6 +1,6 @@
 # Architecture
 
-OneBrain CLI is a five-crate Cargo workspace. Only the binary ships; the library crates exist to keep responsibilities separated and testable.
+OneBrain CLI is a six-crate Cargo workspace. Only the binary ships; the library crates exist to keep responsibilities separated and testable.
 
 ```
 onebrain-cli          Binary crate — clap dispatch over the v3.1 command tree,
@@ -13,6 +13,9 @@ onebrain-cli          Binary crate — clap dispatch over the v3.1 command tree,
   ├─ onebrain-fs      Vault walks · frontmatter parsing · plugin tarball overlay
   │                   · init bootstrap · doctor checks · update install path · backups.
   │                   Knows about the filesystem.
+  │
+  ├─ onebrain-token   Token-optimization transforms · level ladder · honesty backstop
+  │                   · gain telemetry types · redb token cache. Standalone.
   │
   ├─ onebrain-cache   Session token resolution · checkpoint cadence state
   │                   · search status detection.
@@ -30,6 +33,8 @@ The arrow points *down* — higher crates depend on lower ones, never the revers
 onebrain-cli ──▶ onebrain-fs ──▶ onebrain-core
        │                              ▲
        ├────────▶ onebrain-cache ─────┘
+       │
+       ├────────▶ onebrain-token      (standalone — no workspace deps)
        │
        └────────▶ onebrain-search     (standalone — no workspace deps)
 ```

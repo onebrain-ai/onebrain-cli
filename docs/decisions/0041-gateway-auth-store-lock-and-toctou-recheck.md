@@ -30,7 +30,7 @@ A second window exists inside the gateway itself. `/authorize` and `/token` can 
 
 ## Alternatives considered
 
-- **A third-party file-lock crate** (for example `fs2`). Rejected: the standard library now provides it.
+- **A third-party file-lock crate** (for example `fs2`) (considered while writing this ADR). Rejected: the standard library now provides it.
 - **Route CLI changes through the running gateway over HTTP.** Rejected: the commands must work with the gateway stopped.
 - **A single process-wide mutex.** Does not cover the CLI process.
 - **Move the store to SQLite or redb.** Heavier than four small JSON files, and a larger change than the bug warranted.

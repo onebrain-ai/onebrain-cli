@@ -32,7 +32,7 @@ The phone use case needs a public hostname that reaches the loopback gateway, an
 ## Alternatives considered
 
 - **Create the tunnel and DNS from the CLI** with `cloudflared tunnel login` / `create` / `route`. Rejected for v3.5.0: it needs a `cert.pem` and ties the feature to `cloudflared`'s management CLI. Kept as an option for the guided setup.
-- **Pass the token on the command line or in the plist environment by default.** Rejected: the token file is not exposed in the process list.
+- **Pass the token on the command line or in the plist environment by default.** Rejected, because a token on the command line is visible in the process list, while a file is not (considered while writing this ADR). The plist environment is kept only as the fallback for a `cloudflared` without `--token-file`.
 - **Roll back on partial failure.** Rejected: unloading a working gateway on a tunnel error hides the actual state from the operator.
 - **launchd for the gateway only, and a hand-run tunnel.** Rejected: a tunnel that does not restart makes the phone path as fragile as before.
 - **Cloudflare quick tunnels.** Used for the smoke test only: the URL changes on every restart, so no connector could keep working.

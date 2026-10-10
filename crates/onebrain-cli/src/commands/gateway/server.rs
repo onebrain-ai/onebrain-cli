@@ -908,8 +908,9 @@ fn capability_packs(policy: &policy::PolicyConfig) -> Vec<PackInfo> {
 ///   ([`approval_routes::approval_router`]) — unconditionally mounted by
 ///   [`build_gateway_router`] on every platform this binary targets, so this
 ///   is always `true` in this build. Using it still requires a human who
-///   knows the gateway's pairing code (printed once, to stdout, at `gateway
-///   run` startup) — the same precondition OAuth pairing itself already
+///   knows the gateway's pairing code (shown at `gateway run` startup only
+///   when stdout is a terminal, otherwise read with `onebrain gateway
+///   pair`) — the same precondition OAuth pairing itself already
 ///   assumes; `capabilities` reporting `true` here is not a claim that a
 ///   human is actively watching, only that the channel exists and is
 ///   reachable.
@@ -932,8 +933,8 @@ fn approval_channels(config: &GatewayConfig) -> ApprovalChannels {
         native: approval_native::is_available(),
         http: true,
         telegram: telegram::is_available(&config.telegram),
-        note: "http is always available given the gateway's pairing code (printed once to \
-               stdout at `gateway run` startup); native requires macOS with osascript on \
+        note: "http is always available given the gateway's pairing code (shown at \
+               `gateway run` startup only on a terminal, otherwise via `onebrain gateway pair`); native requires macOS with osascript on \
                PATH and is unavailable when explicitly disabled; telegram reports whether \
                gateway.yml has bot_token/chat_id configured, not whether Telegram is \
                currently reachable."

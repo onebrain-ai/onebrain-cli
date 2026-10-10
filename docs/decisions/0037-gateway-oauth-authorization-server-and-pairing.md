@@ -34,5 +34,5 @@ Remote connector clients (the Claude app's custom connector) can talk to a serve
 - **No auth.** Rejected: the endpoint can write into the vault.
 - **A static bearer header or an edge access gate on `/mcp`.** Rejected: connector clients cannot send custom headers in the handshake. An edge gate is usable for admin paths only.
 - **JWT access tokens.** Rejected for the reasons above (same-process issuer and verifier, revocation, dependency graph).
-- **Confidential clients with a secret.** Rejected: the connectors register dynamically as public clients, and a stored secret would add nothing against the party that can read the user's files.
-- **Per-address pairing lockout.** Rejected (see trade-off above).
+- **Confidential clients with a secret.** Rejected: `/register` accepts only `token_endpoint_auth_method: none` and rejects any other method (a test covers `client_secret_basic`), and discovery advertises only `none`. The further argument that a stored secret would add nothing against someone who can read the user's files is our own reasoning (considered while writing this ADR).
+- **Per-address pairing lockout.** Rejected (see trade-off above; the attacker-with-many-addresses argument is also from the design notes on the onboarding lockout, not from a measurement).

@@ -8,12 +8,12 @@
 
 ## Context
 
-With the policy engine, a gated tool call can wait for a human. The gateway ran `rmcp` with `with_json_response(true)`, which returns one JSON body at the end, so a call waiting on an approval sent **zero bytes** until it was resolved. Behind a Cloudflare tunnel that fails: Cloudflare cuts a response that has not started within its limit (documented as 100 s idle and 125 s to first byte at the time of design), and the original default wait was 300 s. The Claude connector also abandons a tool call at 300 s.
+With the policy engine, a gated tool call can wait for a human. The gateway ran `rmcp` with `with_json_response(true)`, which returns one JSON body at the end, so a call waiting on an approval sent **zero bytes** until it was resolved. Behind a Cloudflare tunnel that fails: Cloudflare cuts a response that has not started within its limit (as documented by Cloudflare at the time, 2026-10: 100 s idle and 125 s to first byte), and the original default wait was 300 s. The Claude connector also abandons a tool call at 300 s.
 
 Evidence gathered before building (smoke test, 2026-10-09, real Claude connector through a quick tunnel):
 
 - A spike showed that emitting one non-terminal notification right after the approval is registered makes `rmcp` open an SSE stream: first byte after 6 ms instead of 70 s, a `:` keep-alive comment every 15 s, and the result on the same stream. `json_response` stays `true` for every other call.
-- Run 3 on home Wi-Fi held an approval for **240.8 s** and the client received the result, then continued on the same connection. So the connector accepts an SSE reply and ignores the notification and comments, Claude's tool timeout is above 240 s, and Cloudflare passes the stream.
+- Run 3 on home Wi-Fi (observed, 2026-10-09) held an approval for **240.8 s** with SSE keep-alives and the test passed: the client received the result, then continued on the same connection. So the connector accepts an SSE reply and ignores the notification and comments, Claude's tool timeout is above 240 s, and Cloudflare passes the stream.
 - Run 1 and 2 on a phone hotspot failed for an unrelated reason: `cloudflared` over QUIC could not reach the edge, did not fall back to HTTP/2 for more than two minutes (tunnel 530), and later held a single edge connection that dropped mid-wait. Forcing `--protocol http2` fixed the connectivity ([0042](0042-gateway-tunnel-and-launchagent-service.md)). It was not a keep-alive defect.
 - Run 2 also showed that after the client's request was cancelled the approval stayed approvable, and approving it still wrote the note although the client never got the result.
 

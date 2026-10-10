@@ -7,7 +7,7 @@
 ```
 src/
 ├── main.rs              argv → clap → dispatch; help-banner pre-pass; structured-mode error renderer
-├── cli.rs               clap command tree (Cli + Cmd) — 3 root verbs + 13 groups + 8 hidden v3.0 aliases
+├── cli.rs               clap command tree (Cli + Cmd) — 3 root verbs + 4 standalone + 13 groups + 8 hidden aliases
 ├── banner.rs            TTY-only branded wordmark banner + help-banner gating
 ├── exit.rs              CoreError → stable i32 exit-code mapping (walks anyhow chain)
 ├── vault_ctx.rs         CLI-side wiring for onebrain_core vault resolution (resolve/require/hook)
@@ -55,7 +55,7 @@ Binary entry point. `argv → help-banner pre-pass → Cli::parse() → dispatch
 **Connections** — calls: `banner::{argv_requests_help, emit_help_banner}`, `v31::dispatch::{dispatch, output_mode}`, `exit::exit_code_for`, `output::emit`; called by: OS process entry.
 
 ### `src/cli.rs`
-The entire clap surface, locked at v3.1 per spec §2.4. `Cli` (global flags + `command: Cmd`) and `Cmd` (3 root verbs + 24 resource groups + 8 hidden v3.0 aliases). Every group's verb list is a `Subcommand` enum even when unimplemented — the tree shape itself is the v3.1 deliverable.
+The entire clap surface, locked at v3.1 per spec §2.4. `Cli` (global flags + `command: Cmd`) and `Cmd` (3 root verbs (`init`, `update`, `doctor`) + 4 standalone commands (`completions`, `hook`, `mcp`, `serve`) + 13 resource groups (`daemon` hidden) + 8 hidden v3.0 aliases and a hidden `qmd` removal catcher). Every group's verb list is a `Subcommand` enum even when unimplemented — the tree shape itself is the v3.1 deliverable.
 **Key types**
 - `Cli` — global flags `--vault`, `--output {text,json,yaml,table,tsv}`, `--json`, `--yaml` (conflict), `--pretty`, `--no-color`, `--quiet`; all `global = true`.
 - `Cmd` — root: `Init/Update/Doctor`; visible groups: `Checkpoint/Harness/Plugin/Schedule/Session/Skill/Vault`; `hide = true` stub-only groups: `Avatar/Bookmark/Bundle/Config/Daemon/Date/Dream/Frontmatter/Gateway/Inbox/Log/Memory/Note/Pause/Serve/Task`; hidden aliases: `SessionInitAlias/OrphanScanAlias/QmdReindexAlias/RegisterHooksAlias/RegisterScheduleAlias/MigrateAlias/VaultSyncAlias/RunSkillAlias`; `Qmd` (removed v3.4.5) is now a hidden catch-all that emits a migration error rather than a visible group.
@@ -250,5 +250,5 @@ Hidden v3.0 aliases route through the same handlers after a one-time migration n
 
 ## Entry points
 - `fn main()` (`src/main.rs`) — process entry; help pre-pass → `Cli::parse()` → dispatch → `process::exit`.
-- The clap tree `Cli` / `Cmd` (`src/cli.rs`) — the entire parsed command surface (3 root verbs + 24 groups + 8 hidden aliases).
+- The clap tree `Cli` / `Cmd` (`src/cli.rs`) — the entire parsed command surface (3 root verbs (`init`, `update`, `doctor`) + 4 standalone commands (`completions`, `hook`, `mcp`, `serve`) + 13 resource groups (`daemon` hidden) + 8 hidden v3.0 aliases and a hidden `qmd` removal catcher).
 - `v31::dispatch::dispatch(cli: Cli) -> Result<()>` (`src/v31/dispatch.rs`) — the command dispatcher that fans every `Cmd` variant out to its handler.
