@@ -1032,7 +1032,7 @@ fn a_capture_is_approved_from_telegram_end_to_end() {
         .as_str()
         .unwrap_or_else(|| panic!("editMessageText had no text field: {edit_body}"));
     assert!(
-        edit_text.starts_with("✅ Allowed · saved \"Telegram E2E"),
+        edit_text.starts_with("✅ Allowed · \"Telegram E2E"),
         "{edit_text}"
     );
     assert_eq!(
