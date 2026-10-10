@@ -52,6 +52,43 @@ Taking `onebrain doctor --json` as the worked example:
 
 The same shape holds for every command: **parse → resolve → do work in a library crate → render in the binary.** The library never decides output format; the binary never decides business logic.
 
+## The gateway process (v3.5)
+
+`onebrain gateway run` is a second long-lived process in the same binary ([ADR 0036](decisions/0036-remote-mcp-gateway-separate-process.md)). It is the only surface meant to be reachable from outside, and it lives entirely in `onebrain-cli` (`src/commands/gateway/`, see the [module map](reference/onebrain-cli.md#srccommandsgateway)).
+
+```
+ Claude app (phone)
+      │ HTTPS
+      ▼
+ Cloudflare edge ──▶ cloudflared (LaunchAgent, outbound-only tunnel)
+                          │ http://127.0.0.1:7717   (original Host forwarded)
+                          ▼
+ onebrain gateway run  (LaunchAgent, binds 127.0.0.1 only)
+   ├─ host_guard      Host / Origin / proxy-header checks on every route
+   ├─ /.well-known/*, /register, /authorize, /token     OAuth 2.1 server  (oauth_routes, auth/)
+   ├─ /mcp            bearer middleware ▶ rmcp streamable HTTP ▶ GatewayServer (Brain pack)
+   │                      └─ policy gate ▶ approval registry ▶ audit log
+   ├─ /approvals      loopback-only operator page
+   └─ approval channels: macOS dialog · /approvals · Telegram bot
+                          │ loopback HTTP
+                          ▼
+              per-vault warm daemon (unchanged, ADR 0033)  ·  vault files
+```
+
+Request path for a gated write such as `brain_capture`: `host_guard` → bearer check (scope covers the pack) → policy class and mode → if approval is needed, register a pending approval, open an SSE stream with keep-alives ([ADR 0039](decisions/0039-gateway-approval-keepalive-and-wait-clamp.md)) and prompt every configured channel → first answer wins → run the tool → append one audit line. Reads go through the same gate with mode `auto`. `brain_search` is always routed to the vault's daemon; the gateway never opens a search engine itself.
+
+**State.** Config is `~/.onebrain/gateway.yml` (machine-level, read once at startup). Runtime data lives under `~/.onebrain/gateway/`, directory `0700`, files `0600`:
+
+| Path | Contents |
+|---|---|
+| `clients.json`, `codes.json`, `tokens.json`, `pairing.json` | OAuth clients, pending authorization codes, access and refresh token records, the pairing code. |
+| `auth.lock` | Advisory lock held across every read-modify-write of the four files ([ADR 0041](decisions/0041-gateway-auth-store-lock-and-toctou-recheck.md)). |
+| `audit/YYYY-MM.jsonl` | Append-only audit log, one redacted JSON line per tool call. |
+| `tunnel.token` | The Cloudflare tunnel token, written by `gateway tunnel setup`. |
+| `telegram-<hash>.offset` | Telegram `getUpdates` cursor, keyed by a hash of the bot token. |
+
+On macOS, `gateway service install` also writes `~/Library/LaunchAgents/com.onebrain.gateway.plist` and `com.onebrain.gateway-tunnel.plist`, with logs in `~/Library/Logs/onebrain/` ([ADR 0042](decisions/0042-gateway-tunnel-and-launchagent-service.md)).
+
 ## Why `publish = false`
 
 Workspace inheritance keeps `[workspace.package]` fields (`version`, `edition`, `license`, `repository`) in one place. The workspace root sets `publish = false` and every crate inherits it via `publish.workspace = true`. The library crates are implementation detail, not a public Rust API — only the compiled `onebrain` binary is a product. This keeps us free to refactor crate boundaries without semver obligations to crates.io consumers, and it reflects the Path-B product boundary (Studio spawns the binary as a sidecar rather than importing these crates). With the workspace now permissively licensed (`MIT OR Apache-2.0`), that boundary is a product/architecture choice — no longer forced by copyleft as it was under AGPL.
@@ -76,6 +113,7 @@ Figures are the v3.0.0 rewrite-milestone dogfood (against the v2.3.3 Bun CLI). T
 
 ## Where to go next
 
+- The gateway's setup, config and security model: [`gateway.md`](gateway.md).
 - The *why* behind specific choices: [`decisions/`](decisions/).
 - The Rust idioms these crates use: [`rust-patterns.md`](rust-patterns.md).
 - Crate-by-crate source map, plus the [`onebrain mcp` API reference](reference/mcp.md): [`reference/`](reference/).
