@@ -445,6 +445,8 @@ use std::sync::{Arc, Mutex};
 struct Recorded {
     method: String,
     body: Value,
+    /// Read only by the unix-only shutdown test.
+    #[cfg(unix)]
     done_at: Instant,
 }
 
@@ -474,6 +476,8 @@ impl MockState {
             .push_back(body);
     }
 
+    /// Used only by the unix-only shutdown test.
+    #[cfg(unix)]
     fn set_delay(&self, method: &str, d: Duration) {
         self.delays.lock().unwrap().insert(method.to_string(), d);
     }
@@ -507,6 +511,7 @@ async fn mock_handler(
     state.requests.lock().unwrap().push(Recorded {
         method: method.clone(),
         body,
+        #[cfg(unix)]
         done_at: Instant::now(),
     });
     let queued = state
