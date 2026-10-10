@@ -1160,14 +1160,17 @@ fn with_retry_after(mut resp: Response) -> Response {
     resp
 }
 
-/// The response when a handler's `spawn_blocking` store task panicked or
-/// was cancelled. Handlers run their store work on `spawn_blocking` (#428):
-/// a store call can wait up to `LOCK_WAIT` on `auth.lock`, and doing that on
-/// a runtime worker would starve every other request (SSE keep-alives
-/// included) on it.
-fn store_task_failed(e: tokio::task::JoinError) -> Response {
-    tracing::error!(error = %e, "gateway auth store task failed");
-    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+/// Run a handler's store work on `spawn_blocking` (#428): a store call can
+/// wait up to `LOCK_WAIT` on `auth.lock`, and doing that on a runtime worker
+/// would starve every other request (SSE keep-alives included) on it.
+async fn off_worker<F>(work: F) -> Response
+where
+    F: FnOnce() -> Response + Send + 'static,
+{
+    tokio::task::spawn_blocking(work).await.unwrap_or_else(|e| {
+        tracing::error!(error = %e, "gateway auth store task failed");
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })
 }
 
 /// The in-page error the brief calls "400 error page, NEVER redirect" —
@@ -1313,9 +1316,7 @@ async fn authorize_get_handler(
     State(ctx): State<Arc<AuthCtx>>,
     Query(params): Query<AuthorizeParams>,
 ) -> Response {
-    tokio::task::spawn_blocking(move || authorize_get(&ctx, &params))
-        .await
-        .unwrap_or_else(store_task_failed)
+    off_worker(move || authorize_get(&ctx, &params)).await
 }
 
 fn authorize_get(ctx: &AuthCtx, params: &AuthorizeParams) -> Response {
@@ -1397,9 +1398,7 @@ async fn authorize_post_handler(
             "This authorization request did not come from the gateway's own consent page.",
         );
     }
-    tokio::task::spawn_blocking(move || authorize_post(&ctx, &params))
-        .await
-        .unwrap_or_else(store_task_failed)
+    off_worker(move || authorize_post(&ctx, &params)).await
 }
 
 /// The store-touching part of [`authorize_post_handler`] (steps 1–3), run
@@ -1757,13 +1756,12 @@ fn token_refresh_grant(ctx: &AuthCtx, req: &TokenRequest) -> Response {
 /// parse a body. There is no bespoke content-type check to write or get
 /// wrong here.
 async fn token_handler(State(ctx): State<Arc<AuthCtx>>, Form(req): Form<TokenRequest>) -> Response {
-    tokio::task::spawn_blocking(move || match req.grant_type.as_deref() {
+    off_worker(move || match req.grant_type.as_deref() {
         Some("authorization_code") => token_authorization_code_grant(&ctx, &req),
         Some("refresh_token") => token_refresh_grant(&ctx, &req),
         _ => token_error(StatusCode::BAD_REQUEST, "unsupported_grant_type"),
     })
     .await
-    .unwrap_or_else(store_task_failed)
 }
 
 /// The `POST /token` route as its own small `Router` — mirrors
