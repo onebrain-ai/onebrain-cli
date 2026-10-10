@@ -142,21 +142,16 @@ pub struct PendingApproval {
     pub client_id: String,
     pub tool: String,
     /// The vault the call named (its own `vault` argument), or `None` for
-    /// the default resolution chain — carried so that resolving this
-    /// approval records the SAME [`super::policy::GrantKey`] the waiter
-    /// would (`approval_routes::resolve_approval` and
-    /// `server::await_approval` must not disagree about a grant's scope).
-    /// Not a secret: it is a `gateway.yml` vault NAME, never a host path,
+    /// the default resolution chain — the scope the operator is asked to
+    /// approve (the waiter's [`super::policy::GrantKey`] uses the same
+    /// value). Not a secret: it is a `gateway.yml` vault NAME, never a host path,
     /// and the operator is already shown it inside `summary`.
     pub vault: Option<String>,
     pub summary: String,
     pub created: u64,
     pub expires: u64,
-    /// The [`RiskClass`] this call was gated at — recorded so a
-    /// `Decision::Approve` resolution knows which `(client, class)` grant to
-    /// record via [`super::policy::Grants::record`] (Task 2 review's binding
-    /// requirement A — see `approval_routes::resolve_approval`'s doc
-    /// comment for the actual wiring). Not a secret: an operator reviewing
+    /// The [`RiskClass`] this call was gated at (the waiter records the
+    /// matching grant on an Allow — `server::await_approval`). Not a secret: an operator reviewing
     /// the pending list benefits from seeing exactly what class of access is
     /// being asked for, same as `tool`/`summary`.
     pub class: RiskClass,
@@ -173,12 +168,6 @@ pub struct PendingApproval {
     /// also covers repeat calls for `policy.grant_ttl_minutes`. Shown so the
     /// approver knows why the next call may not prompt.
     pub grant_minutes: Option<u64>,
-    /// The waiting call's token family ([`super::auth::Principal::family`]),
-    /// so a `/approvals` Allow records the SAME family-scoped
-    /// [`super::policy::GrantKey`] the waiter would (#427). Never
-    /// serialized: `GET /approvals`'s body keeps exactly its 11 fields.
-    #[serde(skip)]
-    pub family: String,
 }
 
 /// Longest client name (in chars) shown to an approver before an ellipsis.
@@ -282,8 +271,9 @@ pub fn client_id_short(id: &str) -> String {
 /// DIFFERENT type from `audit::Decision` (`Auto`/`Approved`/`Denied`/
 /// `TimedOut`, an OUTCOME record) even though the names echo each
 /// other: this is the human's raw INPUT (`Approve`/`Deny`), which
-/// `approval_routes::resolve_approval` translates into effects (waking the
-/// waiter, and on `Approve`, recording a [`super::policy::Grants`] entry).
+/// every channel hands to [`Approvals::resolve`] to wake the waiter, which
+/// alone turns an `Approve` into effects (the write, and a
+/// [`super::policy::Grants`] entry) after its revocation check.
 /// Always qualify as `approval::Decision` at any use site that also sees
 /// `audit::Decision`, so the two can't be confused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -724,7 +714,6 @@ mod tests {
             client_name: None,
             subject: Default::default(),
             grant_minutes: None,
-            family: "fam-1".to_string(),
         }
     }
 

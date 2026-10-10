@@ -451,6 +451,7 @@ struct Recorded {
 #[derive(Clone, Default)]
 struct MockState {
     responses: Arc<Mutex<HashMap<String, Value>>>,
+    queued: Arc<Mutex<HashMap<String, std::collections::VecDeque<Value>>>>,
     delays: Arc<Mutex<HashMap<String, Duration>>>,
     requests: Arc<Mutex<Vec<Recorded>>>,
 }
@@ -461,6 +462,16 @@ impl MockState {
             .lock()
             .unwrap()
             .insert(method.to_string(), body);
+    }
+
+    /// A one-shot response for `method`, served before the scripted one.
+    fn queue_response(&self, method: &str, body: Value) {
+        self.queued
+            .lock()
+            .unwrap()
+            .entry(method.to_string())
+            .or_default()
+            .push_back(body);
     }
 
     fn set_delay(&self, method: &str, d: Duration) {
@@ -498,7 +509,13 @@ async fn mock_handler(
         body,
         done_at: Instant::now(),
     });
-    let scripted = state.responses.lock().unwrap().get(&method).cloned();
+    let queued = state
+        .queued
+        .lock()
+        .unwrap()
+        .get_mut(&method)
+        .and_then(|q| q.pop_front());
+    let scripted = queued.or_else(|| state.responses.lock().unwrap().get(&method).cloned());
     Json(scripted.unwrap_or_else(|| serde_json::json!({ "ok": true, "result": null })))
 }
 
@@ -602,6 +619,7 @@ struct Harness {
     token_url: String,
     client_id: String,
     access_token: String,
+    refresh_token: String,
     home: tempfile::TempDir,
     vault: tempfile::TempDir,
     _cache: tempfile::TempDir,
@@ -610,14 +628,14 @@ struct Harness {
 
 /// Authorize `client_id` with the sandbox's pairing code and redeem the
 /// code: one fresh consent, hence one fresh token family. Returns the
-/// access token (never printed).
+/// `(access, refresh)` tokens (never printed).
 fn consent(
     agent: &ureq::Agent,
     home: &Path,
     authorize_url: &str,
     token_url: &str,
     client_id: &str,
-) -> String {
+) -> (String, String) {
     let (verifier, challenge) = pkce_pair();
     let pairing = read_pairing_code(home);
     let params = [
@@ -649,9 +667,27 @@ fn consent(
     );
     assert_eq!(status, 200, "token exchange failed");
     let tokens: Value = serde_json::from_str(&token_body).expect("token response JSON");
+    let field = |k: &str| {
+        tokens[k]
+            .as_str()
+            .unwrap_or_else(|| panic!("no {k} in the token response"))
+            .to_string()
+    };
+    (field("access_token"), field("refresh_token"))
+}
+
+/// Rotate `refresh` (same token family); returns the new access token.
+fn refresh_access(token_url: &str, refresh: &str) -> String {
+    let (status, body) = post_token(
+        &http_agent(),
+        token_url,
+        &[("grant_type", "refresh_token"), ("refresh_token", refresh)],
+    );
+    assert_eq!(status, 200, "refresh rotation failed");
+    let tokens: Value = serde_json::from_str(&body).expect("refresh response JSON");
     tokens["access_token"]
         .as_str()
-        .expect("an access_token in the token response")
+        .expect("an access_token in the refresh response")
         .to_string()
 }
 
@@ -712,7 +748,8 @@ fn spawn_and_authenticate(mock_base: &str, bot_token: &str) -> Harness {
         .expect("client_id")
         .to_string();
 
-    let access_token = consent(&agent, home.path(), &authorize_url, &token_url, &client_id);
+    let (access_token, refresh_token) =
+        consent(&agent, home.path(), &authorize_url, &token_url, &client_id);
     let (status, init) = post_mcp(
         &agent,
         &mcp_url,
@@ -730,6 +767,7 @@ fn spawn_and_authenticate(mock_base: &str, bot_token: &str) -> Harness {
         token_url,
         client_id,
         access_token,
+        refresh_token,
         home,
         vault,
         _cache: cache,
@@ -1026,7 +1064,7 @@ fn an_ask_once_grant_is_not_reused_after_revoke_client_and_reconsent() {
         h.home.path(),
         &["gateway", "tokens", "revoke", "--client", &h.client_id],
     );
-    let fresh = consent(
+    let (fresh, _) = consent(
         &http_agent(),
         h.home.path(),
         &h.authorize_url,
@@ -1045,6 +1083,79 @@ fn an_ask_once_grant_is_not_reused_after_revoke_client_and_reconsent() {
     let message = error_message(call.join().unwrap());
     assert!(message.contains("denied"), "{message}");
     assert_exits_after_kill(&mut h.child.0);
+}
+
+/// Grant/revocation parity across channels: after a single-token
+/// `tokens revoke <access-id>` (the family survives — the client can still
+/// refresh), an Allow that arrives anyway must leave NO grant behind,
+/// whichever channel delivered it. Otherwise the next call — made with a
+/// refreshed token of the same family — would be auto-allowed by that grant
+/// and the revoke defeated. `allow` delivers the Allow for pending `id`.
+fn assert_an_allow_after_a_single_token_revoke_leaves_no_grant(
+    message_id: i64,
+    allow: impl FnOnce(&Harness, &MockState, &str),
+) {
+    let (mock_state, mock) = mock_with_send(message_id);
+    let mut h = spawn_and_authenticate(&mock.base, "grant-parity-bot-token");
+    let call = start_capture(&h, &h.access_token, "Revoked Then Allowed");
+    let id = wait_for_one_pending(&h);
+    wait_for_request(&mock_state, "sendMessage", Duration::from_secs(10));
+
+    let access_id = display_id(&h.access_token);
+    onebrain_cli(h.home.path(), &["gateway", "tokens", "revoke", &access_id]);
+    allow(&h, &mock_state, &id);
+    let message = error_message(call.join().unwrap());
+    assert!(message.contains("access was revoked"), "{message}");
+    assert_eq!(
+        inbox_note_count(h.vault.path()),
+        0,
+        "nothing may be written"
+    );
+
+    // Same family, fresh access token: the client is asked again.
+    let refreshed = refresh_access(&h.token_url, &h.refresh_token);
+    let call = start_capture(&h, &refreshed, "After The Revoke");
+    let id = wait_for_one_pending(&h);
+    assert_eq!(
+        inbox_note_count(h.vault.path()),
+        0,
+        "a grant recorded by the revoked Allow let the next call through"
+    );
+    assert_eq!(resolve(&h, &id, "deny").0, 200);
+    assert!(error_message(call.join().unwrap()).contains("denied"));
+    assert_exits_after_kill(&mut h.child.0);
+}
+
+#[test]
+fn an_http_allow_after_a_single_token_revoke_leaves_no_grant() {
+    assert_an_allow_after_a_single_token_revoke_leaves_no_grant(4274, |h, _, id| {
+        let (status, body) = resolve(h, id, "approve");
+        assert_eq!(status, 200, "the approval was still pending: {body}");
+    });
+}
+
+#[test]
+fn a_telegram_allow_after_a_single_token_revoke_leaves_no_grant() {
+    assert_an_allow_after_a_single_token_revoke_leaves_no_grant(4275, |h, mock, id| {
+        mock.queue_response(
+            "getUpdates",
+            serde_json::json!({
+                "ok": true,
+                "result": [{
+                    "update_id": 7001,
+                    "callback_query": {
+                        "id": "cb-allow-after-revoke",
+                        "from": { "id": CHAT_ID },
+                        "message": { "chat": { "id": CHAT_ID } },
+                        "data": format!("a:{id}"),
+                    }
+                }]
+            }),
+        );
+        // The tap reached the gateway (it answers the callback).
+        wait_for_request(mock, "answerCallbackQuery", Duration::from_secs(10));
+        let _ = h;
+    });
 }
 
 // ── #430 ──────────────────────────────────────────────────────────────────

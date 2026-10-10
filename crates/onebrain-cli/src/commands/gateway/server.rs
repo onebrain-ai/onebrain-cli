@@ -1323,27 +1323,20 @@ async fn outcome_on_revoke(
 ///    `Approvals` are only ever touched through their own
 ///    lock-do-one-thing-drop-the-guard methods, called either strictly
 ///    BEFORE or strictly AFTER the `.await`, never straddling it.
-/// 4. On `Decision::Approve`: record a [`Grants`] entry for `(client_id,
-///    vault, class)` — config-derived TTL (`grant_ttl_minutes * 60`,
-///    mirroring
-///    `approval_routes::resolve_approval`'s own identical calculation for
-///    the HTTP resolution channel) — so a second `ask_once` call from the
-///    same client, same vault, same risk class, within that TTL, satisfies
-///    `decide` via `Grants::has` and never reaches this function at all.
-///    Nothing is recorded under `PolicyMode::AskAlways`: `decide` ignores
-///    grants in that mode anyway, but "always ask" must never be capable of
-///    leaving standing consent behind for a later refactor to start
-///    honoring (`approval_routes::resolve_approval` carries the same
-///    guard). Recording it
-///    HERE (not only in `approval_routes::resolve_approval`) is deliberate:
-///    that HTTP-channel recording only fires when an operator resolves
-///    through `/approvals`, but an approval can equally arrive through the
-///    native dialog channel, which never touches `approval_routes.rs` at
-///    all — recording the grant in the WAITER, once, regardless of which
-///    channel produced the decision, is the only way both channels reliably
-///    honor "ask once". A second write to the same `(client, class)` key
-///    from the HTTP channel (when that IS how it was resolved) is
-///    idempotent — `Grants::record` replaces, never accumulates. Gateway PR
+/// 4. On `Decision::Approve` that survives the Allow-time revocation check
+///    (#427): record a [`Grants`] entry for `(client_id, family, vault,
+///    class)` — config-derived TTL (`grant_ttl_minutes * 60`) — so a second
+///    `ask_once` call from the same consent, same vault, same risk class,
+///    within that TTL, satisfies `decide` via `Grants::has` and never
+///    reaches this function at all. Nothing is recorded under
+///    `PolicyMode::AskAlways`: `decide` ignores grants in that mode anyway,
+///    but "always ask" must never be capable of leaving standing consent
+///    behind for a later refactor to start honoring. This is the ONLY place
+///    a grant is recorded, for every channel (HTTP, native, Telegram): no
+///    channel records at click time, because a click can land after the
+///    credential was revoked, and a grant recorded then would outlive the
+///    revoke (after a single-token revoke the family lives on through a
+///    refresh). Gateway PR
 ///    5, Task 3: this is also where `Ok`'s `channel` is born — the SAME
 ///    `ResolvedVia` [`WaitOutcome::Decided`] carried, reported back to
 ///    `policy_gate`'s caller for `record_audit`. Task 4: also where
@@ -1390,7 +1383,6 @@ async fn await_approval(
         subject: call.subject.clone(),
         grant_minutes: (state.config.policy.mode_for(class) == PolicyMode::AskOnce)
             .then_some(state.config.policy.grant_ttl_minutes),
-        family: principal.family.clone(),
     };
     let id = pending.id.clone();
     let rx = match state.approvals.register(pending.clone()) {
@@ -5739,6 +5731,7 @@ mod tests {
             !state.grants.has(&grant),
             "a revoked Allow records no grant"
         );
+        assert_eq!(state.grants.len(), 0, "nor any other grant");
         let entries = read_audit_entries(dir.path());
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["decision"], "denied", "{entries:?}");
@@ -6037,7 +6030,6 @@ mod tests {
                         client_name: None,
                         subject: Default::default(),
                         grant_minutes: None,
-                        family: "fam-1".to_string(),
                     })
                     .unwrap_or_else(|e| panic!("filler {i} must fit under the cap: {e:?}")),
             );
@@ -6137,7 +6129,6 @@ mod tests {
                 client_name: None,
                 subject: Default::default(),
                 grant_minutes: None,
-                family: "fam-1".to_string(),
             }
         };
         let deny = approval::Decision::Deny;

@@ -422,7 +422,6 @@ mod tests {
             client_name: Some("Claude".to_string()),
             subject: ApprovalSubject::new(Some("ทดสอบ approve จากมือถือ 1"), Some(25)),
             grant_minutes: None,
-            family: "fam-1".to_string(),
         }
     }
 

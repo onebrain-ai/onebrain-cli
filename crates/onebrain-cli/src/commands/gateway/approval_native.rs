@@ -493,7 +493,6 @@ mod tests {
             client_name: None,
             subject: Default::default(),
             grant_minutes: None,
-            family: "fam-1".to_string(),
         }
     }
 

@@ -367,14 +367,20 @@ impl Grants {
             .is_some_and(|&expires| expires > now_epoch_secs())
     }
 
+    /// How many grants are recorded (live or expired) — for tests that
+    /// must prove a path recorded NOTHING, whatever the key.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).len()
+    }
+
     /// Record (or replace) a grant for `key`, expiring `ttl_secs` from now.
     ///
-    /// First given a real production caller by Gateway PR 4, Task 3:
-    /// `approval_routes::resolve_approval` calls this on every
-    /// `approval::Decision::Approve` resolution, using a config-derived TTL
-    /// (`PolicyConfig::grant_ttl_minutes * 60`) rather than a test's
-    /// hardcoded value — see that function's doc comment. `decide` only
-    /// ever READS grants via [`Self::has`]; this is the only writer.
+    /// The one production caller is `server::await_approval`'s Allow path,
+    /// after its Allow-time revocation check (#427) — for every approval
+    /// channel; no channel records its own. It uses a config-derived TTL
+    /// (`PolicyConfig::grant_ttl_minutes * 60`). `decide` only ever READS
+    /// grants via [`Self::has`]; this is the only writer.
     ///
     /// Uses `saturating_add`, not a bare `+` (Task 2 review, binding
     /// requirement A) — now that a production caller can pass an
