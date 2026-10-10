@@ -2,7 +2,7 @@
 
 - **Status:** accepted
 - **Date:** 2026-10
-- **Follows:** [0038](0038-gateway-policy-engine-and-human-approvals.md), [0039](0039-gateway-approval-keepalive-and-wait-clamp.md) (revisits both), [0044](0044-gateway-auth-store-bounded-lock-and-atomic-exchange.md).
+- **Follows:** [0038](0038-gateway-policy-engine-and-human-approvals.md), [0039](0039-gateway-approval-keepalive-and-wait-clamp.md) (revisits both), [0041](0041-gateway-auth-store-lock-and-toctou-recheck.md) (a revoke now reaches waiting calls), [0044](0044-gateway-auth-store-bounded-lock-and-atomic-exchange.md).
 - **PRs:** [#441](https://github.com/onebrain-ai/onebrain-cli/pull/441); issues #427, #430.
 
 ## Context

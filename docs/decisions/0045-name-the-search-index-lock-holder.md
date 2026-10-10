@@ -16,10 +16,10 @@ The search collection's lock is a redb exclusive open, so a process that loses t
 - **When a loser names the holder.** Only when the record's pid is alive right now (on platforms that can probe it), the pid is not the loser's own, and the role is one we write. The version is shown only if it is short printable ASCII.
   - Same version: "… in use by onebrain mcp 3.5.1 (pid N) — retry once it releases the lock".
   - Holder older than ours: "… — from before an upgrade, <hint>".
-  - Newer, or a version that is not plain dotted numbers: "… — a different onebrain version, <hint>" (we do not guess "before an upgrade").
+  - Newer, or a version that is not plain dotted numbers: "… — a different onebrain version (<v>), <hint>" (we do not guess "before an upgrade"; the parenthesised version is omitted when it is not clean).
   - Hint by role: an `mcp` holder says to restart that agent session (Claude Code / Codex / Gemini); a `daemon` holder says `onebrain daemon stop --vault <vault>` when the vault is known (plain `onebrain daemon stop` inside the vault otherwise); anything else says to stop that process.
   - No record, a dead pid, our own pid, an unknown role, or a platform with no liveness probe: the generic "the search index is in use by another onebrain process; if you just upgraded, restart open agent sessions (Claude Code / Codex / Gemini)".
-- **Where it shows.** The daemon's log, the daemon client's error (so the gateway log and routed CLI verbs), `search status` (text hint and `W_ENGINE_BUSY` warning; the holder is not in the JSON, so there is no wire change), `doctor` (the `search` and `lex-index` rows), and the direct CLI open path. The client-visible gateway `brain_search` error stays the sanitized "search backend unavailable — see gateway logs"; the holder appears only in the gateway log.
+- **Where it shows.** The daemon's log, the daemon client's error (so the gateway log and routed CLI verbs), `search status` (text hint and `W_ENGINE_BUSY` warning; the holder is not a JSON field, only text in the warning message, so the schema is unchanged), `doctor` (the `search` and `lex-index` rows), and the direct CLI open path. The client-visible gateway `brain_search` error stays the sanitized "search backend unavailable — see gateway logs"; the holder appears only in the gateway log.
 - **Upgrade docs.** Because the commonest cause is an upgrade, `docs/install.md` now tells users to restart open agent sessions and stop old daemons after upgrading.
 
 ## Consequences

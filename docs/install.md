@@ -63,7 +63,7 @@ After any path, a post-install guard runs `onebrain --version` from PATH and con
 Processes that were already running keep the old binary in memory, and they may still hold the search index. After an upgrade:
 
 1. Restart your open agent sessions (Claude Code / Codex / Gemini), so each one starts a fresh `onebrain mcp`.
-2. Stop daemons left over from the old version: `onebrain daemon stop --vault <vault>`. A daemon can outlive the `onebrain mcp` that started it (seen with a 3.5.0 `mcp` that exited and left its daemon running).
+2. Stop daemons left over from the old version: `onebrain daemon stop --vault <vault>`. A daemon started by an older `onebrain mcp` can keep running after that `mcp` exits (observed during v3.5.1 testing with 3.5.0).
 
 If you skip this, a search can fail with "the search index is in use by …" and, from v3.5.1, the message names the process and says which of the two steps to take. See [ADR 0045](decisions/0045-name-the-search-index-lock-holder.md).
 
