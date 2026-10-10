@@ -173,6 +173,12 @@ pub struct PendingApproval {
     /// also covers repeat calls for `policy.grant_ttl_minutes`. Shown so the
     /// approver knows why the next call may not prompt.
     pub grant_minutes: Option<u64>,
+    /// The waiting call's token family ([`super::auth::Principal::family`]),
+    /// so a `/approvals` Allow records the SAME family-scoped
+    /// [`super::policy::GrantKey`] the waiter would (#427). Never
+    /// serialized: `GET /approvals`'s body keeps exactly its 11 fields.
+    #[serde(skip)]
+    pub family: String,
 }
 
 /// Longest client name (in chars) shown to an approver before an ellipsis.
@@ -319,11 +325,17 @@ pub enum ResolvedVia {
     /// The client went away while its call waited (`server::await_approval`
     /// saw the request's cancellation token fire) — smoke V F2.
     Disconnect,
+    /// The waiting call's own credential was revoked while it waited
+    /// (`tokens revoke`, `tokens revoke --client`, `clients remove`) — the
+    /// waiter's periodic or Allow-time check in `server::await_approval`
+    /// (#427). Always a denial.
+    Revoked,
 }
 
 impl ResolvedVia {
     /// The exact lowercase string `audit::AuditEntry::channel` records —
-    /// `"http"`, `"native"`, `"telegram"`, `"shutdown"`, or `"disconnect"`.
+    /// `"http"`, `"native"`, `"telegram"`, `"shutdown"`, `"disconnect"`, or
+    /// `"revoked"`.
     pub fn as_str(self) -> &'static str {
         match self {
             ResolvedVia::Http => "http",
@@ -331,6 +343,7 @@ impl ResolvedVia {
             ResolvedVia::Telegram => "telegram",
             ResolvedVia::Shutdown => "shutdown",
             ResolvedVia::Disconnect => "disconnect",
+            ResolvedVia::Revoked => "revoked",
         }
     }
 }
@@ -711,6 +724,7 @@ mod tests {
             client_name: None,
             subject: Default::default(),
             grant_minutes: None,
+            family: "fam-1".to_string(),
         }
     }
 
@@ -762,6 +776,7 @@ mod tests {
             ResolvedVia::Native,
             ResolvedVia::Telegram,
             ResolvedVia::Shutdown,
+            ResolvedVia::Revoked,
         ] {
             let approvals = Approvals::new();
             let rx = approvals.register(sample("a1")).unwrap();
@@ -782,6 +797,7 @@ mod tests {
         assert_eq!(ResolvedVia::Telegram.as_str(), "telegram");
         assert_eq!(ResolvedVia::Shutdown.as_str(), "shutdown");
         assert_eq!(ResolvedVia::Disconnect.as_str(), "disconnect");
+        assert_eq!(ResolvedVia::Revoked.as_str(), "revoked");
     }
 
     // ── timeout path: TimedOut + entry dropped from pending ─────────────

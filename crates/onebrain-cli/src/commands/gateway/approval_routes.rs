@@ -167,8 +167,8 @@ struct ResolveResponse {
 /// [`super::policy::Grants::record`] (Task 2 review, binding requirement A)
 /// — using a config-derived TTL (`PolicyConfig::grant_ttl_minutes * 60`),
 /// not a test's hardcoded value. Approving one call grants the SAME
-/// `(client, vault, class)` triple every subsequent `ask_once` call until
-/// that grant expires — that is the entire point of `ask_once` vs.
+/// `(client, token family, vault, class)` key every subsequent `ask_once`
+/// call until that grant expires — that is the entire point of `ask_once` vs.
 /// `ask_always` (see `policy.rs`'s decision table doc comment). A
 /// `Decision::Deny` records nothing: denial is never "ask less often next
 /// time."
@@ -181,8 +181,8 @@ struct ResolveResponse {
 /// is a trap for the next refactor of `decide`. `server::await_approval`
 /// applies the identical guard on the waiter side.
 ///
-/// The pending entry's `client_id`/`vault`/`class` are snapshotted from
-/// [`super::approval::Approvals::list`] BEFORE calling
+/// The pending entry's `client_id`/`family`/`vault`/`class` are snapshotted
+/// from [`super::approval::Approvals::list`] BEFORE calling
 /// [`super::approval::Approvals::resolve`], because `resolve` REMOVES the
 /// entry as part of its own first-responder-wins contract (see that
 /// method's doc comment) — this is the last point that information is still
@@ -220,9 +220,10 @@ async fn resolve_approval(
         if let Some(p) = snapshot {
             if state.config.policy.mode_for(p.class) != PolicyMode::AskAlways {
                 let ttl_secs = state.config.policy.grant_ttl_minutes.saturating_mul(60);
-                state
-                    .grants
-                    .record(GrantKey::new(p.client_id, p.vault, p.class), ttl_secs);
+                state.grants.record(
+                    GrantKey::new(p.client_id, p.family, p.vault, p.class),
+                    ttl_secs,
+                );
             }
         }
     }
@@ -280,6 +281,7 @@ mod tests {
             client_name: None,
             subject: Default::default(),
             grant_minutes: None,
+            family: "fam-1".to_string(),
         }
     }
 
@@ -668,7 +670,12 @@ mod tests {
         pending.class = RiskClass::Mutating;
         let _rx = state.approvals.register(pending).unwrap();
 
-        let key = GrantKey::new("client-x", Some("t1".to_string()), RiskClass::Mutating);
+        let key = GrantKey::new(
+            "client-x",
+            "fam-1",
+            Some("t1".to_string()),
+            RiskClass::Mutating,
+        );
         assert!(!state.grants.has(&key), "no grant before approval");
 
         let resp = post_resolve(&router, "a1", Some(&code), "approve").await;
@@ -705,6 +712,7 @@ mod tests {
         assert!(
             !state.grants.has(&GrantKey::new(
                 "client-z",
+                "fam-1",
                 Some("t1".to_string()),
                 RiskClass::Destructive
             )),
@@ -746,6 +754,7 @@ mod tests {
         assert!(
             !state.grants.has(&GrantKey::new(
                 "client-y",
+                "fam-1",
                 Some("t1".to_string()),
                 RiskClass::Mutating
             )),

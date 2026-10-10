@@ -63,6 +63,7 @@ use crate::commands::gateway::approval_view;
 use crate::commands::gateway::audit::{AuditEntry, AuditLog, Decision, Outcome};
 use crate::commands::gateway::auth::core::{mint_secret_32, now_epoch_secs};
 use crate::commands::gateway::auth::middleware::require_bearer;
+use crate::commands::gateway::auth::store::TokenStatus;
 use crate::commands::gateway::auth::Principal;
 use crate::commands::gateway::host_guard::{self, require_allowed_host, HostGuard};
 use crate::commands::gateway::oauth_routes::{
@@ -1200,6 +1201,90 @@ async fn outcome_on_disconnect(
     }
 }
 
+/// How often a call waiting for approval re-checks that its own credential
+/// was not revoked meanwhile (#427) — see [`credential_revoked`].
+const REVOCATION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Whether the credential behind `principal` was revoked since its request
+/// passed the Bearer gate (#427). "Revoked" means exactly one of:
+///
+/// - the presented token's `tokens list` status is
+///   [`TokenStatus::Revoked`] (`tokens revoke <id>`, `tokens revoke
+///   --client`, `--family`), or
+/// - its client is no longer registered (`clients remove`).
+///
+/// A token that merely EXPIRED is not revoked: an access token lives 1 h
+/// and a wait can last 270 s, so a call that started on a live token may
+/// see it expire mid-wait without anyone having withdrawn consent.
+///
+/// No IPC with the CLI: like `require_bearer`, this re-reads the store's
+/// files (read-only, no `auth.lock`) on `spawn_blocking`. A store that
+/// cannot be read is NOT treated as revoked — it is logged, and the call
+/// keeps waiting for its human answer; the next request still fails closed
+/// at the Bearer gate. With no auth context (unit-test fixtures that never
+/// built the router) there is nothing to check.
+async fn credential_revoked(state: &GatewayState, principal: &Principal) -> bool {
+    let Some(ctx) = state.auth.get().cloned() else {
+        return false;
+    };
+    let client_id = principal.client_id.clone();
+    let token_id = principal.token_id.clone();
+    let checked = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        if ctx.store.get_client(&client_id)?.is_none() {
+            return Ok(true);
+        }
+        Ok(ctx.store.list_tokens()?.iter().any(|t| {
+            t.id == token_id && t.client_id == client_id && t.status == TokenStatus::Revoked
+        }))
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("revocation check task failed: {e}")));
+    checked.unwrap_or_else(|e| {
+        tracing::warn!(
+            error = %e,
+            client_id = %principal.client_id,
+            "could not check whether a waiting call's credential was revoked"
+        );
+        false
+    })
+}
+
+/// Resolves once [`credential_revoked`] says `principal`'s credential is
+/// gone, checking every [`REVOCATION_CHECK_INTERVAL`] (first check one
+/// interval in — the Bearer gate has only just accepted the token). Never
+/// resolves otherwise; [`await_approval`] drops it when the wait ends.
+async fn revocation_watch(state: &GatewayState, principal: &Principal) {
+    let start = tokio::time::Instant::now() + REVOCATION_CHECK_INTERVAL;
+    let mut tick = tokio::time::interval_at(start, REVOCATION_CHECK_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tick.tick().await;
+        if credential_revoked(state, principal).await {
+            return;
+        }
+    }
+}
+
+/// The outcome of a call whose credential was revoked mid-wait (#427):
+/// deny it as [`ResolvedVia::Revoked`] through the same first-response-wins
+/// [`Approvals::resolve`] every channel uses (which withdraws the native
+/// prompt). If a denial from another path won the race (shutdown), its
+/// channel is kept; an Allow that won the race is still turned into a
+/// Revoked denial — the credential is gone, so nothing may be written.
+async fn outcome_on_revoke(
+    approvals: &Approvals,
+    id: &str,
+    wait: impl std::future::Future<Output = WaitOutcome>,
+) -> WaitOutcome {
+    approvals.resolve(id, approval::Decision::Deny, ResolvedVia::Revoked);
+    match wait.await {
+        WaitOutcome::Decided(approval::Decision::Approve, _) => {
+            WaitOutcome::Decided(approval::Decision::Deny, ResolvedVia::Revoked)
+        }
+        other => other,
+    }
+}
+
 /// The `NeedApproval` arm of [`policy_gate`] (Gateway PR 4, Task 5): the
 /// wiring that finally connects [`policy::decide`] to Task 3's
 /// [`Approvals`] registry and Task 4's native macOS dialog channel.
@@ -1305,6 +1390,7 @@ async fn await_approval(
         subject: call.subject.clone(),
         grant_minutes: (state.config.policy.mode_for(class) == PolicyMode::AskOnce)
             .then_some(state.config.policy.grant_ttl_minutes),
+        family: principal.family.clone(),
     };
     let id = pending.id.clone();
     let rx = match state.approvals.register(pending.clone()) {
@@ -1413,23 +1499,45 @@ async fn await_approval(
     // `notifications/cancelled` POST is answered 202 and dropped
     // (streamable_http_server/tower.rs ~1900) without reaching this
     // request's token — such a client's approval stays pending until TTL.
+    //
+    // #427: revoking the credential this call presented (any of the three
+    // revoke verbs) denies it too — `revocation_watch` re-checks the store
+    // while it waits, and an Allow is re-checked once more below before
+    // anything is written. No IPC: the CLI only writes the store.
     let wait = state
         .approvals
         .wait(&id, rx, Duration::from_secs(wait_secs));
     tokio::pin!(wait);
-    let outcome = match ctx {
+    let disconnected = async {
+        match ctx {
+            Some(ctx) => ctx.ct.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(disconnected);
+    let revoked = revocation_watch(state, principal);
+    tokio::pin!(revoked);
+    let outcome = tokio::select! {
         // `biased`, cancel first: an approve racing the disconnect resolves
         // as the fail-safe denial. An approve landing after `ct` fires may
         // still see a transient 200/✅; the final state is denied and
         // nothing is written.
-        Some(ctx) => tokio::select! {
-            biased;
-            () = ctx.ct.cancelled() => {
-                outcome_on_disconnect(&state.approvals, &id, wait.as_mut()).await
-            }
-            outcome = &mut wait => outcome,
-        },
-        None => wait.await,
+        biased;
+        () = &mut disconnected => {
+            outcome_on_disconnect(&state.approvals, &id, wait.as_mut()).await
+        }
+        () = &mut revoked => outcome_on_revoke(&state.approvals, &id, wait.as_mut()).await,
+        outcome = &mut wait => outcome,
+    };
+    // The Allow-time check: an Allow that arrives between two periodic
+    // checks must not write for a credential revoked in that window.
+    let outcome = match outcome {
+        WaitOutcome::Decided(approval::Decision::Approve, _)
+            if credential_revoked(state, principal).await =>
+        {
+            WaitOutcome::Decided(approval::Decision::Deny, ResolvedVia::Revoked)
+        }
+        other => other,
     };
     match outcome {
         WaitOutcome::Decided(approval::Decision::Approve, via) => {
@@ -1441,6 +1549,7 @@ async fn await_approval(
                 state.grants.record(
                     GrantKey::new(
                         principal.client_id.clone(),
+                        principal.family.clone(),
                         vault.map(str::to_string),
                         class,
                     ),
@@ -1489,6 +1598,9 @@ async fn await_approval(
                         ResolvedVia::Disconnect => {
                             format!("the client disconnected while approval was pending [{tool}]")
                         }
+                        ResolvedVia::Revoked => format!(
+                            "access was revoked while this call waited for approval [{tool}]"
+                        ),
                         _ => format!("this call was denied by the gateway operator [{tool}]"),
                     },
                     None,
@@ -2438,8 +2550,22 @@ mod tests {
     /// the auth store can use — the caller's own vault fixture files live
     /// alongside it in the SAME tempdir, under a distinct `gateway-auth/`
     /// subdirectory.
+    ///
+    /// "test-client" is also REGISTERED, as every real token's client is
+    /// (tokens are only minted for a registered client): a waiting approval
+    /// treats an unregistered client as removed (`credential_revoked`).
     fn test_auth_ctx(root: &Path) -> (Arc<AuthCtx>, String) {
+        use crate::commands::gateway::auth::store::{AppType, RegisteredClient};
         let store = AuthStore::open_at(root.join("gateway-auth")).unwrap();
+        store
+            .register_client(RegisteredClient {
+                client_id: "test-client".to_string(),
+                client_name: None,
+                redirect_uris: vec![],
+                application_type: AppType::Web,
+                created: 0,
+            })
+            .unwrap();
         let (access, _refresh) = store.issue_token_pair("test-client", "brain").unwrap();
         let ctx = Arc::new(AuthCtx::new(store));
         ctx.issuer
@@ -5099,6 +5225,26 @@ mod tests {
         (dir, router, state, token)
     }
 
+    /// The `Mutating` [`GrantKey`] an approval of a call made with `token`
+    /// (a "test-client" token from [`test_auth_ctx`]) records for `vault`:
+    /// grants are scoped to the token's family (#427), which only the store
+    /// knows.
+    fn test_grant_key(state: &GatewayState, token: &str, vault: Option<&str>) -> GrantKey {
+        let ctx = state.auth.get().expect("router build sets the auth ctx");
+        let family = ctx
+            .store
+            .check_access(token)
+            .unwrap()
+            .expect("a live test token")
+            .family;
+        GrantKey::new(
+            "test-client",
+            family,
+            vault.map(str::to_string),
+            RiskClass::Mutating,
+        )
+    }
+
     /// Count of `.md` files directly under `<vault_root>/00-inbox` — `0`
     /// (not a panic) when the folder doesn't exist yet, since a denied or
     /// timed-out `brain_capture` never even reaches `create_dir_all`.
@@ -5386,9 +5532,7 @@ mod tests {
         // (`server::await_approval`), independent of whether an operator
         // ever hits the `/approvals` HTTP surface at all.
         assert!(
-            state
-                .grants
-                .has(&GrantKey::new("test-client", None, RiskClass::Mutating)),
+            state.grants.has(&test_grant_key(&state, &token, None)),
             "an Approve must record a grant for (client, class)"
         );
 
@@ -5520,9 +5664,7 @@ mod tests {
             "a denied capture must not create a file"
         );
         assert!(
-            !state
-                .grants
-                .has(&GrantKey::new("test-client", None, RiskClass::Mutating)),
+            !state.grants.has(&test_grant_key(&state, &token, None)),
             "a Deny must never record a grant"
         );
 
@@ -5534,6 +5676,101 @@ mod tests {
             "a human Deny must still be recorded with the channel that answered: {entries:?}"
         );
         assert_eq!(entries[0]["outcome"], "error");
+    }
+
+    /// Spawn one gated `brain_capture` through `router`, returning its
+    /// handle once the call is pending.
+    async fn spawn_pending_capture(
+        router: &axum::Router,
+        state: &Arc<GatewayState>,
+        token: &str,
+        title: &str,
+    ) -> (tokio::task::JoinHandle<serde_json::Value>, PendingApproval) {
+        let call_router = router.clone();
+        let call_token = token.to_string();
+        let body = call_body(
+            1,
+            "brain_capture",
+            serde_json::json!({"title": title, "text": "note body"}),
+        );
+        let handle = tokio::spawn(async move {
+            post(
+                &call_router,
+                body,
+                &call_token,
+                &standard_headers("tools/call", Some("brain_capture")),
+            )
+            .await
+        });
+        (handle, wait_for_one_pending(state).await)
+    }
+
+    /// #427, the Allow-time check: an Allow that arrives after the call's
+    /// credential was revoked (here well inside the first periodic check)
+    /// must write nothing, record no grant, and audit `"revoked"`.
+    #[tokio::test]
+    async fn an_allow_after_the_client_was_revoked_writes_nothing() {
+        use crate::commands::gateway::auth::store::TokenSelector;
+        let (dir, router, state, token) =
+            fixture_router_with_mutating_policy(policy::PolicyMode::AskOnce, 300, 30);
+        let grant = test_grant_key(&state, &token, None);
+        let (handle, pending) = spawn_pending_capture(&router, &state, &token, "Revoked").await;
+
+        let ctx = state.auth.get().unwrap();
+        ctx.store
+            .revoke_tokens(&TokenSelector::Client("test-client".to_string()))
+            .unwrap();
+        assert!(state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Approve,
+            approval::ResolvedVia::Http
+        ));
+
+        let resp = handle.await.unwrap();
+        let message = resp["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a JSON-RPC error: {resp}"));
+        assert!(
+            message.contains("access was revoked while this call waited for approval"),
+            "{message}"
+        );
+        assert_eq!(inbox_note_count(dir.path()), 0, "nothing may be written");
+        assert!(
+            !state.grants.has(&grant),
+            "a revoked Allow records no grant"
+        );
+        let entries = read_audit_entries(dir.path());
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0]["decision"], "denied", "{entries:?}");
+        assert_eq!(entries[0]["channel"], "revoked", "{entries:?}");
+    }
+
+    /// #427: an access token that merely EXPIRES mid-wait was not revoked —
+    /// the human's Allow still writes.
+    #[tokio::test]
+    async fn an_allow_after_the_token_merely_expired_still_writes() {
+        let (dir, router, state, token) =
+            fixture_router_with_mutating_policy(policy::PolicyMode::AskOnce, 300, 30);
+        let (handle, pending) = spawn_pending_capture(&router, &state, &token, "Expired").await;
+
+        // `AuthStore` has no "expire a token" API; age the record on disk,
+        // as `middleware.rs`'s own expiry test does.
+        let tokens_path = dir.path().join("gateway-auth").join("tokens.json");
+        let mut tokens: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&tokens_path).unwrap()).unwrap();
+        tokens[token.as_str()]["expires"] = serde_json::json!(1);
+        std::fs::write(&tokens_path, serde_json::to_vec_pretty(&tokens).unwrap()).unwrap();
+
+        assert!(state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Approve,
+            approval::ResolvedVia::Http
+        ));
+        let resp = handle.await.unwrap();
+        assert!(resp.get("error").is_none(), "{resp}");
+        assert_eq!(inbox_note_count(dir.path()), 1);
+        let entries = read_audit_entries(dir.path());
+        assert_eq!(entries[0]["channel"], "http", "{entries:?}");
     }
 
     #[tokio::test]
@@ -5800,6 +6037,7 @@ mod tests {
                         client_name: None,
                         subject: Default::default(),
                         grant_minutes: None,
+                        family: "fam-1".to_string(),
                     })
                     .unwrap_or_else(|e| panic!("filler {i} must fit under the cap: {e:?}")),
             );
@@ -5899,6 +6137,7 @@ mod tests {
                 client_name: None,
                 subject: Default::default(),
                 grant_minutes: None,
+                family: "fam-1".to_string(),
             }
         };
         let deny = approval::Decision::Deny;
@@ -5987,19 +6226,15 @@ mod tests {
         assert!(handle.await.unwrap().get("error").is_none());
 
         assert!(
-            state.grants.has(&GrantKey::new(
-                "test-client",
-                Some("t1".to_string()),
-                RiskClass::Mutating
-            )),
+            state
+                .grants
+                .has(&test_grant_key(&state, &token, Some("t1"))),
             "the approval must have granted (client, t1, Mutating)"
         );
         assert!(
-            !state.grants.has(&GrantKey::new(
-                "test-client",
-                Some("t2".to_string()),
-                RiskClass::Mutating
-            )),
+            !state
+                .grants
+                .has(&test_grant_key(&state, &token, Some("t2"))),
             "and NOTHING for the other vault"
         );
 
@@ -6087,9 +6322,7 @@ mod tests {
             assert!(resp.get("error").is_none(), "{resp}");
 
             assert!(
-                !state
-                    .grants
-                    .has(&GrantKey::new("test-client", None, RiskClass::Mutating)),
+                !state.grants.has(&test_grant_key(&state, &token, None)),
                 "an ask_always approval must never leave a grant behind (call {id})"
             );
         }

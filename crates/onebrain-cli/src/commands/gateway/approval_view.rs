@@ -248,6 +248,9 @@ pub fn telegram_outcome(
                 (ResolvedVia::Disconnect, _) => {
                     "\u{26d4} Denied \u{b7} the app disconnected, nothing written".to_string()
                 }
+                (ResolvedVia::Revoked, _) => {
+                    "\u{26d4} Access was revoked \u{b7} nothing was written".to_string()
+                }
                 (ResolvedVia::Telegram, true) => format!(
                     "\u{2705} Allowed \u{b7} {}{}",
                     allowed_detail(p),
@@ -419,6 +422,7 @@ mod tests {
             client_name: Some("Claude".to_string()),
             subject: ApprovalSubject::new(Some("ทดสอบ approve จากมือถือ 1"), Some(25)),
             grant_minutes: None,
+            family: "fam-1".to_string(),
         }
     }
 
@@ -510,6 +514,10 @@ mod tests {
         assert_eq!(
             o(Outcome::Decided(Deny, ResolvedVia::Disconnect)),
             "\u{26d4} Denied \u{b7} the app disconnected, nothing written"
+        );
+        assert_eq!(
+            o(Outcome::Decided(Deny, ResolvedVia::Revoked)),
+            "\u{26d4} Access was revoked \u{b7} nothing was written"
         );
     }
 

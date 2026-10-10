@@ -393,6 +393,11 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
     let audit = AuditLog::open().context("open gateway audit log")?;
     let state = Arc::new(GatewayState::new(config, audit));
     let shutdown_state = state.clone();
+    let telegram = state.telegram.clone();
+    // When the shutdown signal arrived — the start of the Telegram edit
+    // drain's budget (#430, see `TELEGRAM_EDIT_DRAIN`).
+    let signalled_at = Arc::new(std::sync::OnceLock::new());
+    let signalled_at_set = signalled_at.clone();
 
     let auth_store = AuthStore::open().context("open gateway auth store")?;
     // Best-effort startup housekeeping: drop expired auth codes/tokens
@@ -450,6 +455,7 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
         let (tx, rx) = tokio::sync::watch::channel(None);
         let shutdown = async move {
             let which = signal.await;
+            let _ = signalled_at_set.set(tokio::time::Instant::now());
             tracing::info!("{which} received; shutting down gateway");
             // Hub ruling: answer every waiting approval with a denial NOW,
             // so its call ends cleanly on its own stream (and Telegram /
@@ -479,12 +485,26 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
             let issuer = resolve_issuer(public_url.as_deref(), bound);
             let _ = auth_ctx.issuer.set(issuer);
         };
-        with_shutdown_grace(
+        let served = with_shutdown_grace(
             run_server_from_router(router, addr, on_bind, shutdown),
             rx,
             SHUTDOWN_GRACE,
         )
-        .await
+        .await;
+        // #430: the denials above each end in a Telegram edit ("Gateway
+        // stopped") that runs on the blocking pool — give those edits up to
+        // TELEGRAM_EDIT_DRAIN from the signal to land before the runtime
+        // teardown below would cut them off and leave the buttons live.
+        if let (Some(t), Some(at)) = (&telegram, signalled_at.get()) {
+            let left =
+                (*at + TELEGRAM_EDIT_DRAIN).saturating_duration_since(tokio::time::Instant::now());
+            if !t.drain_edits(left).await {
+                tracing::warn!(
+                    "telegram approval edits still pending at shutdown; their buttons may stay visible"
+                );
+            }
+        }
+        served
     };
     block_on_bounded(runtime, serve, RUNTIME_TEARDOWN)
 }
@@ -532,6 +552,13 @@ pub fn pair(_mode: &OutputMode, rotate: bool) -> anyhow::Result<()> {
 /// hub ruling), so those calls answer at once; 5 s then lets ordinary calls
 /// finish and drops anything still open.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long, counted from the shutdown signal, `run` waits for Telegram
+/// approval edits still in flight (`TelegramChannel::drain_edits`, #430)
+/// before tearing the runtime down. Inside [`SHUTDOWN_GRACE`], so the worst
+/// case stays SHUTDOWN_GRACE + [`RUNTIME_TEARDOWN`], well under launchd's
+/// 20 s. An edit can still be lost if Telegram itself is unreachable.
+const TELEGRAM_EDIT_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long `run` lets the runtime's blocking tasks finish once the server
 /// future has returned. Dropping a tokio runtime waits on its blocking pool
