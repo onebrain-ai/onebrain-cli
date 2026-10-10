@@ -253,3 +253,41 @@ pub fn parse_mcp_reply(body: &str) -> serde_json::Value {
         .pop()
         .unwrap_or_else(|| panic!("MCP reply was neither JSON nor SSE with a data event: {body}"))
 }
+
+// ── Sandboxed spawn helper (#436) ────────────────────────────────────────
+
+/// A fresh, empty directory under `CARGO_TARGET_TMPDIR` (inside `target/`, so
+/// it is swept by `cargo clean` and never in the developer's real home).
+fn fresh_sandbox_dir(kind: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "sandbox-{kind}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("create sandbox dir");
+    dir
+}
+
+/// `onebrain` spawn with `HOME`, `USERPROFILE` and `ONEBRAIN_CACHE_DIR` pinned
+/// to empty scratch dirs, so a dev machine's real `~/.onebrain/gateway.yml`
+/// (live gateway: `launchctl print`, local/tunnel probes) and real search
+/// cache can never leak into a test.
+///
+/// Callers that need their own `HOME` / cache simply chain `.env(..)` after
+/// this: a later `.env` for the same key overrides the sandbox value.
+pub fn onebrain_cmd() -> assert_cmd::Command {
+    let mut cmd = assert_cmd::Command::cargo_bin("onebrain").unwrap();
+    sandbox_env(&mut cmd);
+    cmd
+}
+
+/// The env overrides behind [`onebrain_cmd`], split out so the canary test can
+/// apply them on top of a deliberately "real" inherited `HOME`.
+pub fn sandbox_env(cmd: &mut assert_cmd::Command) {
+    let home = fresh_sandbox_dir("home");
+    cmd.env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("ONEBRAIN_CACHE_DIR", scratch_cache_root());
+}
