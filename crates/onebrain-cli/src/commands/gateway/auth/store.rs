@@ -566,8 +566,10 @@ impl AuthStore {
     /// Take the store-wide advisory EXCLUSIVE lock (`<root>/auth.lock`,
     /// created 0600 on first use), waiting at most [`LOCK_WAIT`] (#428) and
     /// then failing with a typed [`StoreBusy`] that names the holder from
-    /// the `auth.lock.holder` sidecar when it can. Blocking: async callers
-    /// run it on `spawn_blocking`, never on a runtime worker. Every method
+    /// the `auth.lock.holder` sidecar when it can. The wait is a kernel-queued
+    /// blocking lock, so a burst of writes cannot starve it (see
+    /// [`acquire_within`]). Blocking: async callers run it on
+    /// `spawn_blocking`, never on a runtime worker. Every method
     /// that does load → modify → save holds this for its whole critical
     /// section, so a `onebrain gateway tokens revoke` in one process can
     /// never be lost to a concurrent `rotate_refresh_for_client`/
@@ -600,28 +602,19 @@ impl AuthStore {
         let file = opts
             .open(&path)
             .with_context(|| format!("open gateway auth lock {}", path.display()))?;
-        let deadline = std::time::Instant::now() + self.lock_wait;
-        let mut pause = Duration::from_millis(5);
-        loop {
-            match file.try_lock() {
-                Ok(()) => break,
-                Err(std::fs::TryLockError::WouldBlock) => {
-                    let now = std::time::Instant::now();
-                    if now >= deadline {
-                        return Err(StoreBusy {
-                            holder: self.read_holder(),
-                        }
-                        .into());
-                    }
-                    std::thread::sleep(pause.min(deadline - now));
-                    pause = (pause * 2).min(Duration::from_millis(100));
+        let file = match acquire_within(file, self.lock_wait)
+            .with_context(|| format!("lock gateway auth store ({})", path.display()))?
+        {
+            Some(file) => file,
+            None => {
+                return Err(StoreBusy {
+                    holder: self.read_holder(),
                 }
-                Err(std::fs::TryLockError::Error(e)) => {
-                    return Err(e)
-                        .with_context(|| format!("lock gateway auth store ({})", path.display()));
-                }
+                .into())
             }
-        }
+        };
+        #[cfg(test)]
+        hold_delay::apply();
         // The holder lives in a sidecar, not in `auth.lock` itself: a
         // Windows whole-file lock can stop other handles reading the locked
         // file. Best-effort — a failure only makes a waiter's message generic.
@@ -1401,6 +1394,64 @@ pub(crate) fn check_files_parse(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Waiter threads currently blocked in [`std::fs::File::lock`] on
+/// `auth.lock` in this process (see [`acquire_within`]).
+static LOCK_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Cap on [`LOCK_WAITERS`]. Reaching it means the lock is stuck (every
+/// waiter is stranded behind a stalled holder), so a new caller gets
+/// `StoreBusy` at once instead of adding another thread.
+const MAX_LOCK_WAITERS: usize = 64;
+
+/// Lock `file` exclusively within `wait`: `Ok(None)` on timeout.
+///
+/// Fairness (#438 Windows CI): the wait is a BLOCKING `File::lock` on a
+/// helper thread, so the waiter is queued in the kernel and woken (Windows:
+/// granted) when the holder releases. A `try_lock` poll that sleeps between
+/// attempts almost never lands in the microsecond gap between a busy
+/// writer's holds, and was starved into `StoreBusy` by a write burst. The
+/// uncontended fast path is one `try_lock`, skipped while another thread of
+/// this process is already queued, so a newcomer cannot jump that queue.
+///
+/// On timeout the helper thread is left blocked until the lock is granted;
+/// it then finds the receiver gone and drops the file at once, releasing
+/// the lock. Those stranded threads are bounded by [`MAX_LOCK_WAITERS`].
+fn acquire_within(file: std::fs::File, wait: Duration) -> std::io::Result<Option<std::fs::File>> {
+    use std::sync::atomic::Ordering;
+    if LOCK_WAITERS.load(Ordering::SeqCst) == 0 {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
+    if LOCK_WAITERS.fetch_add(1, Ordering::SeqCst) >= MAX_LOCK_WAITERS {
+        LOCK_WAITERS.fetch_sub(1, Ordering::SeqCst);
+        return Ok(None);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("auth-lock-wait".into())
+        .spawn(move || {
+            let locked = file.lock().map(|()| file);
+            LOCK_WAITERS.fetch_sub(1, Ordering::SeqCst);
+            // A dropped receiver hands the file back in the error, and
+            // dropping it here releases the lock nobody is waiting for.
+            let _ = tx.send(locked);
+        });
+    if let Err(e) = spawned {
+        LOCK_WAITERS.fetch_sub(1, Ordering::SeqCst);
+        return Err(e);
+    }
+    match rx.recv_timeout(wait) {
+        Ok(locked) => locked.map(Some),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::other(
+            "auth.lock waiter thread ended without a result",
+        )),
+    }
+}
+
 /// RAII guard returned by [`AuthStore::lock_exclusive`]. The OS releases the
 /// lock when the file handle closes, i.e. when this guard drops. Bind it as
 /// `let _guard = …` — `let _ = …` would drop (and unlock) immediately.
@@ -1570,6 +1621,29 @@ fn read_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T>
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
         Err(e) => Err(e).context(format!("read {}", path.display())),
+    }
+}
+
+/// Test-only: stretch every `auth.lock` hold taken on the arming thread, to
+/// stand in for a slow disk (fsync on a CI runner) in fairness tests.
+#[cfg(test)]
+pub(crate) mod hold_delay {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    thread_local! {
+        static DELAY: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    }
+
+    pub(crate) fn arm(delay: Duration) {
+        DELAY.with(|d| d.set(delay));
+    }
+
+    pub(super) fn apply() {
+        let delay = DELAY.with(|d| d.get());
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
     }
 }
 
@@ -2518,6 +2592,50 @@ mod tests {
                 CodeExchange::Issued { .. }
             ),
             "a busy lock must not burn the code; the retry succeeds"
+        );
+    }
+
+    /// Fairness (#438 Windows CI): a burst of back-to-back writes on one
+    /// handle must not starve another handle's mutator into `StoreBusy`.
+    /// The writer's holds are stretched to 5 ms (a slow disk); the other
+    /// handle has a 1 s budget per call. A waiter that sleeps between
+    /// `try_lock` polls almost never lands in the writer's microsecond gap
+    /// between holds; a waiter queued in the kernel is woken on release.
+    #[test]
+    fn a_write_burst_on_one_handle_cannot_starve_another_into_store_busy() {
+        const TARGETS: usize = 20;
+        let (dir, store) = open_temp();
+        let targets: Vec<String> = (0..TARGETS)
+            .map(|_| store.issue_token_pair("victim", "brain").unwrap().0.token)
+            .collect();
+        let root = dir.path().join("gateway");
+        let writer = AuthStore::open_at(root.clone()).unwrap();
+        let revoker = AuthStore::open_at(root)
+            .unwrap()
+            .with_lock_wait(std::time::Duration::from_secs(1));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writing = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                hold_delay::arm(std::time::Duration::from_millis(5));
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    writer.issue_token_pair("busy", "brain").unwrap();
+                }
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let starved: Vec<usize> = targets
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| revoker.revoke_token(t).is_err())
+            .map(|(i, _)| i)
+            .collect();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writing.join().unwrap();
+        assert!(
+            starved.is_empty(),
+            "{} of {TARGETS} revokes were starved into StoreBusy by a write burst: {starved:?}",
+            starved.len()
         );
     }
 
