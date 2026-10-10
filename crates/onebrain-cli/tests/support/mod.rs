@@ -258,6 +258,8 @@ pub fn parse_mcp_reply(body: &str) -> serde_json::Value {
 
 /// A fresh, empty directory under `CARGO_TARGET_TMPDIR` (inside `target/`, so
 /// it is swept by `cargo clean` and never in the developer's real home).
+/// Dirs are intentionally left behind per spawn: tiny, and cheaper than
+/// threading a `TempDir` binding through every call site.
 fn fresh_sandbox_dir(kind: &str) -> PathBuf {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);

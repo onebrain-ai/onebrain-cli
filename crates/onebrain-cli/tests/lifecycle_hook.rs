@@ -21,25 +21,29 @@ fn scratch() -> TempDir {
 /// POSIX `sh` front that answers the `search reindex` background path itself
 /// and hands every other invocation to the Python body in `onebrain-child.py`.
 ///
-/// Two changes for #437 (`stop_dispatches_the_pending_embed_child` flaked
-/// under load):
+/// Why it is built this way (#437, `stop_dispatches_the_pending_embed_child`
+/// flaked under CPU load):
 ///
-/// 1. The scripts are written ONCE per process and hard-linked into each
-///    test's dir. Writing an executable per test lets a sibling test thread
-///    `fork()` while the write fd is still open; that child inherits the fd
-///    until its `exec`, so spawning the just-written script fails with
-///    `ETXTBSY` ("Text file busy"). `hook.rs` fails open on a failed spawn
-///    (`command.spawn().ok()?`), so the background `search reindex` child
-///    silently never ran and its marker never appeared. Every test calls this
-///    before spawning anything, so the one-time write races no fork.
-/// 2. The `sh` front keeps the 2 s `BACKGROUND_TIMEOUT` (`hook.rs:17`) path
-///    off Python's interpreter start-up.
-/// 3. The template is exec'd once at creation. With the product patched to log
-///    it, the failures under load were the pending child spawning fine and
-///    then being killed at the 2 s budget before it ran (`DIAGTIMEOUT ... after
-///    2.0s`); a trivial `sh` child had to be starved for 2 s on its first exec
-///    of a freshly written file. Priming that first exec removed it (0/50
-///    vs 4/50 under the same load).
+/// - **Mechanism (proven).** The Stop hook's background child
+///   `search reindex --pending-only` was spawned fine but was still not
+///   running at the 2 s `BACKGROUND_TIMEOUT` (`hook.rs:17`), so it was killed
+///   before its first line and never wrote its marker. With `hook.rs`
+///   temporarily patched to log, 4 of 50 loaded runs showed
+///   `DIAGTIMEOUT ["search","reindex","--pending-only","--json"] after ~2.0s`
+///   and no spawn error.
+/// - **Cause (ASSUMED, not isolated).** The child is starved on its first exec
+///   of a freshly written file (suspected macOS first-exec scan).
+/// - **The fix that matters: priming.** The template is exec'd once at
+///   creation, so later execs of the same inode are fast. Under 60 burners,
+///   `--test-threads 16`, whole file, 50 runs: priming removed 2/50 failures,
+///   priming present 0/50.
+/// - **Supporting changes, not the fix.** The `sh` front keeps the budgeted
+///   path off Python's start-up; scripts are written once and hard-linked per
+///   test. Neither alone cured it: `sh` front alone failed 8/50, `sh` front
+///   plus hard links failed 4/50 (the diagnostic run above).
+///
+/// The template dir is intentionally left under `target/` (swept by
+/// `cargo clean`).
 fn fake_onebrain(root: &Path) -> PathBuf {
     static TEMPLATE: OnceLock<PathBuf> = OnceLock::new();
     let template = TEMPLATE.get_or_init(|| {
@@ -51,11 +55,14 @@ fn fake_onebrain(root: &Path) -> PathBuf {
             permissions.set_mode(0o755);
             fs::set_permissions(&path, permissions).unwrap();
         }
-        // Prime the first exec of the new script (see doc comment, point 3).
-        let _ = std::process::Command::new(dir.join("onebrain-child"))
+        // Prime the first exec (see the doc comment). Must not fail silently:
+        // a failed prime would drop the protection without any signal.
+        let primed = std::process::Command::new(dir.join("onebrain-child"))
             .args(["search", "reindex"])
             .stdout(std::process::Stdio::null())
-            .status();
+            .status()
+            .expect("prime: spawn the fake child");
+        assert!(primed.success(), "prime: fake child failed: {primed:?}");
         dir
     });
     for name in ["onebrain-child", "onebrain-child.py"] {
