@@ -639,8 +639,13 @@ fn read_lock_pid(lock_path: &Path) -> Option<u32> {
 /// Distinct from [`is_alive`] (which requires the pid to be a *daemon* session
 /// leader): the lock's PID is the `daemon start` PROCESS, not the setsid daemon,
 /// so it must not be gated on session-leadership.
+///
+/// Also the liveness check behind naming a search-lock holder
+/// (`search_lock_holder`, #426): a holder sidecar's pid is named only while this
+/// says it exists — and that holder can be any `onebrain` process (mcp, cli,
+/// daemon), so no identity check belongs here either.
 #[cfg(unix)]
-fn pid_exists(pid: u32) -> bool {
+pub(crate) fn pid_exists(pid: u32) -> bool {
     use nix::errno::Errno;
     use nix::sys::signal::kill;
     use nix::unistd::Pid;
@@ -655,13 +660,16 @@ fn pid_exists(pid: u32) -> bool {
 /// identity check — because this answers "is the lock's creator still around?",
 /// and that creator is the `daemon start` process, not the detached daemon, so
 /// it must not be gated on running our own image the way [`is_alive`] is.
+/// Shared with the search-lock holder naming (#426), like the Unix twin.
 #[cfg(windows)]
-fn pid_exists(pid: u32) -> bool {
+pub(crate) fn pid_exists(pid: u32) -> bool {
     win_proc::exists(pid)
 }
 
+/// NOT used for search-lock holder naming (#426): `search_lock_holder` treats
+/// this platform's liveness as unknown instead of trusting this `true`.
 #[cfg(not(any(unix, windows)))]
-fn pid_exists(_pid: u32) -> bool {
+pub(crate) fn pid_exists(_pid: u32) -> bool {
     // No cheap raw probe wired here; assume live so we never reclaim a lock we
     // can't verify is stale (conservative — matches `LockOwner::Unknown`).
     true

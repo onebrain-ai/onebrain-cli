@@ -146,6 +146,7 @@ pub(crate) async fn get_vault_search(
     // held handle both avoids that and keeps the boot-time index warm. `serve`
     // / the unit-test router hold no engine and fall through to `run_native`.
     let held = state.search_engine.clone();
+    let vault_root = root.clone();
 
     // Native search is synchronous (tantivy / embedding). Run it off the async
     // runtime and bound it so a slow hybrid embed can't wedge a worker.
@@ -154,7 +155,7 @@ pub(crate) async fn get_vault_search(
     });
     let hits = match tokio::time::timeout(SEARCH_TIMEOUT, search).await {
         Ok(Ok(Ok(hits))) => hits,
-        Ok(Ok(Err(e))) => return Err(map_search_failure(e)),
+        Ok(Ok(Err(e))) => return Err(map_search_failure(e, &vault_root)),
         Ok(Err(join_err)) => {
             tracing::warn!(error = %join_err, "native search task panicked");
             return Err(ApiError::Internal("search failed".to_string()));
@@ -176,9 +177,15 @@ pub(crate) async fn get_vault_search(
 /// **503** (like `/api/internal/*`) so the CLI classifies it as honest
 /// `E_ENGINE_BUSY` rather than an opaque **500** / `E_INTERNAL`. Any other
 /// failure stays a genuine 500.
-fn map_search_failure(e: anyhow::Error) -> ApiError {
+///
+/// The busy log line names the lock holder when it can (#426).
+fn map_search_failure(e: anyhow::Error, vault_root: &Path) -> ApiError {
     if onebrain_search::error::is_engine_busy(&e) {
-        tracing::warn!(error = %e, "native search: engine busy (index locked by another process)");
+        tracing::warn!(
+            error = %e,
+            holder = %crate::commands::search_lock_holder::busy_message_for_vault(vault_root),
+            "native search: engine busy (index locked by another process)"
+        );
         ApiError::ServiceUnavailable("search index locked by another process".to_string())
     } else {
         tracing::warn!(error = %e, "native search failed");
@@ -1184,9 +1191,15 @@ mod tests {
         // A per-request `Engine::open` that hits the redb lock surfaces as the
         // typed EngineBusy → 503 (ServiceUnavailable), so the CLI reports honest
         // E_ENGINE_BUSY instead of an opaque 500.
+        let vault = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
         let busy = anyhow::Error::new(onebrain_search::error::EngineBusy);
         assert!(
-            matches!(map_search_failure(busy), ApiError::ServiceUnavailable(_)),
+            matches!(
+                map_search_failure(busy, vault.path()),
+                ApiError::ServiceUnavailable(_)
+            ),
             "engine-busy must map to 503"
         );
     }
@@ -1195,7 +1208,10 @@ mod tests {
     fn map_search_failure_other_error_is_500() {
         let other = anyhow::anyhow!("some genuine internal failure");
         assert!(
-            matches!(map_search_failure(other), ApiError::Internal(_)),
+            matches!(
+                map_search_failure(other, Path::new("/nonexistent-vault")),
+                ApiError::Internal(_)
+            ),
             "a non-busy failure must stay a 500"
         );
     }

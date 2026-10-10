@@ -1708,6 +1708,23 @@ fn native_search_check(vault_root: &Path) -> DoctorResult {
                     );
                 }
             },
+            // #426: lock contention names the holder (e.g. an `onebrain mcp`
+            // from before an upgrade) rather than a bare "engine busy".
+            Err(e) if crate::commands::search_common::is_engine_busy_error(&e) => {
+                return finish(
+                    DoctorResult::warn(
+                        "search",
+                        format!(
+                            "engine busy: {}",
+                            crate::commands::search_lock_holder::busy_message(
+                                &cache_dir,
+                                Some(resolved.root.as_path())
+                            )
+                        ),
+                    )
+                    .with_details(vec![format!("collection: {collection}")]),
+                );
+            }
             Err(e) => {
                 return finish(
                     DoctorResult::warn("search", format!("engine unavailable: {e}"))
@@ -1986,8 +2003,13 @@ fn lex_index_check(vault_root: &Path) -> DoctorResult {
         Err(e) if crate::commands::search_common::is_engine_busy_error(&e) => {
             return DoctorResult::warn(
                 LEX_INDEX_CHECK,
+                // #426: the same holder sentence as the `search` row.
                 format!(
-                    "{LEX_INDEX_UNVERIFIED} — a running onebrain process holds the search engine"
+                    "{LEX_INDEX_UNVERIFIED} — {}",
+                    crate::commands::search_lock_holder::busy_message(
+                        &cache_dir,
+                        Some(resolved.root.as_path())
+                    )
                 ),
             )
             // The old hint named only the daemon, which misdirects on the most
@@ -6826,6 +6848,52 @@ mod tests {
             r.details
                 .iter()
                 .any(|d| d.contains("reranker_downloaded: false")),
+            "{r:?}"
+        );
+    }
+
+    /// #426: when the index lock is held, the search and lex-index rows name
+    /// the holder — here a live other process recorded as an older `onebrain
+    /// mcp` (this test process just holds the lock for it).
+    #[test]
+    fn search_rows_name_the_lock_holder_when_busy() {
+        use crate::commands::search_lock_holder::test_support::{
+            holder, write_sidecar, OtherProcess,
+        };
+        let cache = tempdir().unwrap();
+        let _env = crate::test_env::set_vars(&[
+            ("ONEBRAIN_CACHE_DIR", cache.path().as_os_str()),
+            ("ONEBRAIN_NO_DAEMON", std::ffi::OsStr::new("1")),
+        ]);
+        let d = tempdir().unwrap();
+        fs::write(
+            d.path().join("onebrain.yml"),
+            "search:\n  collection: doctor-unit-busy-holder\n",
+        )
+        .unwrap();
+        let cache_dir =
+            crate::commands::search_common::collection_cache_dir("doctor-unit-busy-holder");
+        let _held =
+            onebrain_search::engine::Engine::open(&cache_dir, "multilingual-e5-small").unwrap();
+        let other = OtherProcess::spawn();
+        write_sidecar(&cache_dir, &holder(other.pid(), "mcp", "0.0.1"));
+        let named = format!(
+            "the search index is in use by onebrain mcp 0.0.1 (pid {}) — from before an upgrade",
+            other.pid()
+        );
+
+        let r = native_search_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Warn, "{r:?}");
+        assert!(
+            r.message.starts_with(&format!("engine busy: {named}")),
+            "{r:?}"
+        );
+
+        let r = lex_index_check(d.path());
+        assert_eq!(r.status, DoctorStatus::Warn, "{r:?}");
+        assert!(
+            r.message
+                .starts_with(&format!("{LEX_INDEX_UNVERIFIED} — {named}")),
             "{r:?}"
         );
     }

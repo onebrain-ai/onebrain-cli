@@ -61,6 +61,11 @@ pub fn dispatch(cli: Cli) -> Result<()> {
     if !matches!(&cli.command, Cmd::Hook) {
         migration::migrate_search_cache();
     }
+    // #426: record what kind of process this is, so a search-lock holder
+    // sidecar written by this process can name it ("onebrain mcp 3.5.1").
+    onebrain_search::holder::set_process_role(commands::search_lock_holder::holder_role(
+        &cli.command,
+    ));
     let vault_flag = cli.vault.clone();
     let quiet = cli.quiet;
 
