@@ -1,6 +1,6 @@
 # 0022 — Honest search-engine lock & status errors (`E_ENGINE_BUSY`, exit 77)
 
-- **Status:** accepted
+- **Status:** accepted · revisited by [0045](0045-name-the-search-index-lock-holder.md) (the busy error now names the holder)
 - **Date:** 2026-07-05
 
 ## Context

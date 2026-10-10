@@ -49,8 +49,8 @@ ADRs are immutable once accepted — if a decision changes, write a new ADR that
 | [0019](0019-native-mcp-server-staged-qmd-cutover.md) | Native MCP server (`onebrain mcp`) + staged qmd cutover | accepted |
 | [0020](0020-cpu-only-embedding-runtime.md) | CPU-only embedding runtime, by packaging choice | accepted |
 | [0021](0021-search-state-persistent-data-dir.md) | Native-search state moves to the persistent data dir | accepted |
-| [0022](0022-honest-search-lock-errors.md) | Honest search lock & status errors (`E_ENGINE_BUSY`, exit 77) | accepted |
-| [0023](0023-warm-daemon-mcp-search.md) | Warm daemon owns the search engine for mcp + CLI search | accepted |
+| [0022](0022-honest-search-lock-errors.md) | Honest search lock & status errors (`E_ENGINE_BUSY`, exit 77) | accepted · revisited by [0045](0045-name-the-search-index-lock-holder.md) |
+| [0023](0023-warm-daemon-mcp-search.md) | Warm daemon owns the search engine for mcp + CLI search | accepted · revisited by [0045](0045-name-the-search-index-lock-holder.md) |
 | [0024](0024-vector-confidence-recall-first.md) | Recall-first vector cutoff + honest confidence | accepted · superseded in part by [0025](0025-tier2-cross-encoder-reranker.md) and [0034](0034-heading-search-schema-selfheal-rerank-gate-decouple.md) |
 | [0025](0025-tier2-cross-encoder-reranker.md) | Tier-2 cross-encoder reranker on every search surface | accepted · superseded in part by [0034](0034-heading-search-schema-selfheal-rerank-gate-decouple.md) |
 | [0026](0026-config-self-documentation.md) | Self-documenting onebrain.yml + doctor validate/reset-to-default | accepted |
@@ -68,8 +68,10 @@ ADRs are immutable once accepted — if a decision changes, write a new ADR that
 | [0038](0038-gateway-policy-engine-and-human-approvals.md) | Policy engine with risk tiers and human approvals (auto / ask_once / ask_always / deny, grants, three channels, audit) | accepted |
 | [0039](0039-gateway-approval-keepalive-and-wait-clamp.md) | Approval keep-alive over SSE, wait clamp (240 s / 270 s), SIGTERM handling | accepted |
 | [0040](0040-gateway-pre-tunnel-exposure-hardening.md) | Pre-tunnel exposure hardening: Host/Origin guard, loopback-only `/approvals`, registration caps, CSRF consent | accepted |
-| [0041](0041-gateway-auth-store-lock-and-toctou-recheck.md) | Cross-process auth-store lock, post-mint registration re-check, `rust-version 1.89` | accepted |
+| [0041](0041-gateway-auth-store-lock-and-toctou-recheck.md) | Cross-process auth-store lock, post-mint registration re-check, `rust-version 1.89` | accepted · revisited by [0044](0044-gateway-auth-store-bounded-lock-and-atomic-exchange.md) |
 | [0042](0042-gateway-tunnel-and-launchagent-service.md) | Tunnel + service: Cloudflare token file, KeepAlive LaunchAgents, macOS-only for now | accepted |
 | [0043](0043-gateway-plain-english-approval-prompts.md) | Plain-English approval prompts built from structured fields | accepted |
+| [0044](0044-gateway-auth-store-bounded-lock-and-atomic-exchange.md) | Gateway auth store: bounded fair lock wait, no in-process mutex, atomic code exchange, durable writes | accepted |
+| [0045](0045-name-the-search-index-lock-holder.md) | Name the search-index lock holder (`.collection.lock.holder`) | accepted |
 
 > These ADRs distill the public-facing rationale; the full design notes live in the project tracker. Numbers are stable IDs assigned at authoring time — see each ADR's **Date** for chronology.

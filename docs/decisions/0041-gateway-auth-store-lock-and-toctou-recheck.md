@@ -1,6 +1,6 @@
 # 0041 — Cross-process auth-store lock, post-mint re-check, and `rust-version 1.89`
 
-- **Status:** accepted
+- **Status:** accepted · revisited by [0044](0044-gateway-auth-store-bounded-lock-and-atomic-exchange.md) (bounded wait, no store mutex, `/token` check moved inside the exchange, fsync)
 - **Date:** 2026-10
 - **Follows:** [0037](0037-gateway-oauth-authorization-server-and-pairing.md).
 - **PRs:** [#418](https://github.com/onebrain-ai/onebrain-cli/pull/418); tracking issue #406.
