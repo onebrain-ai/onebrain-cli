@@ -10,7 +10,10 @@
 //!
 //! Revocation needs no IPC with a running gateway: the server re-reads
 //! `tokens.json` on every request, and every store write holds
-//! `auth.lock`, so a revoke here is seen on the server's next request.
+//! `auth.lock`, so a revoke here is seen on the server's next request. A
+//! call already waiting for approval re-reads the store too (every 5 s,
+//! and again at Allow), so it is denied within about 5 s
+//! (`server::await_approval`, #427).
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -360,9 +363,10 @@ pub(crate) fn render_tokens_revoke(env: &Envelope<TokensRevokeData>) -> String {
     };
     if d.selector == "id" {
         out.push_str(
-            "\n💡 this revoked that one token only — to cut a client off completely run \
-             `onebrain gateway tokens revoke --family <FAMILY_ID>` or \
-             `onebrain gateway clients remove <CLIENT_ID>`",
+            "\n💡 this revoked that one token only — the app can still refresh into a new one. \
+             To end that login run `onebrain gateway tokens revoke --family <FAMILY_ID>`; \
+             to cut the app off completely run `onebrain gateway tokens revoke --client <CLIENT_ID>` \
+             or `onebrain gateway clients remove <CLIENT_ID>`",
         );
     }
     out

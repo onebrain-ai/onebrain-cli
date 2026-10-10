@@ -198,8 +198,9 @@ async fn resolve_approval(
 
 /// Build the `/approvals` router: `GET /approvals` + `POST /approvals/{id}`,
 /// both gated by [`require_pairing_header`]. `state` gives the handlers
-/// access to [`super::approval::Approvals`] (`state.approvals`) and
-/// [`super::policy::Grants`] (`state.grants`); `auth_ctx` is the pairing
+/// access to [`super::approval::Approvals`] (`state.approvals`) — they
+/// never touch [`super::policy::Grants`]; only `server::await_approval`
+/// records a grant. `auth_ctx` is the pairing
 /// gate's own state, applied as a `.layer` — see `require_bearer`'s
 /// identical `from_fn_with_state` shape in `auth/middleware.rs` for the
 /// precedent this mirrors (a middleware-level state, independent of the

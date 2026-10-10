@@ -1174,8 +1174,12 @@ fn a_telegram_allow_after_a_single_token_revoke_leaves_no_grant() {
                 }]
             }),
         );
-        // The tap reached the gateway (it answers the callback).
-        wait_for_request(mock, "answerCallbackQuery", Duration::from_secs(10));
+        // The tap reached the gateway AND resolved the approval as an
+        // Allow (a bare "✅" answer; a call already denied by the periodic
+        // check would get "too late"), so the Allow-time path is what
+        // denied it.
+        let ack = wait_for_request(mock, "answerCallbackQuery", Duration::from_secs(10));
+        assert_eq!(ack.body["text"], "\u{2705}", "{}", ack.body);
         let _ = h;
     });
 }

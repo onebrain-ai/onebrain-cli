@@ -421,7 +421,8 @@ pub enum GatewayTokensVerb {
         all: bool,
     },
     /// Revoke one token by id, or in bulk with `--client` / `--family`.
-    /// Takes effect on the running gateway's next request — no restart.
+    /// Takes effect on the running gateway's next request — no restart; a
+    /// call already waiting for approval is denied within about 5 s.
     Revoke(GatewayTokensRevokeArgs),
 }
 
@@ -456,7 +457,8 @@ pub enum GatewayClientsVerb {
     /// List registered OAuth clients and how many live tokens each holds.
     List,
     /// Remove a client: revokes all its tokens and deletes its pending
-    /// authorization codes.
+    /// authorization codes. A call already waiting for approval is denied
+    /// within about 5 s.
     Remove {
         /// The client id, exactly as shown by `onebrain gateway clients list`.
         client_id: String,

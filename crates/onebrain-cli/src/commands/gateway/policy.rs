@@ -886,8 +886,8 @@ mod tests {
     /// (a bare `+`) would panic in a debug build the moment a caller passes
     /// a `ttl_secs` anywhere near `u64::MAX` — exactly the kind of value a
     /// pathological (or merely very large) `grant_ttl_minutes` config could
-    /// produce once a real caller (Gateway PR 4, Task 3's
-    /// `approval_routes::resolve_approval`) exists. `saturating_add` must
+    /// produce once a real caller (`server::await_approval`'s Allow path)
+    /// exists. `saturating_add` must
     /// instead clamp to `u64::MAX` — "never expires" — and the grant must
     /// still read as live.
     #[test]

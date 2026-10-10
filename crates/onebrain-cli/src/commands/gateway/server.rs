@@ -1222,6 +1222,8 @@ enum AccessState {
 /// - the presented token's `tokens list` status is
 ///   [`TokenStatus::Revoked`] (`tokens revoke <id>`, `tokens revoke
 ///   --client`, `--family`), or
+/// - the presented token is no longer in the store at all (the Bearer gate
+///   would refuse it too), or
 /// - its client is no longer registered (`clients remove`).
 ///
 /// A token that merely EXPIRED is not revoked: an access token lives 1 h
@@ -1243,9 +1245,14 @@ async fn check_access_state(state: &GatewayState, principal: &Principal) -> Acce
         if ctx.store.get_client(&client_id)?.is_none() {
             return Ok(true);
         }
-        Ok(ctx.store.list_tokens()?.iter().any(|t| {
-            t.id == token_id && t.client_id == client_id && t.status == TokenStatus::Revoked
-        }))
+        // A token no longer on disk counts as revoked, as `require_bearer`
+        // would refuse it; an expired one still on disk does not.
+        Ok(ctx
+            .store
+            .list_tokens()?
+            .iter()
+            .find(|t| t.id == token_id && t.client_id == client_id)
+            .is_none_or(|t| t.status == TokenStatus::Revoked))
     })
     .await
     .unwrap_or_else(|e| Err(anyhow::anyhow!("revocation check task failed: {e}")));
@@ -1558,8 +1565,7 @@ async fn await_approval(
     match outcome {
         WaitOutcome::Decided(approval::Decision::Approve, via) => {
             // "Always ask" never leaves standing consent behind — see this
-            // function's doc comment, step 4, and the identical guard in
-            // `approval_routes::resolve_approval`.
+            // function's doc comment, step 4. This is the only grant writer.
             if state.config.policy.mode_for(class) != PolicyMode::AskAlways {
                 let ttl_secs = state.config.policy.grant_ttl_minutes.saturating_mul(60);
                 state.grants.record(
@@ -5762,6 +5768,41 @@ mod tests {
         let entries = read_audit_entries(dir.path());
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0]["decision"], "denied", "{entries:?}");
+        assert_eq!(entries[0]["channel"], "revoked", "{entries:?}");
+    }
+
+    /// #427: a token that is no longer in the store at all counts as
+    /// revoked (the Bearer gate would refuse it too) — unlike an expired
+    /// token that is still on disk.
+    #[tokio::test]
+    async fn an_allow_after_the_token_record_vanished_writes_nothing() {
+        let (dir, router, state, token) =
+            fixture_router_with_mutating_policy(policy::PolicyMode::AskOnce, 300, 30);
+        let (handle, pending) = spawn_pending_capture(&router, &state, &token, "Vanished").await;
+
+        let tokens_path = dir.path().join("gateway-auth").join("tokens.json");
+        let mut tokens: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&tokens_path).unwrap()).unwrap();
+        tokens
+            .as_object_mut()
+            .unwrap()
+            .remove(token.as_str())
+            .unwrap();
+        std::fs::write(&tokens_path, serde_json::to_vec_pretty(&tokens).unwrap()).unwrap();
+
+        assert!(state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Approve,
+            approval::ResolvedVia::Http
+        ));
+        let resp = handle.await.unwrap();
+        let message = resp["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected a JSON-RPC error: {resp}"));
+        assert!(message.contains("access was revoked"), "{message}");
+        assert_eq!(inbox_note_count(dir.path()), 0, "nothing may be written");
+        assert_eq!(state.grants.len(), 0);
+        let entries = read_audit_entries(dir.path());
         assert_eq!(entries[0]["channel"], "revoked", "{entries:?}");
     }
 
