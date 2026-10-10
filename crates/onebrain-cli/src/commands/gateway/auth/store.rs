@@ -493,6 +493,11 @@ pub struct LockHolder {
 /// `anyhow::Error`) by every locked mutator; detect it with
 /// [`is_store_busy`]. `holder` is `None` when the sidecar is missing or
 /// unreadable (e.g. the holder predates v3.5.1, or is not `onebrain`).
+///
+/// Accepted risk: the sidecar is removed when the guard drops, so a holder
+/// killed with SIGKILL leaves it behind. If the NEXT holder is pre-3.5.1 or
+/// foreign (it never rewrites the sidecar), a waiter names that dead pid.
+/// There is no liveness check.
 #[derive(Debug)]
 pub struct StoreBusy {
     pub holder: Option<LockHolder>,
@@ -736,7 +741,7 @@ impl AuthStore {
     /// Mint and persist a fresh, single-use auth code (>= 32 random bytes,
     /// [`AUTH_CODE_TTL_SECS`] lifetime) carrying the PKCE challenge + the
     /// rest of the `/authorize` request's parameters, to be redeemed once by
-    /// [`Self::consume_code`].
+    /// [`Self::exchange_code`].
     pub fn issue_code(
         &self,
         client_id: &str,
@@ -785,31 +790,14 @@ impl AuthStore {
         Ok(Some(consumed))
     }
 
-    /// Stamp `family` onto the (already-`used`) code record for `code`. The
-    /// `/token` handler no longer calls this: [`Self::exchange_code`] stamps
-    /// the family in the same lock hold that mints it (#428 review); a
-    /// separate stamp would leave a window for an unrevoked replay. A no-op
-    /// (not an error) if `code` is no longer present in `codes.json` — the
-    /// family it would have linked to already exists independently in
-    /// `tokens.json` and stays valid on its own merits; failing to record
-    /// this link only weakens the replay-hardening for a code that's already
-    /// gone, it never wrongly trusts anything.
-    pub fn mark_code_minted_family(&self, code: &str, family: &str) -> Result<()> {
-        let _guard = self.lock_exclusive()?;
-        let mut codes = self.load_codes()?;
-        if let Some(entry) = codes.get_mut(code) {
-            entry.minted_family = Some(family.to_string());
-            self.save_codes(&codes)?;
-        }
-        Ok(())
-    }
-
     /// Redeem `code` for a token pair (RFC 6749 §4.1.3) in ONE hold of
     /// `auth.lock`: consume → `bindings_ok` (client_id / redirect_uri /
     /// resource / PKCE, decided by the caller) → client still registered →
     /// mint the pair → link the code to the pair's family. A replay of an
     /// already-spent code revokes the family it minted (RFC 6749 §4.1.2
-    /// SHOULD) in the same hold.
+    /// SHOULD) in the same hold. That revoke is NOT best-effort any more: if
+    /// it cannot be saved, the call returns `Err` (→ 500) rather than
+    /// reporting a clean `invalid_grant` over a live family.
     ///
     /// One hold is what makes the replay hardening sound without an
     /// in-process mutex (#428 review): a replay can never run between the
@@ -872,18 +860,13 @@ impl AuthStore {
         })
     }
 
-    /// Look up `code` WITHOUT consuming it, checking expiry, or otherwise
-    /// authorizing anything — a read-only inspection (tests, diagnostics).
-    /// Never used to redeem a code; [`Self::exchange_code`] owns redemption
-    /// and replay hardening.
-    pub fn find_code_record(&self, code: &str) -> Result<Option<AuthCode>> {
-        Ok(self.load_codes()?.get(code).cloned())
-    }
-
     // ── Tokens ───────────────────────────────────────────────────────────
 
     /// Mint a fresh access+refresh pair with no bound `resource` — see
-    /// [`Self::issue_token_pair_for_resource`].
+    /// [`Self::issue_token_pair_for_resource`]. Test fixture only: in
+    /// production every pair comes from [`Self::exchange_code`] or
+    /// [`Self::rotate_refresh_for_client`].
+    #[cfg(test)]
     pub fn issue_token_pair(
         &self,
         client_id: &str,
@@ -895,7 +878,9 @@ impl AuthStore {
     /// Mint a fresh access+refresh pair (>= 32 random bytes each) sharing a
     /// new random `family` id, with [`ACCESS_TTL_SECS`]/[`REFRESH_TTL_SECS`]
     /// lifetimes and `resource` bound onto both (RFC 8707, #404). Persists
-    /// both before returning them.
+    /// both before returning them. Test fixture only (see
+    /// [`Self::issue_token_pair`]).
+    #[cfg(test)]
     pub fn issue_token_pair_for_resource(
         &self,
         client_id: &str,
@@ -1097,6 +1082,8 @@ impl AuthStore {
     /// action [`Self::rotate_refresh`]'s reuse-detection branch takes
     /// inline, and the one [`Self::exchange_code`]'s replay branch takes
     /// (via [`Self::revoke_family_locked`], inside its own lock hold).
+    /// Test-only entry point to that locked body.
+    #[cfg(test)]
     pub fn revoke_family(&self, family: &str) -> Result<()> {
         let _guard = self.lock_exclusive()?;
         self.revoke_family_locked(family)
@@ -1466,7 +1453,14 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
 /// (#429): the temp file is fsynced before the rename and, on unix, the
 /// parent directory after it, so a power cut cannot lose a write the caller
 /// was told succeeded. Windows has no directory fsync; there the rename's
-/// own metadata durability is NTFS's. A failed rename removes the temp file.
+/// own metadata durability is NTFS's.
+///
+/// Any failure after the temp file is opened (write, fsync, rename) removes
+/// it. Once the rename has succeeded the write IS committed and visible, so a
+/// failed directory fsync only warns: returning `Err` there would tell the
+/// caller a visible write failed — e.g. a refresh whose `rotated_to` is
+/// already saved would answer 500, and the client's retry would trip reuse
+/// detection and burn the family.
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent)?;
@@ -1486,10 +1480,19 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
             .open(&tmp)
             .with_context(|| format!("create {}", tmp.display()))?;
         use std::io::Write;
-        f.write_all(&bytes)
-            .with_context(|| format!("write {}", tmp.display()))?;
-        f.sync_all()
-            .with_context(|| format!("fsync {}", tmp.display()))?;
+        let written = write_fault::hit(write_fault::Stage::Write)
+            .and_then(|()| f.write_all(&bytes))
+            .with_context(|| format!("write {}", tmp.display()))
+            .and_then(|()| {
+                write_fault::hit(write_fault::Stage::SyncFile)
+                    .and_then(|()| f.sync_all())
+                    .with_context(|| format!("fsync {}", tmp.display()))
+            });
+        if let Err(e) = written {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
     }
     #[cfg(unix)]
     {
@@ -1505,11 +1508,55 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     }
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
-        std::fs::File::open(parent)
+        if let Err(e) = write_fault::hit(write_fault::Stage::SyncDir)
+            .and_then(|()| std::fs::File::open(parent))
             .and_then(|d| d.sync_all())
-            .with_context(|| format!("fsync dir {}", parent.display()))?;
+        {
+            tracing::warn!(error = %e, path = %parent.display(),
+                "gateway auth store write committed, but its directory fsync failed; \
+                 the change may not survive a power cut");
+        }
     }
     Ok(())
+}
+
+/// Fault injection for [`write_json_atomic`]'s I/O steps. Tests arm one
+/// stage on their own thread; production builds compile to a no-op.
+mod write_fault {
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) enum Stage {
+        Write,
+        SyncFile,
+        #[cfg_attr(not(unix), allow(dead_code))]
+        SyncDir,
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static ARMED: std::cell::Cell<Option<Stage>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Fail the next `stage` on this thread (once).
+    #[cfg(test)]
+    pub(super) fn arm(stage: Stage) {
+        ARMED.with(|a| a.set(Some(stage)));
+    }
+
+    #[cfg(test)]
+    pub(super) fn hit(stage: Stage) -> std::io::Result<()> {
+        if ARMED.with(|a| a.get()) == Some(stage) {
+            ARMED.with(|a| a.set(None));
+            return Err(std::io::Error::other("injected write fault"));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(super) fn hit(_stage: Stage) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Read + parse `path` as JSON; a missing file yields `T::default()` (empty
@@ -1669,51 +1716,6 @@ mod tests {
     // ── Auth-code replay hardening: minted_family linkage (Task 5) ──────
 
     #[test]
-    fn find_code_record_returns_none_for_unknown_code() {
-        let (_dir, store) = open_temp();
-        assert!(store.find_code_record("nope").unwrap().is_none());
-    }
-
-    #[test]
-    fn fresh_code_has_no_minted_family_until_marked() {
-        let (_dir, store) = open_temp();
-        let issued = store
-            .issue_code("client1", "https://cb", "chal", "res", "scope")
-            .unwrap();
-        assert!(issued.minted_family.is_none());
-
-        let record = store.find_code_record(&issued.code).unwrap().unwrap();
-        assert!(record.minted_family.is_none());
-        assert!(!record.used, "find_code_record must not consume");
-    }
-
-    #[test]
-    fn mark_code_minted_family_then_find_code_record_sees_it() {
-        let (_dir, store) = open_temp();
-        let issued = store
-            .issue_code("client1", "https://cb", "chal", "res", "scope")
-            .unwrap();
-        store.consume_code(&issued.code).unwrap();
-        store
-            .mark_code_minted_family(&issued.code, "fam-abc")
-            .unwrap();
-
-        let record = store.find_code_record(&issued.code).unwrap().unwrap();
-        assert!(record.used, "consume_code must have marked it used");
-        assert_eq!(record.minted_family.as_deref(), Some("fam-abc"));
-    }
-
-    #[test]
-    fn mark_code_minted_family_on_unknown_code_is_a_noop_not_an_error() {
-        let (_dir, store) = open_temp();
-        // Nothing panics or errors, and nothing is created.
-        store
-            .mark_code_minted_family("does-not-exist", "fam-abc")
-            .unwrap();
-        assert!(store.find_code_record("does-not-exist").unwrap().is_none());
-    }
-
-    #[test]
     fn revoke_family_kills_every_token_sharing_it_and_is_idempotent() {
         let (_dir, store) = open_temp();
         let (access, refresh) = store.issue_token_pair("client1", "scope").unwrap();
@@ -1756,37 +1758,42 @@ mod tests {
         );
     }
 
-    /// End-to-end proof of the exact replay-hardening flow the `/token`
-    /// handler drives: consume → mint tokens → mark the family → a SECOND
-    /// consume attempt fails (already used) → the handler looks the record
-    /// back up, finds `used && minted_family.is_some()`, and revokes it.
+    /// The replay-hardening flow end to end, sequentially: a redeemed code
+    /// is linked to the family it minted; replaying it is `invalid_grant`
+    /// AND revokes that family.
     #[test]
-    fn replayed_code_flow_end_to_end_revokes_the_family_it_minted() {
+    fn a_replayed_code_revokes_the_family_it_minted() {
         let (_dir, store) = open_temp();
+        store.register_client(client("client1")).unwrap();
         let issued = store
             .issue_code("client1", "https://cb", "chal", "res", "scope")
             .unwrap();
+        assert!(issued.minted_family.is_none());
 
-        let consumed = store.consume_code(&issued.code).unwrap().unwrap();
-        let (access, _refresh) = store
-            .issue_token_pair(&consumed.client_id, &consumed.scope)
-            .unwrap();
-        store
-            .mark_code_minted_family(&issued.code, &access.family)
-            .unwrap();
+        let CodeExchange::Issued { access, refresh } =
+            store.exchange_code(&issued.code, |_| true).unwrap()
+        else {
+            panic!("a fresh code must redeem");
+        };
+        let record = store.load_codes().unwrap()[&issued.code].clone();
+        assert!(record.used);
+        assert_eq!(
+            record.minted_family.as_deref(),
+            Some(access.family.as_str())
+        );
         assert!(store.check_access(&access.token).unwrap().is_some());
 
-        // Replay: consume_code now fails (already used).
-        assert!(store.consume_code(&issued.code).unwrap().is_none());
-        // The handler's reuse-hardening path.
-        let record = store.find_code_record(&issued.code).unwrap().unwrap();
-        assert!(record.used);
-        let family = record.minted_family.expect("family was marked above");
-        store.revoke_family(&family).unwrap();
-
+        assert_eq!(
+            store.exchange_code(&issued.code, |_| true).unwrap(),
+            CodeExchange::Invalid
+        );
         assert!(
             store.check_access(&access.token).unwrap().is_none(),
             "the access token minted from the replayed code must now be dead"
+        );
+        assert_eq!(
+            store.rotate_refresh(&refresh.token).unwrap(),
+            RotateOutcome::Invalid
         );
     }
 
@@ -2614,6 +2621,46 @@ mod tests {
         );
     }
 
+    /// #429 review F2: a failure at ANY step after the temp file is opened
+    /// removes it — not only a failed rename.
+    #[test]
+    fn a_failed_write_or_fsync_removes_the_temp_file() {
+        for stage in [write_fault::Stage::Write, write_fault::Stage::SyncFile] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("tokens.json");
+            write_fault::arm(stage);
+            let err = write_json_atomic(&target, &BTreeMap::<String, String>::new());
+            assert!(err.is_err(), "{stage:?}: the injected fault must surface");
+            assert!(
+                !dir.path().join("tokens.json.tmp").exists(),
+                "{stage:?}: a failed write left tokens.json.tmp behind"
+            );
+            assert!(!target.exists(), "{stage:?}: nothing may be committed");
+        }
+    }
+
+    /// #429 review F1: once the rename has committed the write, a failed
+    /// directory fsync must NOT turn into `Err`. Shown on the path the
+    /// reviewer hit: a refresh rotation whose `rotated_to` is already saved
+    /// must report `Rotated`, or the client's retry trips reuse detection.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_dir_fsync_after_a_committed_rename_is_not_an_error() {
+        let (_dir, store) = open_temp();
+        let (_access, refresh) = store.issue_token_pair("c1", "brain").unwrap();
+        write_fault::arm(write_fault::Stage::SyncDir);
+        let outcome = store
+            .rotate_refresh(&refresh.token)
+            .expect("a committed rotation must not report an error");
+        let RotateOutcome::Rotated { refresh: next, .. } = outcome else {
+            panic!("expected Rotated, got {outcome:?}");
+        };
+        assert!(matches!(
+            store.rotate_refresh(&next.token).unwrap(),
+            RotateOutcome::Rotated { .. }
+        ));
+    }
+
     /// A SECOND `AuthStore` handle on the same root stands in for a second
     /// process (the CLI vs. a running gateway): `flock`/`LockFileEx` locks
     /// conflict across distinct open file handles even inside one process,
@@ -3158,7 +3205,7 @@ mod tests {
         );
         assert!(store.consume_code(&pending.code).unwrap().is_none());
         assert!(store.check_access(&a2.token).unwrap().is_some());
-        assert!(store.find_code_record(&other_code.code).unwrap().is_some());
+        assert!(store.load_codes().unwrap().contains_key(&other_code.code));
     }
 
     #[test]
