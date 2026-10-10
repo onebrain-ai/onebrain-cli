@@ -2026,11 +2026,11 @@ mod tests {
         channel.fire(&pending);
         wait_for_requests(&state, 1).await;
 
-        channel.note_outcome("appr-2", "✅ Approved via native");
+        channel.note_outcome("appr-2", "💻 Answered on the Mac · allowed");
         // `sent` is drained synchronously inside the call above (before it
         // ever spawns the edit), so this second call is a no-op it can
         // prove without waiting for anything async to happen first.
-        channel.note_outcome("appr-2", "✅ Approved via native");
+        channel.note_outcome("appr-2", "💻 Answered on the Mac · allowed");
 
         let requests = wait_for_requests(&state, 2).await;
         assert_eq!(requests.len(), 2, "{requests:?}");
@@ -2039,7 +2039,7 @@ mod tests {
         assert_eq!(body["chat_id"], 5, "{body}");
         assert_eq!(body["message_id"], 77, "{body}");
         let text = body["text"].as_str().unwrap_or_default();
-        assert!(text.contains("Approved via native"), "{body}");
+        assert!(text.contains("Answered on the Mac · allowed"), "{body}");
         assert!(
             text.contains("An unnamed app wants to save a new note"),
             "the edit must still carry the original summary text: {body}"
@@ -2122,7 +2122,10 @@ mod tests {
         // Synchronous, and the mock will not answer the send for another
         // 300ms — so this provably lands while `fire`'s closure is still
         // waiting on the wire, with `sent` still empty.
-        channel.note_outcome("appr-race", "⏰ Expired — no one answered in time");
+        channel.note_outcome(
+            "appr-race",
+            "⌛ Timed out · denied automatically, nothing written",
+        );
         assert_eq!(
             channel.sent_len(),
             1,
@@ -2136,7 +2139,7 @@ mod tests {
         assert_eq!(body["chat_id"], 5, "{body}");
         assert_eq!(body["message_id"], 909, "{body}");
         let text = body["text"].as_str().unwrap_or_default();
-        assert!(text.contains("Expired — no one answered in time"), "{body}");
+        assert!(text.contains("Timed out · denied automatically"), "{body}");
         assert!(
             text.contains("An unnamed app wants to save a new note"),
             "the edit must still carry the original summary text: {body}"
@@ -2189,7 +2192,7 @@ mod tests {
         // just that nothing has happened yet.
         wait_for_requests(&state, 1).await;
 
-        channel.note_outcome("appr-3", "✅ Approved via http");
+        channel.note_outcome("appr-3", "💻 Answered on the approvals page · allowed");
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(
             state.requests().len(),

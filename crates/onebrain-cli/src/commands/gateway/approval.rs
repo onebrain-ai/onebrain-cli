@@ -172,7 +172,7 @@ pub struct PendingApproval {
 }
 
 /// Longest client name (in chars) shown to an approver before an ellipsis.
-const CLIENT_NAME_MAX_CHARS: usize = 64;
+pub(crate) const CLIENT_NAME_MAX_CHARS: usize = 64;
 
 /// Quote a user-supplied string for an operator-facing summary: every
 /// printable character (Thai combining marks, emoji, ...) passes through
@@ -242,8 +242,7 @@ pub fn sanitize_client_name(raw: &str) -> Option<String> {
     if raw.trim().is_empty() {
         return None;
     }
-    let mut escaped = String::new();
-    push_escaped(&mut escaped, raw);
+    let escaped = escape_visible(raw);
     if escaped.chars().count() <= CLIENT_NAME_MAX_CHARS {
         return Some(escaped);
     }

@@ -12,12 +12,12 @@
 
 use serde::Serialize;
 
-use super::approval::{client_id_short, escape_visible, Decision, PendingApproval, ResolvedVia};
+use super::approval::{
+    client_id_short, escape_visible, Decision, PendingApproval, ResolvedVia, CLIENT_NAME_MAX_CHARS,
+};
 
 /// Longest subject (title / path / query), in chars, kept on a pending
 /// entry; longer ones get an ellipsis.
-const CLIENT_NAME_MAX_CHARS: usize = 64;
-
 const SUBJECT_MAX_CHARS: usize = 120;
 
 /// The call-specific facts an approver should see, besides tool and vault.
@@ -74,10 +74,17 @@ fn allowed_detail(p: &PendingApproval) -> String {
     match (p.tool.as_str(), &p.subject.subject) {
         ("brain_capture", Some(t)) => format!("\"{}\"", display_text(t)),
         ("brain_capture", None) => "a new note".to_string(),
-        ("brain_get", _) => "read a note".to_string(),
-        ("brain_search", _) => "search your vault".to_string(),
-        ("brain_tasks", _) => "read your task list".to_string(),
-        (other, _) => format!("run {}", display_text(other)),
+        (tool, _) => plain_action(tool),
+    }
+}
+
+/// The plain action for a tool that has no title to quote.
+fn plain_action(tool: &str) -> String {
+    match tool {
+        "brain_get" => "read a note".to_string(),
+        "brain_search" => "search your vault".to_string(),
+        "brain_tasks" => "read your task list".to_string(),
+        other => format!("run {}", display_text(other)),
     }
 }
 
@@ -117,10 +124,16 @@ fn wait_phrase(remaining_secs: u64) -> String {
     }
 }
 
+/// A client-supplied vault name, escaped and capped like the client name
+/// (it is checked against `gateway.yml` only after the approval gate).
+fn vault_display(v: &str) -> String {
+    display_text(&cap_name(v))
+}
+
 fn vault_text(p: &PendingApproval) -> String {
     p.vault
         .as_deref()
-        .map_or_else(|| "default vault".to_string(), display_text)
+        .map_or_else(|| "default vault".to_string(), vault_display)
 }
 
 /// Telegram message body: headline, detail rows and the "asked by" line —
@@ -213,8 +226,11 @@ pub fn telegram_outcome(p: &PendingApproval, outcome: Outcome) -> String {
                 (ResolvedVia::Telegram, true) => {
                     format!("\u{2705} Allowed \u{b7} {}", allowed_detail(p))
                 }
-                (ResolvedVia::Telegram, false) => {
+                (ResolvedVia::Telegram, false) if p.tool == "brain_capture" => {
                     "\u{26d4} Denied \u{b7} nothing was written to the vault".to_string()
+                }
+                (ResolvedVia::Telegram, false) => {
+                    format!("\u{26d4} Denied \u{b7} {}", plain_action(&p.tool))
                 }
                 (ResolvedVia::Native, a) => format!(
                     "\u{1f4bb} Answered on the Mac \u{b7} {}",
@@ -245,7 +261,7 @@ pub fn dialog_lines(p: &PendingApproval, remaining_secs: u64) -> Vec<String> {
     let vault = p
         .vault
         .as_deref()
-        .map_or_else(|| "default".to_string(), display_text);
+        .map_or_else(|| "default".to_string(), vault_display);
     match p.tool.as_str() {
         "brain_capture" => {
             if let Some(t) = &p.subject.subject {
@@ -512,6 +528,50 @@ mod tests {
         let t = telegram_prompt(&p, 1000);
         assert_eq!(t.lines().count(), 8, "no injected lines: {t}");
         assert_eq!(dialog_lines(&p, 240).len(), 7);
+    }
+
+    #[test]
+    fn hostile_long_vault_is_capped_in_telegram_and_dialog() {
+        let mut p = capture();
+        p.vault = Some(format!("v\u{202e}\n{}", "x".repeat(5000)));
+        let t = telegram_prompt(&p, 1000);
+        assert!(t.chars().count() < 600, "{} chars", t.chars().count());
+        assert!(!t.contains('\u{202e}'), "{t}");
+        assert_eq!(t.lines().count(), 8, "{t}");
+        let vault_line = dialog_lines(&p, 240)
+            .into_iter()
+            .find(|l| l.starts_with("Vault:"))
+            .unwrap();
+        assert!(vault_line.chars().count() < 13 + 64 + 20, "{vault_line}");
+        assert!(vault_line.ends_with('\u{2026}'), "{vault_line}");
+        assert!(describe(&p, 1000).chars().count() < 400);
+    }
+
+    #[test]
+    fn denied_read_tools_name_the_action_not_a_write() {
+        let deny = Outcome::Decided(Decision::Deny, ResolvedVia::Telegram);
+        let mut p = capture();
+        assert_eq!(
+            telegram_outcome(&p, deny),
+            "\u{26d4} Denied \u{b7} nothing was written to the vault"
+        );
+        p.tool = "brain_get".to_string();
+        assert_eq!(
+            telegram_outcome(&p, deny),
+            "\u{26d4} Denied \u{b7} read a note"
+        );
+        p.tool = "brain_search".to_string();
+        assert_eq!(
+            telegram_outcome(&p, deny),
+            "\u{26d4} Denied \u{b7} search your vault"
+        );
+    }
+
+    #[test]
+    fn client_names_keep_plain_quotes() {
+        let mut p = capture();
+        p.client_name = crate::commands::gateway::approval::sanitize_client_name("My \"App\"");
+        assert!(telegram_body(&p).starts_with("\u{1f510} My \"App\" wants to"));
     }
 
     #[test]

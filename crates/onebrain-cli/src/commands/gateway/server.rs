@@ -985,18 +985,6 @@ fn extract_principal(parts: &Parts) -> Result<Principal, ErrorData> {
 /// marker it is when grepping the audit log.
 const UNKNOWN_PRINCIPAL_CLIENT_ID: &str = "<no-principal>";
 
-/// [`extract_principal`], plus one more thing: on failure, records a
-/// minimal audit entry BEFORE returning the error (Task 3 review, binding
-/// requirement B). The bare `extract_principal(&parts)?` this replaces
-/// (Task 2's original shape, one call per tool handler) returned via `?`
-/// before `record_audit` ever had a `principal` to build an entry from — a
-/// genuine "can't happen" path (see [`extract_principal`]'s own doc
-/// comment: not reachable through `build_gateway_router` today, since
-/// `require_bearer` wraps the WHOLE `/mcp` nest) that nonetheless left ZERO
-/// audit trail if it ever somehow did happen. Now it leaves exactly one
-/// entry: `client_id` = [`UNKNOWN_PRINCIPAL_CLIENT_ID`] (there is no real
-/// principal to name) and `decision` = [`Decision::Denied`] (the call was
-/// refused outright, not asked-about-and-left-blocked).
 /// The operator-facing `args_summary` for `brain_capture` (see the call
 /// site for the never-the-body rule): title and vault via
 /// [`approval::summary_opt`], the body by char count only.
@@ -1009,6 +997,18 @@ fn capture_summary(title: Option<&str>, vault: Option<&str>, text: &str) -> Stri
     )
 }
 
+/// [`extract_principal`], plus one more thing: on failure, records a
+/// minimal audit entry BEFORE returning the error (Task 3 review, binding
+/// requirement B). The bare `extract_principal(&parts)?` this replaces
+/// (Task 2's original shape, one call per tool handler) returned via `?`
+/// before `record_audit` ever had a `principal` to build an entry from — a
+/// genuine "can't happen" path (see [`extract_principal`]'s own doc
+/// comment: not reachable through `build_gateway_router` today, since
+/// `require_bearer` wraps the WHOLE `/mcp` nest) that nonetheless left ZERO
+/// audit trail if it ever somehow did happen. Now it leaves exactly one
+/// entry: `client_id` = [`UNKNOWN_PRINCIPAL_CLIENT_ID`] (there is no real
+/// principal to name) and `decision` = [`Decision::Denied`] (the call was
+/// refused outright, not asked-about-and-left-blocked).
 async fn extract_principal_audited(
     state: &Arc<GatewayState>,
     tool: &'static str,
@@ -1086,6 +1086,22 @@ async fn announce_approval_wait(
     }
 }
 
+/// The client's self-registered name, sanitized for display. A single small
+/// read, done only when an approval is created; any failure means no name.
+fn registered_client_name(state: &GatewayState, client_id: &str) -> Option<String> {
+    let ctx = state.auth.get()?;
+    let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
+    let name = store.get_client(client_id).ok().flatten()?.client_name?;
+    approval::sanitize_client_name(&name)
+}
+
+/// What a gated call tells the approval machinery about itself: the
+/// redacted audit line, plus the structured facts the prompts are built from.
+struct GateCall<'a> {
+    args_summary: &'a str,
+    subject: approval_view::ApprovalSubject,
+}
+
 /// Runs the policy check ([`policy::decide`]) for one tool call of risk
 /// class `class`. `Ok((Decision::Auto | Decision::Approved, channel))` means
 /// the call may proceed; `Err((Decision, channel, ErrorData))` carries the
@@ -1129,22 +1145,6 @@ async fn announce_approval_wait(
 /// entry (never the raw tool arguments, never a note body — see
 /// `audit::AuditEntry::args_summary`'s own doc comment), so there is no
 /// second summary to keep in sync.
-/// The client's self-registered name, sanitized for display. A single small
-/// read, done only when an approval is created; any failure means no name.
-fn registered_client_name(state: &GatewayState, client_id: &str) -> Option<String> {
-    let ctx = state.auth.get()?;
-    let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
-    let name = store.get_client(client_id).ok().flatten()?.client_name?;
-    approval::sanitize_client_name(&name)
-}
-
-/// What a gated call tells the approval machinery about itself: the
-/// redacted audit line, plus the structured facts the prompts are built from.
-struct GateCall<'a> {
-    args_summary: &'a str,
-    subject: approval_view::ApprovalSubject,
-}
-
 async fn policy_gate(
     state: &Arc<GatewayState>,
     principal: &Principal,
@@ -2355,7 +2355,12 @@ impl ServerHandler for GatewayServer {
 /// `tests::every_non_mcp_route_rejects_a_rebinding_host_on_the_real_router` /
 /// `tests::public_url_host_reaches_oauth_and_mcp_through_both_guards`.
 pub fn build_gateway_router(state: Arc<GatewayState>, auth_ctx: Arc<AuthCtx>) -> axum::Router {
-    let _ = state.auth.set(auth_ctx.clone());
+    // Built once per process; a second, different context would be a bug.
+    let first = state.auth.set(auth_ctx.clone()).is_ok();
+    debug_assert!(
+        first,
+        "build_gateway_router called twice for one GatewayState"
+    );
     // Cloned BEFORE the `move` closure below takes ownership of `state` for
     // the `/mcp` factory's own per-request `state.clone()` — `approval_router`
     // needs its own handle on the SAME `Arc<GatewayState>` afterward.
