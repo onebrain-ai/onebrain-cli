@@ -776,7 +776,9 @@ fn spawn_and_authenticate(mock_base: &str, bot_token: &str) -> Harness {
 }
 
 /// Run the real `onebrain` CLI against the sandbox HOME (no gateway IPC —
-/// it only writes the store), asserting success.
+/// it only writes the store), asserting success. Callers pass a client id
+/// as `--client=<id>` or after `--`: ids are random base64url and may
+/// start with `-`, which clap would otherwise read as a flag.
 fn onebrain_cli(home: &Path, args: &[&str]) {
     let out = Command::new(env!("CARGO_BIN_EXE_onebrain"))
         .env("ONEBRAIN_CACHE_DIR", support::scratch_cache_root())
@@ -957,7 +959,12 @@ fn tokens_revoke_client_denies_a_pending_capture() {
     assert_revoke_verb_denies_a_pending_capture(|h| {
         onebrain_cli(
             h.home.path(),
-            &["gateway", "tokens", "revoke", "--client", &h.client_id],
+            &[
+                "gateway",
+                "tokens",
+                "revoke",
+                &format!("--client={}", h.client_id),
+            ],
         );
     });
 }
@@ -967,7 +974,7 @@ fn clients_remove_denies_a_pending_capture() {
     assert_revoke_verb_denies_a_pending_capture(|h| {
         onebrain_cli(
             h.home.path(),
-            &["gateway", "clients", "remove", &h.client_id],
+            &["gateway", "clients", "remove", "--", &h.client_id],
         );
     });
 }
@@ -985,7 +992,12 @@ fn an_allow_after_a_revoke_writes_nothing() {
 
     onebrain_cli(
         h.home.path(),
-        &["gateway", "tokens", "revoke", "--client", &h.client_id],
+        &[
+            "gateway",
+            "tokens",
+            "revoke",
+            &format!("--client={}", h.client_id),
+        ],
     );
     let (status, body) = resolve(&h, &id, "approve");
     assert!(
@@ -1062,7 +1074,12 @@ fn an_ask_once_grant_is_not_reused_after_revoke_client_and_reconsent() {
 
     onebrain_cli(
         h.home.path(),
-        &["gateway", "tokens", "revoke", "--client", &h.client_id],
+        &[
+            "gateway",
+            "tokens",
+            "revoke",
+            &format!("--client={}", h.client_id),
+        ],
     );
     let (fresh, _) = consent(
         &http_agent(),
