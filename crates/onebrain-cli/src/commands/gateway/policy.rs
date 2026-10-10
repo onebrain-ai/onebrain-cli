@@ -449,6 +449,7 @@ mod tests {
         Principal {
             client_id: "client-1".to_string(),
             scope: scope.to_string(),
+            client_name: None,
         }
     }
 

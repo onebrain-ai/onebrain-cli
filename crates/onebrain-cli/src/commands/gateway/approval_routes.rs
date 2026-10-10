@@ -256,6 +256,7 @@ mod tests {
             created: now,
             expires: now + 300,
             class: RiskClass::Mutating,
+            client_name: None,
         }
     }
 

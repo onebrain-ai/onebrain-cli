@@ -990,6 +990,18 @@ const UNKNOWN_PRINCIPAL_CLIENT_ID: &str = "<no-principal>";
 /// entry: `client_id` = [`UNKNOWN_PRINCIPAL_CLIENT_ID`] (there is no real
 /// principal to name) and `decision` = [`Decision::Denied`] (the call was
 /// refused outright, not asked-about-and-left-blocked).
+/// The operator-facing `args_summary` for `brain_capture` (see the call
+/// site for the never-the-body rule): title and vault via
+/// [`approval::summary_opt`], the body by char count only.
+fn capture_summary(title: Option<&str>, vault: Option<&str>, text: &str) -> String {
+    format!(
+        "capture: title={} vault={} text_chars={}",
+        approval::summary_opt(title, "(none)"),
+        approval::summary_opt(vault, "default"),
+        text.chars().count()
+    )
+}
+
 async fn extract_principal_audited(
     state: &Arc<GatewayState>,
     tool: &'static str,
@@ -1258,6 +1270,10 @@ async fn await_approval(
         created: now,
         expires: now.saturating_add(wait_secs),
         class,
+        client_name: principal
+            .client_name
+            .as_deref()
+            .and_then(approval::sanitize_client_name),
     };
     let id = pending.id.clone();
     let rx = match state.approvals.register(pending.clone()) {
@@ -1675,8 +1691,12 @@ impl GatewayServer {
             extract_principal_audited(&self.state, "brain_tasks", started, &parts).await?;
         let vault = params.vault.clone();
         let args_summary = format!(
-            "tasks: due_by={:?} limit={:?} vault={:?}",
-            params.due_by, params.limit, params.vault
+            "tasks: due_by={} limit={} vault={}",
+            approval::summary_opt(params.due_by.as_deref(), "(none)"),
+            params
+                .limit
+                .map_or_else(|| "(none)".to_string(), |n| n.to_string()),
+            approval::summary_opt(params.vault.as_deref(), "default")
         );
 
         let (decision, channel, result) = match policy_gate(
@@ -1772,7 +1792,11 @@ impl GatewayServer {
         let principal =
             extract_principal_audited(&self.state, "brain_get", started, &parts).await?;
         let vault = params.vault.clone();
-        let args_summary = format!("get: {} vault={:?}", params.file, params.vault);
+        let args_summary = format!(
+            "get: {} vault={}",
+            approval::summary_value(&params.file),
+            approval::summary_opt(params.vault.as_deref(), "default")
+        );
 
         let (decision, channel, result) = match policy_gate(
             &self.state,
@@ -1864,8 +1888,12 @@ impl GatewayServer {
             extract_principal_audited(&self.state, "brain_search", started, &parts).await?;
         let vault = params.vault.clone();
         let args_summary = format!(
-            "search: {:?} top_k={:?} vault={:?}",
-            params.query, params.top_k, params.vault
+            "search: {} top_k={} vault={}",
+            approval::summary_value(&params.query),
+            params
+                .top_k
+                .map_or_else(|| "(none)".to_string(), |n| n.to_string()),
+            approval::summary_opt(params.vault.as_deref(), "default")
         );
 
         let (decision, channel, result) = match policy_gate(
@@ -1958,11 +1986,10 @@ impl GatewayServer {
         // `audit::AuditEntry::args_summary`'s own doc comment (this string
         // also becomes `PendingApproval::summary` if the call needs
         // approval, an operator-facing field with the identical constraint).
-        let args_summary = format!(
-            "capture: title={:?} vault={:?} text_chars={}",
-            params.title,
-            params.vault,
-            params.text.chars().count()
+        let args_summary = capture_summary(
+            params.title.as_deref(),
+            params.vault.as_deref(),
+            &params.text,
         );
 
         let (decision, channel, result) = match policy_gate(
@@ -4373,6 +4400,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn capture_summary_keeps_thai_titles_readable_and_never_shows_option_debug() {
+        assert_eq!(
+            capture_summary(Some("ทดสอบ approve จากมือถือ 1"), None, &"x".repeat(25)),
+            "capture: title=\"ทดสอบ approve จากมือถือ 1\" vault=default text_chars=25"
+        );
+        assert_eq!(
+            capture_summary(None, Some("work"), "body"),
+            "capture: title=(none) vault=\"work\" text_chars=4"
+        );
+    }
+
     // ── args_summary is bounded before it is recorded (round-2 finding C) ─
 
     #[test]
@@ -5601,6 +5640,7 @@ mod tests {
                         created: now,
                         expires: now + 300,
                         class: RiskClass::Mutating,
+                        client_name: None,
                     })
                     .unwrap_or_else(|e| panic!("filler {i} must fit under the cap: {e:?}")),
             );
@@ -5697,6 +5737,7 @@ mod tests {
                 created: now,
                 expires: now + 300,
                 class: RiskClass::Mutating,
+                client_name: None,
             }
         };
         let deny = approval::Decision::Deny;

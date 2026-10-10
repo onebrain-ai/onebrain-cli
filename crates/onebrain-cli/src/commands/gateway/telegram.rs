@@ -568,7 +568,9 @@ impl TelegramChannel {
         let expires = pending.expires;
         let text = format!(
             "Client: {}\nTool: {}\n\n{}",
-            pending.client_id, pending.tool, pending.summary
+            pending.client_line(),
+            pending.tool,
+            pending.summary
         );
         tokio::task::spawn_blocking(move || {
             let approve_data = format!("a:{id}");
@@ -1888,7 +1890,61 @@ mod tests {
             created: now,
             expires: now + 300,
             class: crate::commands::gateway::policy::RiskClass::Mutating,
+            client_name: None,
         }
+    }
+
+    /// Fire `pending` at a mock server and return the sent message text.
+    async fn fired_text(pending: &PendingApproval) -> String {
+        let state = MockState::default();
+        state.set_response(
+            "sendMessage",
+            serde_json::json!({ "ok": true, "result": { "message_id": 1 } }),
+        );
+        let server = MockServer::start(state.clone());
+        let _env = crate::test_env::set_var(TELEGRAM_API_BASE_ENV, server.base.as_str());
+        let channel = TelegramChannel::new(&configured());
+        channel.fire(pending);
+        let requests = wait_for_requests(&state, 1).await;
+        requests[0].1["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn fire_names_the_client_as_unverified_with_a_short_id() {
+        let mut p = sample_pending("appr-name");
+        p.client_id = "rKkfrep1IPUdbsIDkOsWPZoYfdIc6cx-qL8Vj1CGY58".to_string();
+        p.client_name = Some("Claude".to_string());
+        let text = fired_text(&p).await;
+        assert!(
+            text.starts_with("Client: Claude (unverified name) \u{b7} id rKkfrep1\u{2026}Y58\n"),
+            "{text}"
+        );
+        p.client_name = None;
+        let text = fired_text(&p).await;
+        assert!(
+            text.starts_with("Client: id rKkfrep1\u{2026}Y58\n"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fire_neutralises_a_hostile_client_name() {
+        let mut p = sample_pending("appr-hostile");
+        p.client_name = crate::commands::gateway::approval::sanitize_client_name(&format!(
+            "evil\u{202e}\nname{}",
+            "z".repeat(200)
+        ));
+        let text = fired_text(&p).await;
+        assert!(!text.contains('\u{202e}'), "{text}");
+        let first = text.lines().next().unwrap();
+        assert!(
+            first.starts_with("Client: evil\\u{202e}\\u{a}name"),
+            "{first}"
+        );
+        assert!(first.chars().count() < 120, "cap not applied: {first}");
     }
 
     #[tokio::test]
@@ -1915,7 +1971,7 @@ mod tests {
         // (very often the one AWAY from the machine the native dialog
         // would pop on) can see which connected client is asking.
         assert!(
-            text.contains(&format!("Client: {}", pending.client_id)),
+            text.contains(&format!("Client: {}", pending.client_line())),
             "{body}"
         );
         assert!(text.contains(&format!("Tool: {}", pending.tool)), "{body}");

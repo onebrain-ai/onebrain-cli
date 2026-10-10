@@ -319,11 +319,11 @@ fn dialog_timeout_secs(p: &PendingApproval, now: u64) -> u64 {
 /// produces the value). Pure and fully unit-testable without ever invoking
 /// `osascript`.
 fn build_dialog_script(p: &PendingApproval, giving_up_after: u64) -> String {
-    let client_id = escape_applescript_string(&p.client_id);
+    let client = escape_applescript_string(&p.client_line());
     let tool = escape_applescript_string(&p.tool);
     let summary = escape_applescript_string(&p.summary);
     format!(
-        "display dialog \"OneBrain gateway approval request\\n\\nClient: {client_id}\\nTool: {tool}\\nSummary: {summary}\" with title \"OneBrain Gateway\" buttons {{\"Deny\", \"Approve\"}} default button \"Approve\" with icon caution giving up after {giving_up_after}"
+        "display dialog \"OneBrain gateway approval request\\n\\nClient: {client}\\nTool: {tool}\\nSummary: {summary}\" with title \"OneBrain Gateway\" buttons {{\"Deny\", \"Approve\"}} default button \"Approve\" with icon caution giving up after {giving_up_after}"
     )
 }
 
@@ -488,6 +488,7 @@ mod tests {
             created: now,
             expires: now + 300,
             class: crate::commands::gateway::policy::RiskClass::Mutating,
+            client_name: None,
         }
     }
 
@@ -605,9 +606,9 @@ mod tests {
     // ── build_dialog_script: the payload appears only escaped ───────────
 
     #[test]
-    fn build_dialog_script_embeds_only_the_escaped_form_of_a_malicious_client_id() {
+    fn build_dialog_script_embeds_only_the_escaped_form_of_a_malicious_client_name() {
         let mut p = sample();
-        p.client_id = r#"" & do shell script "id"#.to_string();
+        p.client_name = Some(r#"" & do shell script "id"#.to_string());
         let script = build_dialog_script(&p, 300);
         assert!(
             !script.contains(r#"" & do shell script "id"#),
@@ -624,8 +625,39 @@ mod tests {
         let script = build_dialog_script(&sample(), 300);
         assert!(script.contains("buttons {\"Deny\", \"Approve\"}"));
         assert!(script.contains("default button \"Approve\""));
-        assert!(script.contains("Client: client-1"));
+        assert!(script.contains("Client: id client-1"));
         assert!(script.contains("Tool: brain_capture"));
+    }
+
+    #[test]
+    fn build_dialog_script_shows_the_client_name_and_short_id() {
+        let mut p = sample();
+        p.client_id = "rKkfrep1IPUdbsIDkOsWPZoYfdIc6cx-qL8Vj1CGY58".to_string();
+        p.client_name = Some("Claude".to_string());
+        let script = build_dialog_script(&p, 300);
+        assert!(
+            script.contains("Client: Claude (unverified name) \u{b7} id rKkfrep1\u{2026}Y58\\n"),
+            "{script}"
+        );
+        p.client_name = None;
+        let script = build_dialog_script(&p, 300);
+        assert!(
+            script.contains("Client: id rKkfrep1\u{2026}Y58\\n"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn build_dialog_script_neutralises_a_hostile_client_name() {
+        let mut p = sample();
+        p.client_name = crate::commands::gateway::approval::sanitize_client_name(&format!(
+            "evil\u{202e}\nname{}",
+            "z".repeat(200)
+        ));
+        let script = build_dialog_script(&p, 300);
+        assert!(!script.contains('\u{202e}'), "{script}");
+        assert!(!script.contains("evil\nname"), "{script}");
+        assert!(script.len() < 600, "cap not applied: {}", script.len());
     }
 
     // ── The dialog is time-bounded (round-2 finding A) ───────────────────

@@ -160,6 +160,109 @@ pub struct PendingApproval {
     /// the pending list benefits from seeing exactly what class of access is
     /// being asked for, same as `tool`/`summary`.
     pub class: RiskClass,
+    /// The client's SELF-REGISTERED name (DCR `client_name`), already passed
+    /// through [`sanitize_client_name`] (visible escapes for control/bidi
+    /// characters, capped). Untrusted: the approver sees it labelled
+    /// "unverified" (see [`PendingApproval::client_line`]). `None` when the
+    /// store has no name or the lookup failed.
+    pub client_name: Option<String>,
+}
+
+/// Longest client name (in chars) shown to an approver before an ellipsis.
+const CLIENT_NAME_MAX_CHARS: usize = 64;
+
+/// Quote a user-supplied string for an operator-facing summary: every
+/// printable character (Thai combining marks, emoji, ...) passes through
+/// unchanged; `"` and `\` are backslash-escaped; control characters and
+/// Unicode bidi/line-separator characters become a visible `\u{..}` escape
+/// so they can neither spoof the surrounding text nor break the line.
+pub fn summary_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    push_escaped(&mut out, s);
+    out.push('"');
+    out
+}
+
+fn push_escaped(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() || is_bidi_or_separator(c) => {
+                out.push_str(&format!("\\u{{{:x}}}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+/// Bidi controls (embeddings/overrides/isolates/marks) and the Unicode line
+/// and paragraph separators: invisible, yet able to reorder or split the text
+/// an approver reads.
+fn is_bidi_or_separator(c: char) -> bool {
+    matches!(
+        c,
+        '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{061C}'
+            | '\u{2028}'
+            | '\u{2029}'
+    )
+}
+
+/// `Some(s)` -> [`summary_value`]; `None` -> `none_label` verbatim.
+pub fn summary_opt(s: Option<&str>, none_label: &str) -> String {
+    s.map_or_else(|| none_label.to_string(), summary_value)
+}
+
+/// Neutralise a self-registered client name for display: escape as
+/// [`summary_value`] does (without the quotes), then cap at
+/// [`CLIENT_NAME_MAX_CHARS`] chars with an ellipsis. Blank -> `None`.
+pub fn sanitize_client_name(raw: &str) -> Option<String> {
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let mut escaped = String::new();
+    push_escaped(&mut escaped, raw);
+    if escaped.chars().count() <= CLIENT_NAME_MAX_CHARS {
+        return Some(escaped);
+    }
+    let mut cut: String = escaped.chars().take(CLIENT_NAME_MAX_CHARS).collect();
+    // Never leave a half-written escape (`\u{20`) at the cut.
+    if let Some(i) = cut.rfind('\\') {
+        if cut[i..].starts_with("\\u{") && !cut[i..].contains('}') {
+            cut.truncate(i);
+        }
+    }
+    cut.push('\u{2026}');
+    Some(cut)
+}
+
+/// First 8 + last 3 chars of a client_id (`rKkfrep1…Y58`); short ids as-is.
+fn short_client_id(id: &str) -> String {
+    let n = id.chars().count();
+    if n <= 12 {
+        return id.to_string();
+    }
+    let head: String = id.chars().take(8).collect();
+    let tail: String = id.chars().skip(n - 3).collect();
+    format!("{head}\u{2026}{tail}")
+}
+
+impl PendingApproval {
+    /// The "who is asking" text shared verbatim by the native dialog and the
+    /// Telegram message: `Claude (unverified name) · id rKkfrep1…Y58`, or
+    /// `id rKkfrep1…Y58` alone when no name is known.
+    pub fn client_line(&self) -> String {
+        let id = short_client_id(&self.client_id);
+        match &self.client_name {
+            Some(name) => format!("{name} (unverified name) \u{b7} id {id}"),
+            None => format!("id {id}"),
+        }
+    }
 }
 
 /// A human operator's response to one [`PendingApproval`] — deliberately a
@@ -519,6 +622,60 @@ impl Default for Approvals {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn summary_value_passes_thai_combining_marks_and_emoji_through() {
+        assert_eq!(
+            summary_value("ทดสอบ approve จากมือถือ 1"),
+            "\"ทดสอบ approve จากมือถือ 1\""
+        );
+        assert_eq!(summary_value("ok 🚀"), "\"ok 🚀\"");
+    }
+
+    #[test]
+    fn summary_value_escapes_quote_and_backslash() {
+        assert_eq!(summary_value(r#"a"b\c"#), r#""a\"b\\c""#);
+    }
+
+    #[test]
+    fn summary_value_makes_bidi_and_control_characters_visible() {
+        assert_eq!(summary_value("a\u{202e}b"), "\"a\\u{202e}b\"");
+        assert_eq!(summary_value("a\nb\tc"), "\"a\\u{a}b\\u{9}c\"");
+        assert_eq!(
+            summary_value("\u{2066}\u{200f}\u{61c}"),
+            "\"\\u{2066}\\u{200f}\\u{61c}\""
+        );
+    }
+
+    #[test]
+    fn summary_opt_renders_none_as_the_given_label() {
+        assert_eq!(summary_opt(None, "default"), "default");
+        assert_eq!(summary_opt(Some("v"), "default"), "\"v\"");
+    }
+
+    #[test]
+    fn sanitize_client_name_neutralises_and_caps_hostile_names() {
+        let hostile = format!("evil\u{202e}name\nline{}", "z".repeat(200));
+        let out = sanitize_client_name(&hostile).unwrap();
+        assert!(!out.contains('\u{202e}') && !out.contains('\n'), "{out}");
+        assert!(out.contains("\\u{202e}"), "{out}");
+        assert!(out.chars().count() <= 65, "{} chars", out.chars().count());
+        assert!(out.ends_with('\u{2026}'));
+        assert_eq!(sanitize_client_name("Claude").as_deref(), Some("Claude"));
+        assert_eq!(sanitize_client_name("  "), None);
+    }
+
+    #[test]
+    fn client_line_shows_name_and_short_id_or_short_id_alone() {
+        let mut p = sample("a1");
+        p.client_id = "rKkfrep1IPUdbsIDkOsWPZoYfdIc6cx-qL8Vj1CGY58".to_string();
+        assert_eq!(p.client_line(), "id rKkfrep1\u{2026}Y58");
+        p.client_name = Some("Claude".to_string());
+        assert_eq!(
+            p.client_line(),
+            "Claude (unverified name) \u{b7} id rKkfrep1\u{2026}Y58"
+        );
+    }
+
     use super::*;
 
     /// A pending entry whose TTL is comfortably LIVE. That matters:
@@ -541,6 +698,7 @@ mod tests {
             created: now,
             expires: now + 300,
             class: RiskClass::Mutating,
+            client_name: None,
         }
     }
 
@@ -797,7 +955,7 @@ mod tests {
         assert!(p.expires > p.created, "{p:?}");
         assert_eq!(p.class, RiskClass::Mutating);
 
-        // Serializes to EXACTLY these 8 fields — a JSON object with no extra
+        // Serializes to EXACTLY these 9 fields — a JSON object with no extra
         // keys, so no token / full note body / host path could sneak in
         // through a field this struct doesn't have. (`vault` is a
         // `gateway.yml` vault NAME, never a path — see its own doc comment.)
@@ -810,6 +968,7 @@ mod tests {
             [
                 "class",
                 "client_id",
+                "client_name",
                 "created",
                 "expires",
                 "id",
