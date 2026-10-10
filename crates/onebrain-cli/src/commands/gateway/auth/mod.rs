@@ -9,9 +9,8 @@
 //! rest of the authorization-server surface against that same `AuthCtx`:
 //! `POST /register` (RFC 7591), `GET`/`POST /authorize` (the consent flow),
 //! and `POST /token` (code exchange + refresh rotation, including the RFC
-//! 6749 §4.1.2 replay hardening that added
-//! [`store::AuthStore::mark_code_minted_family`]/
-//! [`store::AuthStore::find_code_record`]/[`store::AuthStore::revoke_family`]).
+//! 6749 §4.1.2 replay hardening, now one locked
+//! [`store::AuthStore::exchange_code`] call since the #428 review).
 //!
 //! Design ruling (not JWT): tokens are random opaque strings looked up in
 //! [`store::AuthStore`], not signed/self-describing JWTs — this workspace

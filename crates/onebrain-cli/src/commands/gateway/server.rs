@@ -1089,10 +1089,16 @@ async fn announce_approval_wait(
 
 /// The client's self-registered name, sanitized for display. A single small
 /// read, done only when an approval is created; any failure means no name.
-fn registered_client_name(state: &GatewayState, client_id: &str) -> Option<String> {
-    let ctx = state.auth.get()?;
-    let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
-    let name = store.get_client(client_id).ok().flatten()?.client_name?;
+/// Runs on `spawn_blocking`, off the runtime workers (#428).
+async fn registered_client_name(state: &GatewayState, client_id: &str) -> Option<String> {
+    let ctx = state.auth.get()?.clone();
+    let client_id = client_id.to_string();
+    let name = tokio::task::spawn_blocking(move || ctx.store.get_client(&client_id))
+        .await
+        .ok()?
+        .ok()
+        .flatten()?
+        .client_name?;
     approval::sanitize_client_name(&name)
 }
 
@@ -1280,6 +1286,7 @@ async fn await_approval(
     ctx: Option<&RequestContext<RoleServer>>,
 ) -> Result<(Decision, Option<ResolvedVia>), (Decision, Option<ResolvedVia>, ErrorData)> {
     let wait_secs = state.config.policy.approval_wait_seconds;
+    let client_name = registered_client_name(state, &principal.client_id).await;
     let now = now_epoch_secs();
     let pending = PendingApproval {
         id: mint_secret_32(),
@@ -1294,7 +1301,7 @@ async fn await_approval(
         created: now,
         expires: now.saturating_add(wait_secs),
         class,
-        client_name: registered_client_name(state, &principal.client_id),
+        client_name,
         subject: call.subject.clone(),
         grant_minutes: (state.config.policy.mode_for(class) == PolicyMode::AskOnce)
             .then_some(state.config.policy.grant_ttl_minutes),
@@ -5434,7 +5441,7 @@ mod tests {
             fixture_router_with_mutating_policy(policy::PolicyMode::AskOnce, 300, 30);
         {
             let ctx = state.auth.get().expect("router build sets the auth ctx");
-            let store = ctx.store.lock().unwrap();
+            let store = &ctx.store;
             store
                 .register_client(RegisteredClient {
                     client_id: "test-client".to_string(),

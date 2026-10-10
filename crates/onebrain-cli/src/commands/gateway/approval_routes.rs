@@ -88,8 +88,8 @@ const PAIRING_HEADER: &str = "x-onebrain-pairing";
 /// header, if present at all, is never even looked at.
 ///
 /// No `std::sync::Mutex` guard is held across the `next.run(req).await`
-/// below: `check_pairing_code` is synchronous and releases both of its locks
-/// before returning its verdict.
+/// below: `check_pairing_code` is synchronous and releases its `attempts`
+/// lock before returning its verdict (its pairing read takes no lock).
 async fn require_pairing_header(
     State(ctx): State<Arc<AuthCtx>>,
     req: Request,
@@ -578,8 +578,6 @@ mod tests {
         let redirect_uri = "https://claude.ai/cb";
         let client_id = mint_secret_32();
         ctx.store
-            .lock()
-            .unwrap()
             .register_client(RegisteredClient {
                 client_id: client_id.clone(),
                 client_name: None,

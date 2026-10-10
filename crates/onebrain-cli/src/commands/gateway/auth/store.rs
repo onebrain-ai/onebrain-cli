@@ -36,6 +36,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
@@ -83,15 +84,13 @@ pub struct AuthCode {
     pub scope: String,
     pub expires: u64,
     pub used: bool,
-    /// The token `family` id [`AuthStore::issue_token_pair`] minted when this
-    /// code was successfully redeemed — `None` until then (and forever, if
-    /// this code is never successfully redeemed at all). Stamped by
-    /// [`AuthStore::mark_code_minted_family`] AFTER a `/token` handler's
-    /// `issue_token_pair` call, and read back by
-    /// [`AuthStore::find_code_record`] when that SAME code is presented
-    /// again — a replay of an already-`used` code (RFC 6749 §4.1.2 SHOULD)
-    /// — so the `/token` handler can [`AuthStore::revoke_family`] everything
-    /// that code ever produced. `#[serde(default)]` so an on-disk
+    /// The token `family` id minted when this code was successfully
+    /// redeemed — `None` until then (and forever, if this code is never
+    /// successfully redeemed at all). Stamped by [`AuthStore::exchange_code`]
+    /// in the same `auth.lock` hold that spends the code and mints the pair,
+    /// and read back by it when that SAME code is presented again — a replay
+    /// of an already-`used` code (RFC 6749 §4.1.2 SHOULD) — to revoke
+    /// everything that code ever produced. `#[serde(default)]` so an on-disk
     /// `codes.json` written before this field existed still deserializes
     /// (as `None`, the correct "nothing minted from this yet" value).
     #[serde(default)]
@@ -241,6 +240,25 @@ impl std::fmt::Debug for PairingState {
             .field("created", &self.created)
             .finish()
     }
+}
+
+/// Outcome of [`AuthStore::exchange_code`] — the whole RFC 6749 §4.1.3
+/// authorization_code redemption, decided in ONE `auth.lock` hold.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CodeExchange {
+    /// The code was fresh, its bindings matched and its client is still
+    /// registered: here is the pair minted for it (boxed, as in
+    /// [`RotateOutcome::Rotated`]). The code is spent and links to the pair's
+    /// family.
+    Issued {
+        access: Box<TokenRecord>,
+        refresh: Box<TokenRecord>,
+    },
+    /// `invalid_grant`, whatever the cause: unknown or expired code; a
+    /// replay of a spent code (whose minted family, if any, is now revoked);
+    /// a binding/PKCE mismatch (the code is spent anyway); or a client that
+    /// was removed (the code is spent, nothing minted).
+    Invalid,
 }
 
 /// Outcome of [`AuthStore::rotate_refresh`]. See the module docs for the
@@ -448,8 +466,70 @@ fn resolve_unique(hits: Vec<(String, String)>) -> std::result::Result<Vec<String
 /// is up) is seen on the very next call. Every read-modify-write op holds the
 /// store-wide `auth.lock` (see [`Self::lock_exclusive`]) so two processes can
 /// never lose each other's writes.
+///
+/// The gateway shares ONE `AuthStore` across threads with no in-process
+/// mutex (#428): each `lock_exclusive` call opens its own handle on
+/// `auth.lock`, so that lock serializes threads exactly as it serializes
+/// processes (proven by `two_threads_sharing_one_store_serialize_on_auth_lock`).
 pub struct AuthStore {
     root: PathBuf,
+    /// How long [`Self::lock_exclusive`] waits before giving up with
+    /// [`StoreBusy`]. [`LOCK_WAIT`] everywhere except unit tests.
+    lock_wait: Duration,
+}
+
+/// Upper bound on one wait for `auth.lock` (#428). A CLI suspended with
+/// Ctrl-Z while holding the lock must not stall `/token` forever.
+pub const LOCK_WAIT: Duration = Duration::from_secs(5);
+
+/// Who holds `auth.lock`, as recorded in the `auth.lock.holder` sidecar.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockHolder {
+    pub pid: u32,
+    pub version: String,
+}
+
+/// `auth.lock` stayed held past [`LOCK_WAIT`]. Returned (inside
+/// `anyhow::Error`) by every locked mutator; detect it with
+/// [`is_store_busy`]. `holder` is `None` when the sidecar is missing or
+/// unreadable (e.g. the holder predates v3.5.1, or is not `onebrain`).
+///
+/// Accepted risk: the sidecar is removed when the guard drops, so a holder
+/// killed with SIGKILL leaves it behind. If the NEXT holder is pre-3.5.1 or
+/// foreign (it never rewrites the sidecar), a waiter names that dead pid.
+/// There is no liveness check.
+#[derive(Debug)]
+pub struct StoreBusy {
+    pub holder: Option<LockHolder>,
+}
+
+impl std::fmt::Display for StoreBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let secs = LOCK_WAIT.as_secs();
+        match &self.holder {
+            Some(h) => write!(
+                f,
+                "the gateway auth store is busy — onebrain {} (pid {}) has held auth.lock for over {secs}s",
+                h.version, h.pid
+            ),
+            None => write!(
+                f,
+                "the gateway auth store is busy — another process has held auth.lock for over {secs}s"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for StoreBusy {}
+
+/// The [`StoreBusy`] in `e`'s chain, if `auth.lock` was what failed.
+pub fn store_busy(e: &anyhow::Error) -> Option<&StoreBusy> {
+    e.downcast_ref::<StoreBusy>()
+}
+
+/// True when `e` is a [`StoreBusy`] (possibly under added context).
+pub fn is_store_busy(e: &anyhow::Error) -> bool {
+    store_busy(e).is_some()
 }
 
 impl AuthStore {
@@ -470,11 +550,26 @@ impl AuthStore {
     /// tests can point the store at a tempdir instead of the real home.
     pub(crate) fn open_at(root: PathBuf) -> Result<AuthStore> {
         ensure_private_dir(&root)?;
-        Ok(AuthStore { root })
+        Ok(AuthStore {
+            root,
+            lock_wait: LOCK_WAIT,
+        })
+    }
+
+    /// Test-only: a shorter [`LOCK_WAIT`] so busy-path tests don't sleep 5 s.
+    #[cfg(test)]
+    pub(crate) fn with_lock_wait(mut self, wait: Duration) -> AuthStore {
+        self.lock_wait = wait;
+        self
     }
 
     /// Take the store-wide advisory EXCLUSIVE lock (`<root>/auth.lock`,
-    /// created 0600 on first use), blocking until it is free. Every method
+    /// created 0600 on first use), waiting at most [`LOCK_WAIT`] (#428) and
+    /// then failing with a typed [`StoreBusy`] that names the holder from
+    /// the `auth.lock.holder` sidecar when it can. The wait is a kernel-queued
+    /// blocking lock, so a burst of writes cannot starve it (see
+    /// [`acquire_within`]). Blocking: async callers run it on
+    /// `spawn_blocking`, never on a runtime worker. Every method
     /// that does load → modify → save holds this for its whole critical
     /// section, so a `onebrain gateway tokens revoke` in one process can
     /// never be lost to a concurrent `rotate_refresh_for_client`/
@@ -507,9 +602,43 @@ impl AuthStore {
         let file = opts
             .open(&path)
             .with_context(|| format!("open gateway auth lock {}", path.display()))?;
-        file.lock()
-            .with_context(|| format!("lock gateway auth store ({})", path.display()))?;
-        Ok(StoreLock { _file: file })
+        let file = match acquire_within(file, self.lock_wait)
+            .with_context(|| format!("lock gateway auth store ({})", path.display()))?
+        {
+            Some(file) => file,
+            None => {
+                return Err(StoreBusy {
+                    holder: self.read_holder(),
+                }
+                .into())
+            }
+        };
+        #[cfg(test)]
+        hold_delay::apply();
+        // The holder lives in a sidecar, not in `auth.lock` itself: a
+        // Windows whole-file lock can stop other handles reading the locked
+        // file. Best-effort — a failure only makes a waiter's message generic.
+        let holder = self.holder_path();
+        let record = LockHolder {
+            pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+        if let Err(e) = serde_json::to_vec(&record)
+            .map_err(anyhow::Error::from)
+            .and_then(|b| std::fs::write(&holder, b).map_err(anyhow::Error::from))
+        {
+            tracing::debug!(error = %e, "could not write auth.lock.holder");
+        }
+        Ok(StoreLock {
+            holder,
+            _file: file,
+        })
+    }
+
+    /// Best-effort read of the `auth.lock.holder` sidecar.
+    fn read_holder(&self) -> Option<LockHolder> {
+        let bytes = std::fs::read(self.holder_path()).ok()?;
+        serde_json::from_slice(&bytes).ok()
     }
 
     fn clients_path(&self) -> PathBuf {
@@ -523,6 +652,9 @@ impl AuthStore {
     }
     fn lock_path(&self) -> PathBuf {
         self.root.join("auth.lock")
+    }
+    fn holder_path(&self) -> PathBuf {
+        self.root.join("auth.lock.holder")
     }
     fn pairing_path(&self) -> PathBuf {
         self.root.join("pairing.json")
@@ -602,7 +734,7 @@ impl AuthStore {
     /// Mint and persist a fresh, single-use auth code (>= 32 random bytes,
     /// [`AUTH_CODE_TTL_SECS`] lifetime) carrying the PKCE challenge + the
     /// rest of the `/authorize` request's parameters, to be redeemed once by
-    /// [`Self::consume_code`].
+    /// [`Self::exchange_code`].
     pub fn issue_code(
         &self,
         client_id: &str,
@@ -651,43 +783,83 @@ impl AuthStore {
         Ok(Some(consumed))
     }
 
-    /// Stamp `family` onto the (already-`used`) code record for `code` —
-    /// called by the `/token` handler right after [`Self::issue_token_pair`]
-    /// mints the pair a successful `consume_code` redemption produced, so a
-    /// LATER replay of this same code can find and
-    /// [`Self::revoke_family`] it (RFC 6749 §4.1.2 SHOULD; see
-    /// [`AuthCode::minted_family`]'s doc comment for the full link). A no-op
-    /// (not an error) if `code` is no longer present in `codes.json` — the
-    /// family it would have linked to already exists independently in
-    /// `tokens.json` and stays valid on its own merits; failing to record
-    /// this link only weakens the replay-hardening for a code that's already
-    /// gone, it never wrongly trusts anything.
-    pub fn mark_code_minted_family(&self, code: &str, family: &str) -> Result<()> {
+    /// Redeem `code` for a token pair (RFC 6749 §4.1.3) in ONE hold of
+    /// `auth.lock`: consume → `bindings_ok` (client_id / redirect_uri /
+    /// resource / PKCE, decided by the caller) → client still registered →
+    /// mint the pair → link the code to the pair's family. A replay of an
+    /// already-spent code revokes the family it minted (RFC 6749 §4.1.2
+    /// SHOULD) in the same hold. That revoke is NOT best-effort any more: if
+    /// it cannot be saved, the call returns `Err` (→ 500) rather than
+    /// reporting a clean `invalid_grant` over a live family.
+    ///
+    /// One hold is what makes the replay hardening sound without an
+    /// in-process mutex (#428 review): a replay can never run between the
+    /// first redemption's consume and its family link, because both happen
+    /// before the lock is released — so it always finds the family to
+    /// revoke. It also means a busy lock fails BEFORE anything is spent: the
+    /// client can retry with the same code.
+    ///
+    /// Write order is `codes.json` first (spent + linked), then
+    /// `tokens.json`: a crash between the two leaves a spent code and no
+    /// tokens (fail closed), never live tokens beside a redeemable code.
+    pub fn exchange_code(
+        &self,
+        code: &str,
+        bindings_ok: impl FnOnce(&AuthCode) -> bool,
+    ) -> Result<CodeExchange> {
         let _guard = self.lock_exclusive()?;
         let mut codes = self.load_codes()?;
-        if let Some(entry) = codes.get_mut(code) {
-            entry.minted_family = Some(family.to_string());
-            self.save_codes(&codes)?;
+        let now = core::now_epoch_secs();
+        let Some(entry) = codes.get_mut(code) else {
+            return Ok(CodeExchange::Invalid);
+        };
+        if entry.used {
+            if let Some(family) = entry.minted_family.clone() {
+                self.revoke_family_locked(&family)?;
+            }
+            return Ok(CodeExchange::Invalid);
         }
-        Ok(())
-    }
+        if entry.expires <= now {
+            return Ok(CodeExchange::Invalid);
+        }
+        entry.used = true;
+        let auth_code = entry.clone();
+        #[cfg(test)]
+        exchange_pause::fire();
 
-    /// Look up `code` WITHOUT consuming it, checking expiry, or otherwise
-    /// authorizing anything — the ONLY legitimate caller is the `/token`
-    /// handler's replay-hardening path, AFTER [`Self::consume_code`] has
-    /// already returned `None` for this exact code, to tell a genuine replay
-    /// (`used == true`) apart from unknown/never-issued (`Ok(None)` here
-    /// too, nothing to revoke). Never used to redeem a code a second way —
-    /// see [`AuthCode::minted_family`]'s doc comment for the full flow this
-    /// feeds into.
-    pub fn find_code_record(&self, code: &str) -> Result<Option<AuthCode>> {
-        Ok(self.load_codes()?.get(code).cloned())
+        // A code is spent on presentation, not only on success — a wrong
+        // verifier or a removed client still kills it.
+        if !bindings_ok(&auth_code) || !self.load_clients()?.contains_key(&auth_code.client_id) {
+            self.save_codes(&codes)?;
+            return Ok(CodeExchange::Invalid);
+        }
+
+        let (access, refresh) = self.new_pair(
+            &auth_code.client_id,
+            &auth_code.scope,
+            Some(&auth_code.resource),
+        );
+        if let Some(entry) = codes.get_mut(code) {
+            entry.minted_family = Some(refresh.family.clone());
+        }
+        self.save_codes(&codes)?;
+        let mut tokens = self.load_tokens()?;
+        tokens.insert(access.token.clone(), access.clone());
+        tokens.insert(refresh.token.clone(), refresh.clone());
+        self.save_tokens(&tokens)?;
+        Ok(CodeExchange::Issued {
+            access: Box::new(access),
+            refresh: Box::new(refresh),
+        })
     }
 
     // ── Tokens ───────────────────────────────────────────────────────────
 
     /// Mint a fresh access+refresh pair with no bound `resource` — see
-    /// [`Self::issue_token_pair_for_resource`].
+    /// [`Self::issue_token_pair_for_resource`]. Test fixture only: in
+    /// production every pair comes from [`Self::exchange_code`] or
+    /// [`Self::rotate_refresh_for_client`].
+    #[cfg(test)]
     pub fn issue_token_pair(
         &self,
         client_id: &str,
@@ -699,7 +871,9 @@ impl AuthStore {
     /// Mint a fresh access+refresh pair (>= 32 random bytes each) sharing a
     /// new random `family` id, with [`ACCESS_TTL_SECS`]/[`REFRESH_TTL_SECS`]
     /// lifetimes and `resource` bound onto both (RFC 8707, #404). Persists
-    /// both before returning them.
+    /// both before returning them. Test fixture only (see
+    /// [`Self::issue_token_pair`]).
+    #[cfg(test)]
     pub fn issue_token_pair_for_resource(
         &self,
         client_id: &str,
@@ -707,6 +881,21 @@ impl AuthStore {
         resource: Option<&str>,
     ) -> Result<(TokenRecord, TokenRecord)> {
         let _guard = self.lock_exclusive()?;
+        let (access, refresh) = self.new_pair(client_id, scope, resource);
+        let mut tokens = self.load_tokens()?;
+        tokens.insert(access.token.clone(), access.clone());
+        tokens.insert(refresh.token.clone(), refresh.clone());
+        self.save_tokens(&tokens)?;
+        Ok((access, refresh))
+    }
+
+    /// Build (not persist) a fresh access+refresh pair in a new family.
+    fn new_pair(
+        &self,
+        client_id: &str,
+        scope: &str,
+        resource: Option<&str>,
+    ) -> (TokenRecord, TokenRecord) {
         let family = core::mint_secret_32();
         let now = core::now_epoch_secs();
         let resource = resource.map(str::to_string);
@@ -732,12 +921,7 @@ impl AuthStore {
             revoked: false,
             rotated_to: None,
         };
-
-        let mut tokens = self.load_tokens()?;
-        tokens.insert(access.token.clone(), access.clone());
-        tokens.insert(refresh.token.clone(), refresh.clone());
-        self.save_tokens(&tokens)?;
-        Ok((access, refresh))
+        (access, refresh)
     }
 
     /// Validate a presented bearer token as an in-date, unrevoked ACCESS
@@ -889,12 +1073,17 @@ impl AuthStore {
     /// tokens are left alone, and nothing is written back if `family`
     /// matches no token at all). This is the SAME "burn the whole family"
     /// action [`Self::rotate_refresh`]'s reuse-detection branch takes
-    /// inline; exposed here as its own method for the `/token` handler's
-    /// authorization-code replay hardening (RFC 6749 §4.1.2 SHOULD) — see
-    /// [`Self::mark_code_minted_family`]/[`Self::find_code_record`] for how
-    /// that path finds the family to pass in here.
+    /// inline, and the one [`Self::exchange_code`]'s replay branch takes
+    /// (via [`Self::revoke_family_locked`], inside its own lock hold).
+    /// Test-only entry point to that locked body.
+    #[cfg(test)]
     pub fn revoke_family(&self, family: &str) -> Result<()> {
         let _guard = self.lock_exclusive()?;
+        self.revoke_family_locked(family)
+    }
+
+    /// [`Self::revoke_family`]'s body, for callers already holding the lock.
+    fn revoke_family_locked(&self, family: &str) -> Result<()> {
         let mut tokens = self.load_tokens()?;
         let mut changed = false;
         for t in tokens.values_mut() {
@@ -965,8 +1154,8 @@ impl AuthStore {
     /// **`codes.json` retention is NOT simply "past its own `expires`
     /// field."** A USED code that recorded a [`AuthCode::minted_family`] is a
     /// durable security artifact, not disposable state: the `/token`
-    /// handler's RFC 6749 §4.1.2 replay hardening ([`Self::find_code_record`]
-    /// → [`Self::revoke_family`]) depends on that record still being on disk
+    /// handler's RFC 6749 §4.1.2 replay hardening (inside
+    /// [`Self::exchange_code`]) depends on that record still being on disk
     /// to catch a LATE replay of the code, and a refresh token from that
     /// family can legitimately still be presented for rotation up to
     /// [`REFRESH_TTL_SECS`] (30 days) after it was minted — far longer than
@@ -1196,6 +1385,7 @@ impl AuthStore {
 pub(crate) fn check_files_parse(root: &Path) -> Result<()> {
     let store = AuthStore {
         root: root.to_path_buf(),
+        lock_wait: LOCK_WAIT,
     };
     store.load_clients()?;
     store.load_codes()?;
@@ -1204,12 +1394,79 @@ pub(crate) fn check_files_parse(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Waiter threads currently blocked in [`std::fs::File::lock`] on
+/// `auth.lock` in this process (see [`acquire_within`]).
+static LOCK_WAITERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Cap on [`LOCK_WAITERS`]. Reaching it means the lock is stuck (every
+/// waiter is stranded behind a stalled holder), so a new caller gets
+/// `StoreBusy` at once instead of adding another thread.
+const MAX_LOCK_WAITERS: usize = 64;
+
+/// Lock `file` exclusively within `wait`: `Ok(None)` on timeout.
+///
+/// Fairness (#438 Windows CI): the wait is a BLOCKING `File::lock` on a
+/// helper thread, so the waiter is queued in the kernel and woken (Windows:
+/// granted) when the holder releases. A `try_lock` poll that sleeps between
+/// attempts almost never lands in the microsecond gap between a busy
+/// writer's holds, and was starved into `StoreBusy` by a write burst. The
+/// uncontended fast path is one `try_lock`, skipped while another thread of
+/// this process is already queued, so a newcomer cannot jump that queue.
+///
+/// On timeout the helper thread is left blocked until the lock is granted;
+/// it then finds the receiver gone and drops the file at once, releasing
+/// the lock. Those stranded threads are bounded by [`MAX_LOCK_WAITERS`].
+fn acquire_within(file: std::fs::File, wait: Duration) -> std::io::Result<Option<std::fs::File>> {
+    use std::sync::atomic::Ordering;
+    if LOCK_WAITERS.load(Ordering::SeqCst) == 0 {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
+    if LOCK_WAITERS.fetch_add(1, Ordering::SeqCst) >= MAX_LOCK_WAITERS {
+        LOCK_WAITERS.fetch_sub(1, Ordering::SeqCst);
+        return Ok(None);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("auth-lock-wait".into())
+        .spawn(move || {
+            let locked = file.lock().map(|()| file);
+            LOCK_WAITERS.fetch_sub(1, Ordering::SeqCst);
+            // A dropped receiver hands the file back in the error, and
+            // dropping it here releases the lock nobody is waiting for.
+            let _ = tx.send(locked);
+        });
+    if let Err(e) = spawned {
+        LOCK_WAITERS.fetch_sub(1, Ordering::SeqCst);
+        return Err(e);
+    }
+    match rx.recv_timeout(wait) {
+        Ok(locked) => locked.map(Some),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::other(
+            "auth.lock waiter thread ended without a result",
+        )),
+    }
+}
+
 /// RAII guard returned by [`AuthStore::lock_exclusive`]. The OS releases the
 /// lock when the file handle closes, i.e. when this guard drops. Bind it as
 /// `let _guard = …` — `let _ = …` would drop (and unlock) immediately.
 #[must_use = "the auth store lock is released as soon as this guard is dropped"]
 pub(crate) struct StoreLock {
+    holder: PathBuf,
     _file: std::fs::File,
+}
+
+impl Drop for StoreLock {
+    /// Remove the holder sidecar BEFORE the lock is released (`_file` drops
+    /// after this body), so it never names a process that no longer holds it.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.holder);
+    }
 }
 
 // ── File I/O helpers (mirrors `daemon_client::DaemonInfo`) ────────────────
@@ -1243,7 +1500,18 @@ fn ensure_private_dir(dir: &Path) -> Result<()> {
 /// Serialize `value` and atomically replace `path` with it: write to a
 /// `.tmp` sibling with owner-only (0600) perms, re-assert 0600 (warn, don't
 /// swallow, on failure — this is a credential file), then rename over the
-/// real path. Mirrors `daemon_client::DaemonInfo::write` exactly.
+/// real path. Mirrors `daemon_client::DaemonInfo::write`, plus durability
+/// (#429): the temp file is fsynced before the rename and, on unix, the
+/// parent directory after it, so a power cut cannot lose a write the caller
+/// was told succeeded. Windows has no directory fsync; there the rename's
+/// own metadata durability is NTFS's.
+///
+/// Any failure after the temp file is opened (write, fsync, rename) removes
+/// it. Once the rename has succeeded the write IS committed and visible, so a
+/// failed directory fsync only warns: returning `Err` there would tell the
+/// caller a visible write failed — e.g. a refresh whose `rotated_to` is
+/// already saved would answer 500, and the client's retry would trip reuse
+/// detection and burn the family.
 fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent)?;
@@ -1263,8 +1531,19 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
             .open(&tmp)
             .with_context(|| format!("create {}", tmp.display()))?;
         use std::io::Write;
-        f.write_all(&bytes)
-            .with_context(|| format!("write {}", tmp.display()))?;
+        let written = write_fault::hit(write_fault::Stage::Write)
+            .and_then(|()| f.write_all(&bytes))
+            .with_context(|| format!("write {}", tmp.display()))
+            .and_then(|()| {
+                write_fault::hit(write_fault::Stage::SyncFile)
+                    .and_then(|()| f.sync_all())
+                    .with_context(|| format!("fsync {}", tmp.display()))
+            });
+        if let Err(e) = written {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
     }
     #[cfg(unix)]
     {
@@ -1274,9 +1553,61 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
                 "could not re-assert 0600 on gateway auth store file (may be readable)");
         }
     }
-    std::fs::rename(&tmp, path)
-        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("rename {} -> {}", tmp.display(), path.display()));
+    }
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        if let Err(e) = write_fault::hit(write_fault::Stage::SyncDir)
+            .and_then(|()| std::fs::File::open(parent))
+            .and_then(|d| d.sync_all())
+        {
+            tracing::warn!(error = %e, path = %parent.display(),
+                "gateway auth store write committed, but its directory fsync failed; \
+                 the change may not survive a power cut");
+        }
+    }
     Ok(())
+}
+
+/// Fault injection for [`write_json_atomic`]'s I/O steps. Tests arm one
+/// stage on their own thread; production builds compile to a no-op.
+mod write_fault {
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) enum Stage {
+        Write,
+        SyncFile,
+        #[cfg_attr(not(unix), allow(dead_code))]
+        SyncDir,
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static ARMED: std::cell::Cell<Option<Stage>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Fail the next `stage` on this thread (once).
+    #[cfg(test)]
+    pub(super) fn arm(stage: Stage) {
+        ARMED.with(|a| a.set(Some(stage)));
+    }
+
+    #[cfg(test)]
+    pub(super) fn hit(stage: Stage) -> std::io::Result<()> {
+        if ARMED.with(|a| a.get()) == Some(stage) {
+            ARMED.with(|a| a.set(None));
+            return Err(std::io::Error::other("injected write fault"));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(super) fn hit(_stage: Stage) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Read + parse `path` as JSON; a missing file yields `T::default()` (empty
@@ -1290,6 +1621,52 @@ fn read_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T>
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
         Err(e) => Err(e).context(format!("read {}", path.display())),
+    }
+}
+
+/// Test-only: stretch every `auth.lock` hold taken on the arming thread, to
+/// stand in for a slow disk (fsync on a CI runner) in fairness tests.
+#[cfg(test)]
+pub(crate) mod hold_delay {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    thread_local! {
+        static DELAY: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    }
+
+    pub(crate) fn arm(delay: Duration) {
+        DELAY.with(|d| d.set(delay));
+    }
+
+    pub(super) fn apply() {
+        let delay = DELAY.with(|d| d.get());
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+    }
+}
+
+/// Test-only pause point inside [`AuthStore::exchange_code`], right after
+/// the code is marked spent and before the pair is minted — where the
+/// pre-#428-review split released `auth.lock`. Thread-local, so only the
+/// thread that armed it pauses.
+#[cfg(test)]
+pub(crate) mod exchange_pause {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    pub(crate) fn arm(hook: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn fire() {
+        if let Some(hook) = HOOK.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
     }
 }
 
@@ -1413,51 +1790,6 @@ mod tests {
     // ── Auth-code replay hardening: minted_family linkage (Task 5) ──────
 
     #[test]
-    fn find_code_record_returns_none_for_unknown_code() {
-        let (_dir, store) = open_temp();
-        assert!(store.find_code_record("nope").unwrap().is_none());
-    }
-
-    #[test]
-    fn fresh_code_has_no_minted_family_until_marked() {
-        let (_dir, store) = open_temp();
-        let issued = store
-            .issue_code("client1", "https://cb", "chal", "res", "scope")
-            .unwrap();
-        assert!(issued.minted_family.is_none());
-
-        let record = store.find_code_record(&issued.code).unwrap().unwrap();
-        assert!(record.minted_family.is_none());
-        assert!(!record.used, "find_code_record must not consume");
-    }
-
-    #[test]
-    fn mark_code_minted_family_then_find_code_record_sees_it() {
-        let (_dir, store) = open_temp();
-        let issued = store
-            .issue_code("client1", "https://cb", "chal", "res", "scope")
-            .unwrap();
-        store.consume_code(&issued.code).unwrap();
-        store
-            .mark_code_minted_family(&issued.code, "fam-abc")
-            .unwrap();
-
-        let record = store.find_code_record(&issued.code).unwrap().unwrap();
-        assert!(record.used, "consume_code must have marked it used");
-        assert_eq!(record.minted_family.as_deref(), Some("fam-abc"));
-    }
-
-    #[test]
-    fn mark_code_minted_family_on_unknown_code_is_a_noop_not_an_error() {
-        let (_dir, store) = open_temp();
-        // Nothing panics or errors, and nothing is created.
-        store
-            .mark_code_minted_family("does-not-exist", "fam-abc")
-            .unwrap();
-        assert!(store.find_code_record("does-not-exist").unwrap().is_none());
-    }
-
-    #[test]
     fn revoke_family_kills_every_token_sharing_it_and_is_idempotent() {
         let (_dir, store) = open_temp();
         let (access, refresh) = store.issue_token_pair("client1", "scope").unwrap();
@@ -1500,37 +1832,42 @@ mod tests {
         );
     }
 
-    /// End-to-end proof of the exact replay-hardening flow the `/token`
-    /// handler drives: consume → mint tokens → mark the family → a SECOND
-    /// consume attempt fails (already used) → the handler looks the record
-    /// back up, finds `used && minted_family.is_some()`, and revokes it.
+    /// The replay-hardening flow end to end, sequentially: a redeemed code
+    /// is linked to the family it minted; replaying it is `invalid_grant`
+    /// AND revokes that family.
     #[test]
-    fn replayed_code_flow_end_to_end_revokes_the_family_it_minted() {
+    fn a_replayed_code_revokes_the_family_it_minted() {
         let (_dir, store) = open_temp();
+        store.register_client(client("client1")).unwrap();
         let issued = store
             .issue_code("client1", "https://cb", "chal", "res", "scope")
             .unwrap();
+        assert!(issued.minted_family.is_none());
 
-        let consumed = store.consume_code(&issued.code).unwrap().unwrap();
-        let (access, _refresh) = store
-            .issue_token_pair(&consumed.client_id, &consumed.scope)
-            .unwrap();
-        store
-            .mark_code_minted_family(&issued.code, &access.family)
-            .unwrap();
+        let CodeExchange::Issued { access, refresh } =
+            store.exchange_code(&issued.code, |_| true).unwrap()
+        else {
+            panic!("a fresh code must redeem");
+        };
+        let record = store.load_codes().unwrap()[&issued.code].clone();
+        assert!(record.used);
+        assert_eq!(
+            record.minted_family.as_deref(),
+            Some(access.family.as_str())
+        );
         assert!(store.check_access(&access.token).unwrap().is_some());
 
-        // Replay: consume_code now fails (already used).
-        assert!(store.consume_code(&issued.code).unwrap().is_none());
-        // The handler's reuse-hardening path.
-        let record = store.find_code_record(&issued.code).unwrap().unwrap();
-        assert!(record.used);
-        let family = record.minted_family.expect("family was marked above");
-        store.revoke_family(&family).unwrap();
-
+        assert_eq!(
+            store.exchange_code(&issued.code, |_| true).unwrap(),
+            CodeExchange::Invalid
+        );
         assert!(
             store.check_access(&access.token).unwrap().is_none(),
             "the access token minted from the replayed code must now be dead"
+        );
+        assert_eq!(
+            store.rotate_refresh(&refresh.token).unwrap(),
+            RotateOutcome::Invalid
         );
     }
 
@@ -2161,6 +2498,287 @@ mod tests {
 
     // ── Cross-process advisory lock (T2 / #406) ─────────────────────────
 
+    /// #428 review blocker: a replay that arrives while the first
+    /// redemption is between "code spent" and "family linked" must still
+    /// end with that family revoked. Thread A pauses at exactly that point
+    /// ([`exchange_pause`]) and waits for replay B to finish (up to 500 ms).
+    /// With the exchange in ONE lock hold, B cannot run inside the pause: it
+    /// waits on `auth.lock`, then finds the linked family and revokes it.
+    /// With the old split (consume, mint, link as separate lock holds), B
+    /// runs inside the pause, finds no family yet, and A's pair survives.
+    #[test]
+    fn a_replay_racing_the_first_redemption_still_revokes_its_family() {
+        let (_dir, store) = open_temp();
+        store.register_client(client("c1")).unwrap();
+        let code = store
+            .issue_code("c1", "https://cb", "chal", "res", "brain")
+            .unwrap()
+            .code;
+        let store = std::sync::Arc::new(store);
+        let (consumed_tx, consumed_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+        let first = {
+            let store = store.clone();
+            let code = code.clone();
+            std::thread::spawn(move || {
+                exchange_pause::arm(move || {
+                    consumed_tx.send(()).unwrap();
+                    let _ = done_rx.recv_timeout(std::time::Duration::from_millis(500));
+                });
+                store.exchange_code(&code, |_| true).unwrap()
+            })
+        };
+        consumed_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the first redemption never reached the pause point");
+        let replay = store.exchange_code(&code, |_| true).unwrap();
+        let _ = done_tx.send(());
+        assert_eq!(replay, CodeExchange::Invalid);
+
+        let CodeExchange::Issued { access, refresh } = first.join().unwrap() else {
+            panic!("the first redemption must mint a pair");
+        };
+        assert!(
+            store.check_access(&access.token).unwrap().is_none(),
+            "the replay raced the first redemption and its pair survived"
+        );
+        assert_eq!(
+            store.rotate_refresh(&refresh.token).unwrap(),
+            RotateOutcome::Invalid,
+            "the replayed code's refresh token must be dead too"
+        );
+    }
+
+    #[test]
+    fn exchange_code_spends_the_code_on_a_binding_mismatch_and_mints_nothing() {
+        let (_dir, store) = open_temp();
+        store.register_client(client("c1")).unwrap();
+        let code = store
+            .issue_code("c1", "https://cb", "chal", "res", "brain")
+            .unwrap()
+            .code;
+        assert_eq!(
+            store.exchange_code(&code, |_| false).unwrap(),
+            CodeExchange::Invalid
+        );
+        assert!(store.load_tokens().unwrap().is_empty());
+        assert_eq!(
+            store.exchange_code(&code, |_| true).unwrap(),
+            CodeExchange::Invalid,
+            "a code that failed its bindings is spent"
+        );
+    }
+
+    #[test]
+    fn exchange_code_on_a_busy_store_spends_nothing() {
+        let (dir, store) = open_temp();
+        store.register_client(client("c1")).unwrap();
+        let code = store
+            .issue_code("c1", "https://cb", "chal", "res", "brain")
+            .unwrap()
+            .code;
+        let busy = AuthStore::open_at(dir.path().join("gateway"))
+            .unwrap()
+            .with_lock_wait(std::time::Duration::from_millis(100));
+        let guard = store.lock_exclusive().unwrap();
+        assert!(is_store_busy(
+            &busy.exchange_code(&code, |_| true).unwrap_err()
+        ));
+        drop(guard);
+        assert!(
+            matches!(
+                store.exchange_code(&code, |_| true).unwrap(),
+                CodeExchange::Issued { .. }
+            ),
+            "a busy lock must not burn the code; the retry succeeds"
+        );
+    }
+
+    /// Fairness (#438 Windows CI): a burst of back-to-back writes on one
+    /// handle must not starve another handle's mutator into `StoreBusy`.
+    /// The writer's holds are stretched to 5 ms (a slow disk); the other
+    /// handle has a 1 s budget per call. A waiter that sleeps between
+    /// `try_lock` polls almost never lands in the writer's microsecond gap
+    /// between holds; a waiter queued in the kernel is woken on release.
+    #[test]
+    fn a_write_burst_on_one_handle_cannot_starve_another_into_store_busy() {
+        const TARGETS: usize = 20;
+        let (dir, store) = open_temp();
+        let targets: Vec<String> = (0..TARGETS)
+            .map(|_| store.issue_token_pair("victim", "brain").unwrap().0.token)
+            .collect();
+        let root = dir.path().join("gateway");
+        let writer = AuthStore::open_at(root.clone()).unwrap();
+        let revoker = AuthStore::open_at(root)
+            .unwrap()
+            .with_lock_wait(std::time::Duration::from_secs(1));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writing = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                hold_delay::arm(std::time::Duration::from_millis(5));
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    writer.issue_token_pair("busy", "brain").unwrap();
+                }
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let starved: Vec<usize> = targets
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| revoker.revoke_token(t).is_err())
+            .map(|(i, _)| i)
+            .collect();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writing.join().unwrap();
+        assert!(
+            starved.is_empty(),
+            "{} of {TARGETS} revokes were starved into StoreBusy by a write burst: {starved:?}",
+            starved.len()
+        );
+    }
+
+    /// #428 premise: with no in-process `Mutex<AuthStore>`, the gateway's
+    /// threads share ONE `AuthStore` and rely on `auth.lock` alone to
+    /// serialize writers. That only holds because every `lock_exclusive`
+    /// call opens its OWN file handle (flock is per open-file-description,
+    /// `LockFileEx` per handle). Two threads, one shared store: the second
+    /// lock must wait until the first guard drops.
+    #[test]
+    fn two_threads_sharing_one_store_serialize_on_auth_lock() {
+        let (_dir, store) = open_temp();
+        let store = std::sync::Arc::new(store);
+        let first = store.lock_exclusive().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let shared = store.clone();
+        let handle = std::thread::spawn(move || {
+            let guard = shared.lock_exclusive().unwrap();
+            tx.send(()).unwrap();
+            drop(guard);
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "a second thread acquired auth.lock while the first still held it"
+        );
+        drop(first);
+        rx.recv_timeout(std::time::Duration::from_secs(4))
+            .expect("the second thread must acquire auth.lock once it is released");
+        handle.join().unwrap();
+    }
+
+    /// #428: a mutator gives up after the lock wait with a typed
+    /// [`StoreBusy`] naming the holder from the sidecar, writes nothing,
+    /// and the holder's sidecar disappears with its guard.
+    #[test]
+    fn a_mutator_gives_up_with_store_busy_naming_the_holder() {
+        let (dir, store) = open_temp();
+        let (access, _r) = store.issue_token_pair("c1", "brain").unwrap();
+        let other = AuthStore::open_at(dir.path().join("gateway"))
+            .unwrap()
+            .with_lock_wait(std::time::Duration::from_millis(200));
+        let guard = store.lock_exclusive().unwrap();
+
+        let started = std::time::Instant::now();
+        let err = other.revoke_token(&access.token).unwrap_err();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let busy = store_busy(&err).expect("lock timeout must be a typed StoreBusy");
+        assert_eq!(
+            busy.holder,
+            Some(LockHolder {
+                pid: std::process::id(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            })
+        );
+        assert!(
+            err.to_string().contains(&std::process::id().to_string()),
+            "{err}"
+        );
+        assert!(store.check_access(&access.token).unwrap().is_some());
+
+        drop(guard);
+        assert!(
+            !store.root.join("auth.lock.holder").exists(),
+            "the holder sidecar must go away with the guard"
+        );
+        other.revoke_token(&access.token).unwrap();
+        assert!(store.check_access(&access.token).unwrap().is_none());
+    }
+
+    /// A holder that leaves no sidecar (an older CLI, a foreign process)
+    /// still yields `StoreBusy`, with a generic message.
+    #[test]
+    fn store_busy_without_a_sidecar_is_generic() {
+        let (dir, store) = open_temp();
+        let other = AuthStore::open_at(dir.path().join("gateway"))
+            .unwrap()
+            .with_lock_wait(std::time::Duration::from_millis(100));
+        let guard = store.lock_exclusive().unwrap();
+        std::fs::remove_file(store.root.join("auth.lock.holder")).unwrap();
+        let err = other.register_client(client("x")).unwrap_err();
+        let busy = store_busy(&err).expect("typed StoreBusy");
+        assert_eq!(busy.holder, None);
+        assert!(err.to_string().contains("another process"), "{err}");
+        drop(guard);
+    }
+
+    /// #429: a rename that fails (the target is a non-empty directory)
+    /// must not leave the credential-bearing `.json.tmp` behind.
+    #[test]
+    fn a_failed_rename_removes_the_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("tokens.json");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep"), b"x").unwrap();
+        let err = write_json_atomic(&target, &BTreeMap::<String, String>::new());
+        assert!(err.is_err(), "renaming over a non-empty dir must fail");
+        assert!(
+            !dir.path().join("tokens.json.tmp").exists(),
+            "a failed rename left tokens.json.tmp behind"
+        );
+    }
+
+    /// #429 review F2: a failure at ANY step after the temp file is opened
+    /// removes it — not only a failed rename.
+    #[test]
+    fn a_failed_write_or_fsync_removes_the_temp_file() {
+        for stage in [write_fault::Stage::Write, write_fault::Stage::SyncFile] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("tokens.json");
+            write_fault::arm(stage);
+            let err = write_json_atomic(&target, &BTreeMap::<String, String>::new());
+            assert!(err.is_err(), "{stage:?}: the injected fault must surface");
+            assert!(
+                !dir.path().join("tokens.json.tmp").exists(),
+                "{stage:?}: a failed write left tokens.json.tmp behind"
+            );
+            assert!(!target.exists(), "{stage:?}: nothing may be committed");
+        }
+    }
+
+    /// #429 review F1: once the rename has committed the write, a failed
+    /// directory fsync must NOT turn into `Err`. Shown on the path the
+    /// reviewer hit: a refresh rotation whose `rotated_to` is already saved
+    /// must report `Rotated`, or the client's retry trips reuse detection.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_dir_fsync_after_a_committed_rename_is_not_an_error() {
+        let (_dir, store) = open_temp();
+        let (_access, refresh) = store.issue_token_pair("c1", "brain").unwrap();
+        write_fault::arm(write_fault::Stage::SyncDir);
+        let outcome = store
+            .rotate_refresh(&refresh.token)
+            .expect("a committed rotation must not report an error");
+        let RotateOutcome::Rotated { refresh: next, .. } = outcome else {
+            panic!("expected Rotated, got {outcome:?}");
+        };
+        assert!(matches!(
+            store.rotate_refresh(&next.token).unwrap(),
+            RotateOutcome::Rotated { .. }
+        ));
+    }
+
     /// A SECOND `AuthStore` handle on the same root stands in for a second
     /// process (the CLI vs. a running gateway): `flock`/`LockFileEx` locks
     /// conflict across distinct open file handles even inside one process,
@@ -2705,7 +3323,7 @@ mod tests {
         );
         assert!(store.consume_code(&pending.code).unwrap().is_none());
         assert!(store.check_access(&a2.token).unwrap().is_some());
-        assert!(store.find_code_record(&other_code.code).unwrap().is_some());
+        assert!(store.load_codes().unwrap().contains_key(&other_code.code));
     }
 
     #[test]
