@@ -16,6 +16,8 @@ use super::approval::{client_id_short, escape_visible, Decision, PendingApproval
 
 /// Longest subject (title / path / query), in chars, kept on a pending
 /// entry; longer ones get an ellipsis.
+const CLIENT_NAME_MAX_CHARS: usize = 64;
+
 const SUBJECT_MAX_CHARS: usize = 120;
 
 /// The call-specific facts an approver should see, besides tool and vault.
@@ -79,10 +81,22 @@ fn done_phrase(p: &PendingApproval) -> String {
     }
 }
 
+/// The asker's name. Self-registered and attacker-controlled, so it is
+/// re-neutralised and capped HERE at render time, whatever path built `p`.
 fn who(p: &PendingApproval) -> String {
-    p.client_name
-        .clone()
-        .unwrap_or_else(|| "An unnamed app".to_string())
+    match p.client_name.as_deref() {
+        Some(n) if !n.trim().is_empty() => display_text(&cap_name(n)),
+        _ => "An unnamed app".to_string(),
+    }
+}
+
+fn cap_name(s: &str) -> String {
+    if s.chars().count() <= CLIENT_NAME_MAX_CHARS {
+        return s.to_string();
+    }
+    let mut cut: String = s.chars().take(CLIENT_NAME_MAX_CHARS).collect();
+    cut.push('\u{2026}');
+    cut
 }
 
 fn chars_phrase(n: usize) -> String {
@@ -472,6 +486,29 @@ mod tests {
         assert_eq!(t.lines().count(), 8, "no injected lines: {t}");
         let d = dialog_lines(&p, 240).join("\n");
         assert!(!d.contains('\u{202e}'), "{d}");
+    }
+
+    #[test]
+    fn who_neutralises_and_caps_a_raw_hostile_name_in_every_output() {
+        let mut p = capture();
+        // Deliberately NOT pre-sanitised: PendingApproval may be built by
+        // any path.
+        p.client_name = Some(format!("Cla\u{202e}ude\n{}", "z".repeat(500)));
+        let w = who(&p);
+        assert!(w.starts_with("Cla\\u{202e}ude\\u{a}zzz"), "{w}");
+        assert!(w.chars().count() <= 64 + 1 + "\\u{202e}\\u{a}".len(), "{w}");
+        for out in [
+            telegram_prompt(&p, 1000),
+            telegram_outcome(&p, Outcome::TimedOut),
+            dialog_lines(&p, 240).join("\n"),
+            describe(&p, 1000),
+        ] {
+            assert!(!out.contains('\u{202e}'), "{out}");
+            assert!(out.chars().count() < 1000, "{} chars", out.chars().count());
+        }
+        let t = telegram_prompt(&p, 1000);
+        assert_eq!(t.lines().count(), 8, "no injected lines: {t}");
+        assert_eq!(dialog_lines(&p, 240).len(), 7);
     }
 
     #[test]

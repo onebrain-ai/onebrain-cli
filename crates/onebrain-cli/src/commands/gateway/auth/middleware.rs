@@ -30,10 +30,6 @@ use super::super::oauth_routes::AuthCtx;
 pub struct Principal {
     pub client_id: String,
     pub scope: String,
-    /// Self-registered (untrusted) `client_name` of `client_id`, looked up
-    /// from the store when the token is checked; `None` if unnamed or the
-    /// lookup failed. Display-only: never used for any access decision.
-    pub client_name: Option<String>,
 }
 
 /// Axum middleware guarding the `/mcp` nest: requires a live, unrevoked,
@@ -69,25 +65,14 @@ pub async fn require_bearer(
     // (v3.5.x).
     let checked = {
         let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
-        // Display-only name lookup (a read; failure just means no name).
-        store.check_access(&token).map(|rec| {
-            let name = rec.as_ref().and_then(|r| {
-                store
-                    .get_client(&r.client_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|c| c.client_name)
-            });
-            (rec, name)
-        })
+        store.check_access(&token)
     };
 
     match checked {
-        Ok((Some(record), client_name)) => {
+        Ok(Some(record)) => {
             req.extensions_mut().insert(Principal {
                 client_id: record.client_id,
                 scope: record.scope,
-                client_name,
             });
             next.run(req).await
         }
@@ -101,7 +86,7 @@ pub async fn require_bearer(
         // future `/authorize`/`/token` handler hitting the same corrupt file
         // will surface it loudly via its own `Result` handling; this gate
         // just needs to fail closed.
-        Ok((None, _)) | Err(_) => challenge(ctx.issuer(), true),
+        Ok(None) | Err(_) => challenge(ctx.issuer(), true),
     }
 }
 
@@ -280,41 +265,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body[..], b"client-1:brain");
-    }
-
-    #[tokio::test]
-    async fn principal_carries_the_registered_client_name() {
-        use super::super::store::{AppType, RegisteredClient};
-        let dir = tempfile::tempdir().unwrap();
-        let store = AuthStore::open_at(dir.path().join("auth")).unwrap();
-        store
-            .register_client(RegisteredClient {
-                client_id: "client-1".to_string(),
-                client_name: Some("Claude".to_string()),
-                redirect_uris: vec![],
-                application_type: AppType::Web,
-                created: 0,
-            })
-            .unwrap();
-        let (named, _) = store.issue_token_pair("client-1", "brain").unwrap();
-        let (unnamed, _) = store.issue_token_pair("client-2", "brain").unwrap();
-        let ctx = Arc::new(AuthCtx::new(store));
-        ctx.issuer.set("http://127.0.0.1:7717".to_string()).unwrap();
-
-        async fn handler(Extension(p): Extension<Principal>) -> String {
-            format!("{:?}", p.client_name)
-        }
-        let router = Router::new()
-            .route("/mcp", get(handler))
-            .layer(axum::middleware::from_fn_with_state(ctx, require_bearer));
-
-        for (tok, want) in [(named, "Some(\"Claude\")"), (unnamed, "None")] {
-            let resp = get_mcp(&router, Some(&format!("Bearer {}", tok.token))).await;
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            assert_eq!(std::str::from_utf8(&body).unwrap(), want);
-        }
     }
 
     #[tokio::test]

@@ -136,6 +136,11 @@ pub struct GatewayState {
     /// `gateway.yml`) makes both calls unconditionally no-ops, never a
     /// special case the caller has to think about.
     pub telegram: Option<Arc<telegram::TelegramChannel>>,
+    /// The OAuth context, set once by [`build_gateway_router`]. Used ONLY to
+    /// look up a client's self-registered display name when an approval is
+    /// created (the approval path, not every request). Unset (tests, early
+    /// startup) just means no name is shown.
+    pub auth: std::sync::OnceLock<Arc<AuthCtx>>,
 }
 
 impl GatewayState {
@@ -165,6 +170,7 @@ impl GatewayState {
             audit,
             approvals: Arc::new(Approvals::new()),
             telegram,
+            auth: std::sync::OnceLock::new(),
         }
     }
 }
@@ -1123,6 +1129,15 @@ async fn announce_approval_wait(
 /// entry (never the raw tool arguments, never a note body — see
 /// `audit::AuditEntry::args_summary`'s own doc comment), so there is no
 /// second summary to keep in sync.
+/// The client's self-registered name, sanitized for display. A single small
+/// read, done only when an approval is created; any failure means no name.
+fn registered_client_name(state: &GatewayState, client_id: &str) -> Option<String> {
+    let ctx = state.auth.get()?;
+    let store = ctx.store.lock().unwrap_or_else(|p| p.into_inner());
+    let name = store.get_client(client_id).ok().flatten()?.client_name?;
+    approval::sanitize_client_name(&name)
+}
+
 /// What a gated call tells the approval machinery about itself: the
 /// redacted audit line, plus the structured facts the prompts are built from.
 struct GateCall<'a> {
@@ -1278,10 +1293,7 @@ async fn await_approval(
         created: now,
         expires: now.saturating_add(wait_secs),
         class,
-        client_name: principal
-            .client_name
-            .as_deref()
-            .and_then(approval::sanitize_client_name),
+        client_name: registered_client_name(state, &principal.client_id),
         subject: call.subject.clone(),
     };
     let id = pending.id.clone();
@@ -2343,6 +2355,7 @@ impl ServerHandler for GatewayServer {
 /// `tests::every_non_mcp_route_rejects_a_rebinding_host_on_the_real_router` /
 /// `tests::public_url_host_reaches_oauth_and_mcp_through_both_guards`.
 pub fn build_gateway_router(state: Arc<GatewayState>, auth_ctx: Arc<AuthCtx>) -> axum::Router {
+    let _ = state.auth.set(auth_ctx.clone());
     // Cloned BEFORE the `move` closure below takes ownership of `state` for
     // the `/mcp` factory's own per-request `state.clone()` — `approval_router`
     // needs its own handle on the SAME `Arc<GatewayState>` afterward.
@@ -5363,6 +5376,52 @@ mod tests {
             "the channel that answered this approval must be recorded: {entries:?}"
         );
         assert_eq!(entries[0]["outcome"], "ok");
+    }
+
+    #[tokio::test]
+    async fn the_registered_client_name_reaches_the_pending_prompt_sanitized() {
+        use crate::commands::gateway::auth::store::{AppType, RegisteredClient};
+        let (_dir, router, state, token) =
+            fixture_router_with_mutating_policy(policy::PolicyMode::AskOnce, 300, 30);
+        {
+            let ctx = state.auth.get().expect("router build sets the auth ctx");
+            let store = ctx.store.lock().unwrap();
+            store
+                .register_client(RegisteredClient {
+                    client_id: "test-client".to_string(),
+                    client_name: Some(format!("Cla\u{202e}ude\n{}", "z".repeat(500))),
+                    redirect_uris: vec![],
+                    application_type: AppType::Web,
+                    created: 0,
+                })
+                .unwrap();
+        }
+        let handle = tokio::spawn(async move {
+            let body = call_body(
+                1,
+                "brain_capture",
+                serde_json::json!({"title": "Named", "text": "b"}),
+            );
+            post(
+                &router,
+                body,
+                &token,
+                &standard_headers("tools/call", Some("brain_capture")),
+            )
+            .await
+        });
+        let pending = wait_for_one_pending(&state).await;
+        let name = pending.client_name.clone().expect("name looked up");
+        assert!(name.starts_with("Cla\\u{202e}ude\\u{a}zzz"), "{name}");
+        assert!(name.chars().count() <= 65, "capped");
+        let prompt = approval_view::telegram_body(&pending);
+        assert!(prompt.starts_with("\u{1f510} Cla\\u{202e}ude"), "{prompt}");
+        state.approvals.resolve(
+            &pending.id,
+            approval::Decision::Deny,
+            approval::ResolvedVia::Http,
+        );
+        let _ = handle.await;
     }
 
     #[tokio::test]
