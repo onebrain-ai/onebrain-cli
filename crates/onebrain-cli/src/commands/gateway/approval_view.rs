@@ -68,11 +68,16 @@ pub fn action_phrase(tool: &str) -> String {
 }
 
 /// What an Allowed line names: the decision only, never the result of the
-/// call (the edit is sent before the call runs). A titled note is quoted.
-fn allowed_detail(p: &PendingApproval) -> Option<String> {
+/// call (the edit is sent before the call runs). A titled note is quoted;
+/// everything else names the plain action that was allowed.
+fn allowed_detail(p: &PendingApproval) -> String {
     match (p.tool.as_str(), &p.subject.subject) {
-        ("brain_capture", Some(t)) => Some(format!("\"{}\"", display_text(t))),
-        _ => None,
+        ("brain_capture", Some(t)) => format!("\"{}\"", display_text(t)),
+        ("brain_capture", None) => "a new note".to_string(),
+        ("brain_get", _) => "read a note".to_string(),
+        ("brain_search", _) => "search your vault".to_string(),
+        ("brain_tasks", _) => "read your task list".to_string(),
+        (other, _) => format!("run {}", display_text(other)),
     }
 }
 
@@ -205,10 +210,9 @@ pub fn telegram_outcome(p: &PendingApproval, outcome: Outcome) -> String {
                 (ResolvedVia::Disconnect, _) => {
                     "\u{26d4} Denied \u{b7} the app disconnected, nothing written".to_string()
                 }
-                (ResolvedVia::Telegram, true) => match allowed_detail(p) {
-                    Some(d) => format!("\u{2705} Allowed \u{b7} {d}"),
-                    None => "\u{2705} Allowed".to_string(),
-                },
+                (ResolvedVia::Telegram, true) => {
+                    format!("\u{2705} Allowed \u{b7} {}", allowed_detail(p))
+                }
                 (ResolvedVia::Telegram, false) => {
                     "\u{26d4} Denied \u{b7} nothing was written to the vault".to_string()
                 }
@@ -417,14 +421,26 @@ mod tests {
 
     #[test]
     fn allowed_outcome_states_the_decision_only() {
-        let mut p = capture();
-        p.tool = "brain_get".to_string();
         let allow = Outcome::Decided(Decision::Approve, ResolvedVia::Telegram);
-        assert_eq!(telegram_outcome(&p, allow), "\u{2705} Allowed");
+        let mut p = capture();
+        for (tool, want) in [
+            ("brain_get", "\u{2705} Allowed \u{b7} read a note"),
+            ("brain_search", "\u{2705} Allowed \u{b7} search your vault"),
+            ("brain_tasks", "\u{2705} Allowed \u{b7} read your task list"),
+            ("brain_zap", "\u{2705} Allowed \u{b7} run brain_zap"),
+        ] {
+            p.tool = tool.to_string();
+            assert_eq!(telegram_outcome(&p, allow), want);
+        }
         p.tool = "brain_capture".to_string();
         p.subject = ApprovalSubject::default();
-        assert_eq!(telegram_outcome(&p, allow), "\u{2705} Allowed");
-        assert!(!telegram_outcome(&capture(), allow).contains("saved"));
+        assert_eq!(
+            telegram_outcome(&p, allow),
+            "\u{2705} Allowed \u{b7} a new note"
+        );
+        for w in ["saved", "written", "done"] {
+            assert!(!telegram_outcome(&capture(), allow).contains(w));
+        }
     }
 
     #[test]
