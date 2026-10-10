@@ -12,7 +12,8 @@
 //! - a fresh authenticated `/mcp tools/list` still answers in < 1 s;
 //! - each of three concurrent `/token` calls gets a 503
 //!   `temporarily_unavailable` + `Retry-After: 2` within 6 s;
-//! - an already-open approval SSE stream keeps its keep-alives.
+//! - an already-open approval SSE stream gets a keep-alive while the lock
+//!   is held (the hold runs past the 15 s keep-alive cadence).
 //!
 //! The sandbox helpers are copied from `gateway_keepalive_e2e.rs` (it owns
 //! the originals; `tests/support` is deliberately not used here).
@@ -188,7 +189,9 @@ struct Timed {
 
 /// POST an approval-gated `brain_capture` and stream its reply line by line
 /// on a thread (see `gateway_keepalive_e2e.rs::open_capture_stream`).
-fn open_capture_stream(sb: &Sandbox) -> (String, JoinHandle<Vec<Timed>>) {
+/// Returns the instant the POST was sent: every [`Timed::at`] is measured
+/// from it.
+fn open_capture_stream(sb: &Sandbox) -> (String, Instant, JoinHandle<Vec<Timed>>) {
     let body = serde_json::json!({
         "jsonrpc": "2.0", "id": 2, "method": "tools/call",
         "params": {"name": "brain_capture", "arguments": {"title": "auth lock", "text": "hello"}},
@@ -232,7 +235,7 @@ fn open_capture_stream(sb: &Sandbox) -> (String, JoinHandle<Vec<Timed>>) {
             })
             .collect()
     });
-    (content_type, reader)
+    (content_type, t0, reader)
 }
 
 /// Bounded poll (10 s) for exactly one pending approval; returns its id.
@@ -324,42 +327,15 @@ fn tools_list(mcp_url: &str) -> (Duration, u16, String) {
     (t.elapsed(), status, text)
 }
 
-/// #428 acceptance (design T1 "Starvation test").
-#[test]
-fn a_held_auth_lock_starves_nothing_and_token_answers_503() {
-    let sb = start();
-
-    // An approval-gated call holds an SSE stream open for the whole test.
-    let (content_type, reader) = open_capture_stream(&sb);
-    let stream_opened = Instant::now();
-    assert!(
-        content_type.starts_with("text/event-stream"),
-        "{content_type}"
-    );
-    let code = read_pairing_code(&sb.home);
-    let id = wait_for_one_pending(&sb, &code);
-
-    let lock = hold_auth_lock(&sb.home, 424_242);
-
-    // Three concurrent /token calls: each waits on auth.lock. With only two
-    // runtime workers, a wait on a worker (or under a shared mutex) would
-    // stall everything else below.
+/// Fire three concurrent `/token` calls while `auth.lock` is held and check
+/// each one gives up with the designed 503 within 6 s.
+fn token_wave_answers_503(base_url: &str) {
     let tokens: Vec<JoinHandle<TokenReply>> = (0..3)
         .map(|_| {
-            let base = sb.base_url.clone();
+            let base = base_url.to_string();
             std::thread::spawn(move || post_token(&base))
         })
         .collect();
-    std::thread::sleep(Duration::from_millis(500));
-
-    let (elapsed, status, body) = tools_list(&sb.mcp_url);
-    assert_eq!(status, 200, "{body}");
-    assert!(body.contains("brain_search"), "{body}");
-    assert!(
-        elapsed < Duration::from_secs(1),
-        "tools/list took {elapsed:?} while auth.lock was held — the runtime is starved"
-    );
-
     for handle in tokens {
         let reply = handle.join().unwrap();
         assert_eq!(reply.status, 503, "{}", reply.body);
@@ -375,7 +351,53 @@ fn a_held_auth_lock_starves_nothing_and_token_answers_503() {
             serde_json::json!({"error": "temporarily_unavailable"})
         );
     }
+}
 
+/// How long (on the stream's clock) `auth.lock` stays held. rmcp sends a
+/// `:` keep-alive every 15 s, so holding past 17 s guarantees one is due
+/// INSIDE the hold.
+const HOLD_UNTIL: Duration = Duration::from_secs(17);
+
+/// #428 acceptance (design T1 "Starvation test").
+#[test]
+fn a_held_auth_lock_starves_nothing_and_token_answers_503() {
+    let sb = start();
+
+    // An approval-gated call holds an SSE stream open for the whole test.
+    let (content_type, t0, reader) = open_capture_stream(&sb);
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "{content_type}"
+    );
+    let code = read_pairing_code(&sb.home);
+    let id = wait_for_one_pending(&sb, &code);
+
+    let lock = hold_auth_lock(&sb.home, 424_242);
+    let hold_start = t0.elapsed();
+
+    // Waves of three concurrent /token calls keep blocking threads busy on
+    // auth.lock for the whole hold. With only two runtime workers, a wait on
+    // a worker (or under a shared mutex) would stall everything else: the
+    // fresh tools/list below and the stream's keep-alives.
+    let mut waves = 0;
+    while t0.elapsed() < HOLD_UNTIL {
+        let base = sb.base_url.clone();
+        let wave = std::thread::spawn(move || token_wave_answers_503(&base));
+        std::thread::sleep(Duration::from_millis(500));
+        let (elapsed, status, body) = tools_list(&sb.mcp_url);
+        assert_eq!(status, 200, "{body}");
+        assert!(body.contains("brain_search"), "{body}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "tools/list took {elapsed:?} while auth.lock was held — the runtime is starved"
+        );
+        if let Err(panic) = wave.join() {
+            std::panic::resume_unwind(panic);
+        }
+        waves += 1;
+    }
+
+    let hold_end = t0.elapsed();
     drop(lock);
     let after = post_token(&sb.base_url);
     assert_eq!(
@@ -384,19 +406,20 @@ fn a_held_auth_lock_starves_nothing_and_token_answers_503() {
         after.body
     );
 
-    // Keep the stream open long enough for two 15 s keep-alives, then end it.
-    let hold = Duration::from_secs(32);
-    if let Some(left) = hold.checked_sub(stream_opened.elapsed()) {
-        std::thread::sleep(left);
-    }
     resolve(&sb, &code, &id, "approve");
     let lines = join_within(reader, Duration::from_secs(10));
     let dump: String = lines
         .iter()
         .map(|t| format!("{:>6.1}s {}\n", t.at.as_secs_f64(), t.line))
         .collect();
-    let keepalives = lines.iter().filter(|t| t.line.starts_with(':')).count();
-    assert!(keepalives >= 2, "only {keepalives} keep-alives:\n{dump}");
+    let inside = lines
+        .iter()
+        .filter(|t| t.line.starts_with(':') && t.at > hold_start && t.at < hold_end)
+        .count();
+    assert!(
+        inside >= 1,
+        "no keep-alive inside the hold {hold_start:?}..{hold_end:?} ({waves} /token waves):\n{dump}"
+    );
     let mut prev = Duration::ZERO;
     for t in &lines {
         assert!(
