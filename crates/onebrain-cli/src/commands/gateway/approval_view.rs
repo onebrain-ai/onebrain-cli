@@ -91,10 +91,15 @@ fn plain_action(tool: &str) -> String {
 /// The asker's name. Self-registered and attacker-controlled, so it is
 /// re-neutralised and capped HERE at render time, whatever path built `p`.
 fn who(p: &PendingApproval) -> String {
-    match p.client_name.as_deref() {
-        Some(n) if !n.trim().is_empty() => display_text(&cap_name(n)),
-        _ => "An unnamed app".to_string(),
-    }
+    named(p).unwrap_or_else(|| "An unnamed app".to_string())
+}
+
+/// The rendered client name, or `None` when absent, blank or whitespace.
+fn named(p: &PendingApproval) -> Option<String> {
+    p.client_name
+        .as_deref()
+        .filter(|n| !n.trim().is_empty())
+        .map(|n| display_text(&cap_name(n)))
 }
 
 fn cap_name(s: &str) -> String {
@@ -169,7 +174,7 @@ pub fn telegram_body(p: &PendingApproval) -> String {
     out.push_str(&rows.join("\n"));
     out.push_str("\n\n");
     let id = client_id_short(&p.client_id);
-    if p.client_name.is_some() {
+    if named(p).is_some() {
         out.push_str(&format!(
             "Asked by {} \u{b7} self-declared name \u{b7} id {id}",
             who(p)
@@ -201,10 +206,7 @@ fn grant_line(p: &PendingApproval) -> Option<String> {
     } else {
         "do this again"
     };
-    let who = p
-        .client_name
-        .as_ref()
-        .map_or_else(|| "the app".to_string(), |_| self::who(p));
+    let who = named(p).unwrap_or_else(|| "the app".to_string());
     Some(format!("Allow also lets {who} {what} for {m} min"))
 }
 
@@ -356,7 +358,7 @@ pub fn dialog_lines(p: &PendingApproval, remaining_secs: u64) -> Vec<String> {
         lines.push(g);
     }
     let id = client_id_short(&p.client_id);
-    let asked = if p.client_name.is_some() {
+    let asked = if named(p).is_some() {
         format!("Asked by {} (self-declared name \u{b7} id {id})", who(p))
     } else {
         format!("Asked by an unnamed app (id {id})")
@@ -387,8 +389,8 @@ pub fn describe(p: &PendingApproval, now: u64) -> String {
             s => format!("{} min left", s.div_ceil(60)),
         }
     ));
-    if let Some(m) = p.grant_minutes {
-        out.push_str(&format!(" \u{b7} Allow also covers repeats for {m} min"));
+    if let Some(g) = grant_line(p) {
+        out.push_str(&format!(" \u{b7} {g}"));
     }
     out
 }
@@ -569,13 +571,15 @@ mod tests {
         let title = format!("a\u{202e}b\nc{}", "x".repeat(500));
         p.subject = ApprovalSubject::new(Some(&title), Some(1));
         p.vault = Some("v\u{2066}\n".to_string());
+        p.grant_minutes = Some(30);
         let t = telegram_prompt(&p, 1000);
         assert!(!t.contains('\u{202e}') && !t.contains('\u{2066}'), "{t}");
         assert!(t.contains("a\\u{202e}b\\u{a}c"), "{t}");
         assert!(t.contains("\u{2026}"), "title capped");
         assert!(t.chars().count() < 800, "{} chars", t.chars().count());
         assert!(t.contains("1 character\n"), "singular");
-        assert_eq!(t.lines().count(), 8, "no injected lines: {t}");
+        assert_eq!(t.lines().count(), 9, "no injected lines: {t}");
+        assert!(t.contains("\nAllow also lets Claude save more notes for 30 min\n"));
         let d = dialog_lines(&p, 240).join("\n");
         assert!(!d.contains('\u{202e}'), "{d}");
     }
@@ -586,6 +590,7 @@ mod tests {
         // Deliberately NOT pre-sanitised: PendingApproval may be built by
         // any path.
         p.client_name = Some(format!("Cla\u{202e}ude\n{}", "z".repeat(500)));
+        p.grant_minutes = Some(30);
         let w = who(&p);
         assert!(w.starts_with("Cla\\u{202e}ude\\u{a}zzz"), "{w}");
         assert!(w.chars().count() <= 64 + 1 + "\\u{202e}\\u{a}".len(), "{w}");
@@ -596,11 +601,58 @@ mod tests {
             describe(&p, 1000),
         ] {
             assert!(!out.contains('\u{202e}'), "{out}");
-            assert!(out.chars().count() < 1000, "{} chars", out.chars().count());
+            assert!(out.chars().count() < 1100, "{} chars", out.chars().count());
         }
         let t = telegram_prompt(&p, 1000);
-        assert_eq!(t.lines().count(), 8, "no injected lines: {t}");
-        assert_eq!(dialog_lines(&p, 240).len(), 7);
+        assert_eq!(t.lines().count(), 9, "no injected lines: {t}");
+        assert!(t.contains("\nAllow also lets Cla\\u{202e}ude"), "{t}");
+        assert_eq!(dialog_lines(&p, 240).len(), 8);
+    }
+
+    #[test]
+    fn everything_hostile_at_once_stays_under_telegram_4096_in_prompt_and_outcome() {
+        let mut p = capture();
+        let big = format!("a\u{202e}\n{}", "x".repeat(5000));
+        p.client_name = Some(big.clone());
+        p.vault = Some(big.clone());
+        p.subject = ApprovalSubject::new(Some(&big), Some(usize::MAX));
+        p.grant_minutes = Some(u64::MAX);
+        let allow = Outcome::Decided(Decision::Approve, ResolvedVia::Telegram);
+        assert!(telegram_prompt(&p, 0).chars().count() < 4096);
+        assert!(
+            format!("{}\n\n{}", tout(&p, allow), telegram_body(&p))
+                .chars()
+                .count()
+                < 4096
+        );
+    }
+
+    #[test]
+    fn blank_client_name_falls_back_like_none() {
+        let mut p = capture();
+        p.grant_minutes = Some(30);
+        let none_t = {
+            p.client_name = None;
+            (
+                telegram_prompt(&p, 1000),
+                dialog_lines(&p, 240),
+                describe(&p, 1000),
+            )
+        };
+        for blank in ["", "   ", "\t"] {
+            p.client_name = Some(blank.to_string());
+            assert_eq!(
+                (
+                    telegram_prompt(&p, 1000),
+                    dialog_lines(&p, 240),
+                    describe(&p, 1000)
+                ),
+                none_t
+            );
+        }
+        assert!(none_t
+            .0
+            .contains("Allow also lets the app save more notes for 30 min"));
     }
 
     #[test]
@@ -691,7 +743,9 @@ mod tests {
             Outcome::Decided(Decision::Approve, ResolvedVia::Telegram)
         )
         .ends_with("read a note \u{b7} repeat allowed until t2800"));
-        assert!(describe(&p, 1000).ends_with("Allow also covers repeats for 30 min"));
+        assert!(
+            describe(&p, 1000).ends_with("\u{b7} Allow also lets the app do this again for 30 min")
+        );
     }
 
     #[test]
