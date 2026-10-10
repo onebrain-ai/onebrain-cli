@@ -53,10 +53,10 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use super::auth::store::is_store_busy;
+use super::auth::store::{is_store_busy, CodeExchange};
 use super::auth::{
-    mint_secret_32, now_epoch_secs, pkce_s256_matches, AppType, AuthStore, RegisteredClient,
-    RotateOutcome, TokenRecord, ACCESS_TTL_SECS,
+    mint_secret_32, now_epoch_secs, pkce_s256_matches, AppType, AuthCode, AuthStore,
+    RegisteredClient, RotateOutcome, TokenRecord, ACCESS_TTL_SECS,
 };
 use super::host_guard::request_origin_allowed;
 
@@ -1612,38 +1612,27 @@ fn token_busy() -> Response {
 }
 
 /// The authorization_code grant (RFC 6749 §4.1.3). Synchronous, run on
-/// `spawn_blocking` by [`token_handler`]. Each store step is atomic under
-/// `auth.lock` (see `AuthCtx`'s doc comment): `consume_code` spends the code
-/// exactly once, so two concurrent redemptions cannot both mint a pair.
+/// `spawn_blocking` by [`token_handler`]. The WHOLE redemption is one store
+/// call, [`super::auth::store::AuthStore::exchange_code`], under one hold of
+/// `auth.lock` (#428 review): consume, bindings, client re-check, mint, and
+/// link the code to the minted family. A replay can therefore never slip in
+/// between the first redemption's consume and its family link, and a busy
+/// lock spends nothing.
 ///
-/// Order of operations matters for two binding properties:
-/// 1. `consume_code` runs UNCONDITIONALLY FIRST, before any binding/PKCE
-///    check — a code is single-use the moment it's presented, regardless of
-///    whether the rest of the request turns out to be valid (this is what
-///    makes "wrong verifier → invalid_grant AND the code is now dead" true:
-///    RFC 6749 intends a presented code to be spent on presentation, not
-///    only on a successful exchange).
-/// 2. Every subsequent failure — client_id mismatch, redirect_uri mismatch,
-///    resource mismatch (checked only when the request itself sent one —
-///    RFC 8707 `resource` is optional at each step), PKCE mismatch — is
-///    combined into ONE boolean and checked with a SINGLE `if` / SINGLE
-///    return statement ([`token_error`] call), rather than four separate
-///    early-return branches. There is exactly one line in this function that
-///    can produce the `invalid_grant` response for a bindings failure, so
-///    there is no way for two different causes to accidentally diverge in
-///    status/body — the uniform-failure, no-oracle contract (task brief) by
-///    construction, not by discipline.
+/// Binding properties, both enforced inside that one call:
+/// 1. The code is spent on PRESENTATION, before any binding/PKCE check —
+///    "wrong verifier → invalid_grant AND the code is now dead" (RFC 6749
+///    intends a presented code to be spent, not only on success).
+/// 2. Every binding failure — client_id, redirect_uri, resource (checked
+///    only when the request sent one; RFC 8707 `resource` is optional at
+///    each step), PKCE — is ONE boolean below, and every `Invalid` outcome
+///    maps to the SAME `invalid_grant` response: the uniform-failure,
+///    no-oracle contract by construction.
 ///
-/// Replay hardening (RFC 6749 §4.1.2 SHOULD): when `consume_code` fails,
-/// this checks — READ-ONLY, via [`super::auth::store::AuthStore::find_code_record`]
-/// — whether the failure was because the code was already `used` (a genuine
-/// replay) as opposed to unknown/never-issued/expired-but-never-used. Only
-/// in the replay case, and only if that earlier successful redemption
-/// actually minted a token family ([`AuthCode::minted_family`], stamped by
-/// [`Self`]'s own success path below via `mark_code_minted_family`), does it
-/// revoke that family. This distinction is used ONLY to decide the internal
-/// side effect — the HTTP response is [`token_error`]'s identical
-/// `invalid_grant` body no matter which of these branches fired.
+/// Replay hardening (RFC 6749 §4.1.2 SHOULD): a replay of a spent code
+/// revokes the family that code minted, inside `exchange_code`. Only the
+/// internal side effect differs; the response is the identical
+/// `invalid_grant`.
 fn token_authorization_code_grant(ctx: &AuthCtx, req: &TokenRequest) -> Response {
     // Wire-invisible diagnostic only: the HTTP response for a missing
     // required parameter is still the identical uniform `invalid_grant`
@@ -1671,112 +1660,29 @@ fn token_authorization_code_grant(ctx: &AuthCtx, req: &TokenRequest) -> Response
     let redirect_uri = req.redirect_uri.as_deref().unwrap_or_default();
     let code_verifier = req.code_verifier.as_deref().unwrap_or_default();
 
-    let store = &ctx.store;
-
-    let consumed = match store.consume_code(code) {
-        Ok(v) => v,
-        Err(e) if is_store_busy(&e) => {
-            tracing::warn!(error = %e, "POST /token: auth store busy");
-            return token_busy();
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "auth code store I/O error during /token");
-            return oauth_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "internal error redeeming authorization code",
-            );
-        }
+    let bindings_ok = |auth_code: &AuthCode| {
+        client_id == auth_code.client_id
+            && redirect_uri == auth_code.redirect_uri
+            && match req.resource.as_deref() {
+                None => true,
+                Some(r) => r == auth_code.resource,
+            }
+            && pkce_s256_matches(code_verifier, &auth_code.code_challenge)
     };
 
-    let Some(auth_code) = consumed else {
-        // Replay hardening — see the doc comment above. Every branch below
-        // still ends at the exact same `token_error(... "invalid_grant")`
-        // call; only the internal side effect differs.
-        if let Ok(Some(record)) = store.find_code_record(code) {
-            if record.used {
-                if let Some(family) = &record.minted_family {
-                    // Best-effort: a failure here would already be a store
-                    // I/O problem `consume_code` above would also have hit,
-                    // and there is nothing more specific to tell the caller
-                    // either way (still `invalid_grant`).
-                    let _ = store.revoke_family(family);
-                }
-            }
-        }
-        return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
-    };
-
-    let bindings_ok = client_id == auth_code.client_id
-        && redirect_uri == auth_code.redirect_uri
-        && match req.resource.as_deref() {
-            None => true,
-            Some(r) => r == auth_code.resource,
-        }
-        && pkce_s256_matches(code_verifier, &auth_code.code_challenge);
-
-    if !bindings_ok {
-        return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
-    }
-
-    issue_pair_for_consumed_code(store, &auth_code)
-}
-
-/// Mint the pair for an already-consumed, binding-checked code.
-///
-/// `consume_code` and the issue below are separate locked calls, so
-/// `AuthStore::remove_client` (another process) can run between them. After
-/// issuing we therefore re-check the client is still registered: a remove
-/// AFTER the re-check sees the new pair and revokes it, and a remove BEFORE
-/// it is caught here, so no live pair survives for a removed client.
-fn issue_pair_for_consumed_code(store: &AuthStore, auth_code: &super::auth::AuthCode) -> Response {
-    match store.issue_token_pair_for_resource(
-        &auth_code.client_id,
-        &auth_code.scope,
-        Some(&auth_code.resource),
-    ) {
-        Ok((access, refresh)) => {
-            match store.get_client(&auth_code.client_id) {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    if let Err(e) = store.revoke_family(&refresh.family) {
-                        tracing::warn!(error = %e, client_id = %auth_code.client_id,
-                            "failed to revoke family after client re-check");
-                    }
-                    return token_error(StatusCode::BAD_REQUEST, "invalid_grant");
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "client re-check failed during /token");
-                    if let Err(e) = store.revoke_family(&refresh.family) {
-                        tracing::warn!(error = %e, client_id = %auth_code.client_id,
-                            "failed to revoke family after client re-check");
-                    }
-                    return oauth_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "server_error",
-                        "failed to issue tokens",
-                    );
-                }
-            }
-            // Link this code to the family it minted so a LATER replay can
-            // find and revoke it (see the doc comment above). Best-effort:
-            // the tokens are already valid and returned to the caller either
-            // way; failing to record this link only weakens hardening
-            // against a FUTURE replay of an already-spent code, it never
-            // wrongly trusts anything.
-            let _ = store.mark_code_minted_family(&auth_code.code, &refresh.family);
-            TokenResponse::from_pair(&access, &refresh)
-        }
+    match ctx.store.exchange_code(code, bindings_ok) {
+        Ok(CodeExchange::Issued { access, refresh }) => TokenResponse::from_pair(&access, &refresh),
+        Ok(CodeExchange::Invalid) => token_error(StatusCode::BAD_REQUEST, "invalid_grant"),
         Err(e) if is_store_busy(&e) => {
             tracing::warn!(error = %e, "POST /token: auth store busy");
             token_busy()
         }
         Err(e) => {
-            tracing::error!(error = %e, "failed to persist minted token pair");
+            tracing::error!(error = %e, "auth code store I/O error during /token");
             oauth_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
-                "failed to issue tokens",
+                "internal error redeeming authorization code",
             )
         }
     }
@@ -2427,8 +2333,7 @@ mod tests {
     }
 
     #[test]
-    fn code_exchange_refuses_a_pair_when_the_client_was_removed_mid_exchange() {
-        use super::super::auth::store::TokenStatus;
+    fn code_exchange_refuses_a_pair_when_the_client_was_removed_before_redemption() {
         let dir = tempfile::tempdir().unwrap();
         let store = AuthStore::open_at(dir.path().join("auth")).unwrap();
         store
@@ -2443,17 +2348,17 @@ mod tests {
         let code = store
             .issue_code("c1", "https://cb", "chal", "res", "brain")
             .unwrap();
-        // Interleaving: the code is consumed, THEN the operator removes the
-        // client, THEN the handler issues the pair.
-        let consumed = store.consume_code(&code.code).unwrap().unwrap();
+        // The operator removes the client between /authorize and /token. A
+        // remove can no longer land INSIDE the exchange (one auth.lock hold),
+        // and one landing after it revokes the minted pair itself.
         store.remove_client("c1").unwrap().unwrap();
-        let resp = issue_pair_for_consumed_code(&store, &consumed);
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let views = store.list_tokens().unwrap();
-        assert!(!views.is_empty(), "the pair was minted then revoked");
+        assert_eq!(
+            store.exchange_code(&code.code, |_| true).unwrap(),
+            super::super::auth::store::CodeExchange::Invalid
+        );
         assert!(
-            views.iter().all(|v| v.status == TokenStatus::Revoked),
-            "no live token may survive for a removed client"
+            store.list_tokens().unwrap().is_empty(),
+            "no pair may be minted for a removed client"
         );
     }
 

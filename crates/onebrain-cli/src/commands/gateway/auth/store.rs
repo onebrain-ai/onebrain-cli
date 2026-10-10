@@ -84,15 +84,13 @@ pub struct AuthCode {
     pub scope: String,
     pub expires: u64,
     pub used: bool,
-    /// The token `family` id [`AuthStore::issue_token_pair`] minted when this
-    /// code was successfully redeemed — `None` until then (and forever, if
-    /// this code is never successfully redeemed at all). Stamped by
-    /// [`AuthStore::mark_code_minted_family`] AFTER a `/token` handler's
-    /// `issue_token_pair` call, and read back by
-    /// [`AuthStore::find_code_record`] when that SAME code is presented
-    /// again — a replay of an already-`used` code (RFC 6749 §4.1.2 SHOULD)
-    /// — so the `/token` handler can [`AuthStore::revoke_family`] everything
-    /// that code ever produced. `#[serde(default)]` so an on-disk
+    /// The token `family` id minted when this code was successfully
+    /// redeemed — `None` until then (and forever, if this code is never
+    /// successfully redeemed at all). Stamped by [`AuthStore::exchange_code`]
+    /// in the same `auth.lock` hold that spends the code and mints the pair,
+    /// and read back by it when that SAME code is presented again — a replay
+    /// of an already-`used` code (RFC 6749 §4.1.2 SHOULD) — to revoke
+    /// everything that code ever produced. `#[serde(default)]` so an on-disk
     /// `codes.json` written before this field existed still deserializes
     /// (as `None`, the correct "nothing minted from this yet" value).
     #[serde(default)]
@@ -242,6 +240,25 @@ impl std::fmt::Debug for PairingState {
             .field("created", &self.created)
             .finish()
     }
+}
+
+/// Outcome of [`AuthStore::exchange_code`] — the whole RFC 6749 §4.1.3
+/// authorization_code redemption, decided in ONE `auth.lock` hold.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CodeExchange {
+    /// The code was fresh, its bindings matched and its client is still
+    /// registered: here is the pair minted for it (boxed, as in
+    /// [`RotateOutcome::Rotated`]). The code is spent and links to the pair's
+    /// family.
+    Issued {
+        access: Box<TokenRecord>,
+        refresh: Box<TokenRecord>,
+    },
+    /// `invalid_grant`, whatever the cause: unknown or expired code; a
+    /// replay of a spent code (whose minted family, if any, is now revoked);
+    /// a binding/PKCE mismatch (the code is spent anyway); or a client that
+    /// was removed (the code is spent, nothing minted).
+    Invalid,
 }
 
 /// Outcome of [`AuthStore::rotate_refresh`]. See the module docs for the
@@ -768,12 +785,10 @@ impl AuthStore {
         Ok(Some(consumed))
     }
 
-    /// Stamp `family` onto the (already-`used`) code record for `code` —
-    /// called by the `/token` handler right after [`Self::issue_token_pair`]
-    /// mints the pair a successful `consume_code` redemption produced, so a
-    /// LATER replay of this same code can find and
-    /// [`Self::revoke_family`] it (RFC 6749 §4.1.2 SHOULD; see
-    /// [`AuthCode::minted_family`]'s doc comment for the full link). A no-op
+    /// Stamp `family` onto the (already-`used`) code record for `code`. The
+    /// `/token` handler no longer calls this: [`Self::exchange_code`] stamps
+    /// the family in the same lock hold that mints it (#428 review); a
+    /// separate stamp would leave a window for an unrevoked replay. A no-op
     /// (not an error) if `code` is no longer present in `codes.json` — the
     /// family it would have linked to already exists independently in
     /// `tokens.json` and stays valid on its own merits; failing to record
@@ -789,14 +804,78 @@ impl AuthStore {
         Ok(())
     }
 
+    /// Redeem `code` for a token pair (RFC 6749 §4.1.3) in ONE hold of
+    /// `auth.lock`: consume → `bindings_ok` (client_id / redirect_uri /
+    /// resource / PKCE, decided by the caller) → client still registered →
+    /// mint the pair → link the code to the pair's family. A replay of an
+    /// already-spent code revokes the family it minted (RFC 6749 §4.1.2
+    /// SHOULD) in the same hold.
+    ///
+    /// One hold is what makes the replay hardening sound without an
+    /// in-process mutex (#428 review): a replay can never run between the
+    /// first redemption's consume and its family link, because both happen
+    /// before the lock is released — so it always finds the family to
+    /// revoke. It also means a busy lock fails BEFORE anything is spent: the
+    /// client can retry with the same code.
+    ///
+    /// Write order is `codes.json` first (spent + linked), then
+    /// `tokens.json`: a crash between the two leaves a spent code and no
+    /// tokens (fail closed), never live tokens beside a redeemable code.
+    pub fn exchange_code(
+        &self,
+        code: &str,
+        bindings_ok: impl FnOnce(&AuthCode) -> bool,
+    ) -> Result<CodeExchange> {
+        let _guard = self.lock_exclusive()?;
+        let mut codes = self.load_codes()?;
+        let now = core::now_epoch_secs();
+        let Some(entry) = codes.get_mut(code) else {
+            return Ok(CodeExchange::Invalid);
+        };
+        if entry.used {
+            if let Some(family) = entry.minted_family.clone() {
+                self.revoke_family_locked(&family)?;
+            }
+            return Ok(CodeExchange::Invalid);
+        }
+        if entry.expires <= now {
+            return Ok(CodeExchange::Invalid);
+        }
+        entry.used = true;
+        let auth_code = entry.clone();
+        #[cfg(test)]
+        exchange_pause::fire();
+
+        // A code is spent on presentation, not only on success — a wrong
+        // verifier or a removed client still kills it.
+        if !bindings_ok(&auth_code) || !self.load_clients()?.contains_key(&auth_code.client_id) {
+            self.save_codes(&codes)?;
+            return Ok(CodeExchange::Invalid);
+        }
+
+        let (access, refresh) = self.new_pair(
+            &auth_code.client_id,
+            &auth_code.scope,
+            Some(&auth_code.resource),
+        );
+        if let Some(entry) = codes.get_mut(code) {
+            entry.minted_family = Some(refresh.family.clone());
+        }
+        self.save_codes(&codes)?;
+        let mut tokens = self.load_tokens()?;
+        tokens.insert(access.token.clone(), access.clone());
+        tokens.insert(refresh.token.clone(), refresh.clone());
+        self.save_tokens(&tokens)?;
+        Ok(CodeExchange::Issued {
+            access: Box::new(access),
+            refresh: Box::new(refresh),
+        })
+    }
+
     /// Look up `code` WITHOUT consuming it, checking expiry, or otherwise
-    /// authorizing anything — the ONLY legitimate caller is the `/token`
-    /// handler's replay-hardening path, AFTER [`Self::consume_code`] has
-    /// already returned `None` for this exact code, to tell a genuine replay
-    /// (`used == true`) apart from unknown/never-issued (`Ok(None)` here
-    /// too, nothing to revoke). Never used to redeem a code a second way —
-    /// see [`AuthCode::minted_family`]'s doc comment for the full flow this
-    /// feeds into.
+    /// authorizing anything — a read-only inspection (tests, diagnostics).
+    /// Never used to redeem a code; [`Self::exchange_code`] owns redemption
+    /// and replay hardening.
     pub fn find_code_record(&self, code: &str) -> Result<Option<AuthCode>> {
         Ok(self.load_codes()?.get(code).cloned())
     }
@@ -824,6 +903,21 @@ impl AuthStore {
         resource: Option<&str>,
     ) -> Result<(TokenRecord, TokenRecord)> {
         let _guard = self.lock_exclusive()?;
+        let (access, refresh) = self.new_pair(client_id, scope, resource);
+        let mut tokens = self.load_tokens()?;
+        tokens.insert(access.token.clone(), access.clone());
+        tokens.insert(refresh.token.clone(), refresh.clone());
+        self.save_tokens(&tokens)?;
+        Ok((access, refresh))
+    }
+
+    /// Build (not persist) a fresh access+refresh pair in a new family.
+    fn new_pair(
+        &self,
+        client_id: &str,
+        scope: &str,
+        resource: Option<&str>,
+    ) -> (TokenRecord, TokenRecord) {
         let family = core::mint_secret_32();
         let now = core::now_epoch_secs();
         let resource = resource.map(str::to_string);
@@ -849,12 +943,7 @@ impl AuthStore {
             revoked: false,
             rotated_to: None,
         };
-
-        let mut tokens = self.load_tokens()?;
-        tokens.insert(access.token.clone(), access.clone());
-        tokens.insert(refresh.token.clone(), refresh.clone());
-        self.save_tokens(&tokens)?;
-        Ok((access, refresh))
+        (access, refresh)
     }
 
     /// Validate a presented bearer token as an in-date, unrevoked ACCESS
@@ -1006,12 +1095,15 @@ impl AuthStore {
     /// tokens are left alone, and nothing is written back if `family`
     /// matches no token at all). This is the SAME "burn the whole family"
     /// action [`Self::rotate_refresh`]'s reuse-detection branch takes
-    /// inline; exposed here as its own method for the `/token` handler's
-    /// authorization-code replay hardening (RFC 6749 §4.1.2 SHOULD) — see
-    /// [`Self::mark_code_minted_family`]/[`Self::find_code_record`] for how
-    /// that path finds the family to pass in here.
+    /// inline, and the one [`Self::exchange_code`]'s replay branch takes
+    /// (via [`Self::revoke_family_locked`], inside its own lock hold).
     pub fn revoke_family(&self, family: &str) -> Result<()> {
         let _guard = self.lock_exclusive()?;
+        self.revoke_family_locked(family)
+    }
+
+    /// [`Self::revoke_family`]'s body, for callers already holding the lock.
+    fn revoke_family_locked(&self, family: &str) -> Result<()> {
         let mut tokens = self.load_tokens()?;
         let mut changed = false;
         for t in tokens.values_mut() {
@@ -1082,8 +1174,8 @@ impl AuthStore {
     /// **`codes.json` retention is NOT simply "past its own `expires`
     /// field."** A USED code that recorded a [`AuthCode::minted_family`] is a
     /// durable security artifact, not disposable state: the `/token`
-    /// handler's RFC 6749 §4.1.2 replay hardening ([`Self::find_code_record`]
-    /// → [`Self::revoke_family`]) depends on that record still being on disk
+    /// handler's RFC 6749 §4.1.2 replay hardening (inside
+    /// [`Self::exchange_code`]) depends on that record still being on disk
     /// to catch a LATE replay of the code, and a refresh token from that
     /// family can legitimately still be presented for rotation up to
     /// [`REFRESH_TTL_SECS`] (30 days) after it was minted — far longer than
@@ -1431,6 +1523,29 @@ fn read_json_or_default<T: DeserializeOwned + Default>(path: &Path) -> Result<T>
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
         Err(e) => Err(e).context(format!("read {}", path.display())),
+    }
+}
+
+/// Test-only pause point inside [`AuthStore::exchange_code`], right after
+/// the code is marked spent and before the pair is minted — where the
+/// pre-#428-review split released `auth.lock`. Thread-local, so only the
+/// thread that armed it pauses.
+#[cfg(test)]
+pub(crate) mod exchange_pause {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+
+    pub(crate) fn arm(hook: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(super) fn fire() {
+        if let Some(hook) = HOOK.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
     }
 }
 
@@ -2301,6 +2416,103 @@ mod tests {
     }
 
     // ── Cross-process advisory lock (T2 / #406) ─────────────────────────
+
+    /// #428 review blocker: a replay that arrives while the first
+    /// redemption is between "code spent" and "family linked" must still
+    /// end with that family revoked. Thread A pauses at exactly that point
+    /// ([`exchange_pause`]) and waits for replay B to finish (up to 500 ms).
+    /// With the exchange in ONE lock hold, B cannot run inside the pause: it
+    /// waits on `auth.lock`, then finds the linked family and revokes it.
+    /// With the old split (consume, mint, link as separate lock holds), B
+    /// runs inside the pause, finds no family yet, and A's pair survives.
+    #[test]
+    fn a_replay_racing_the_first_redemption_still_revokes_its_family() {
+        let (_dir, store) = open_temp();
+        store.register_client(client("c1")).unwrap();
+        let code = store
+            .issue_code("c1", "https://cb", "chal", "res", "brain")
+            .unwrap()
+            .code;
+        let store = std::sync::Arc::new(store);
+        let (consumed_tx, consumed_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+        let first = {
+            let store = store.clone();
+            let code = code.clone();
+            std::thread::spawn(move || {
+                exchange_pause::arm(move || {
+                    consumed_tx.send(()).unwrap();
+                    let _ = done_rx.recv_timeout(std::time::Duration::from_millis(500));
+                });
+                store.exchange_code(&code, |_| true).unwrap()
+            })
+        };
+        consumed_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the first redemption never reached the pause point");
+        let replay = store.exchange_code(&code, |_| true).unwrap();
+        let _ = done_tx.send(());
+        assert_eq!(replay, CodeExchange::Invalid);
+
+        let CodeExchange::Issued { access, refresh } = first.join().unwrap() else {
+            panic!("the first redemption must mint a pair");
+        };
+        assert!(
+            store.check_access(&access.token).unwrap().is_none(),
+            "the replay raced the first redemption and its pair survived"
+        );
+        assert_eq!(
+            store.rotate_refresh(&refresh.token).unwrap(),
+            RotateOutcome::Invalid,
+            "the replayed code's refresh token must be dead too"
+        );
+    }
+
+    #[test]
+    fn exchange_code_spends_the_code_on_a_binding_mismatch_and_mints_nothing() {
+        let (_dir, store) = open_temp();
+        store.register_client(client("c1")).unwrap();
+        let code = store
+            .issue_code("c1", "https://cb", "chal", "res", "brain")
+            .unwrap()
+            .code;
+        assert_eq!(
+            store.exchange_code(&code, |_| false).unwrap(),
+            CodeExchange::Invalid
+        );
+        assert!(store.load_tokens().unwrap().is_empty());
+        assert_eq!(
+            store.exchange_code(&code, |_| true).unwrap(),
+            CodeExchange::Invalid,
+            "a code that failed its bindings is spent"
+        );
+    }
+
+    #[test]
+    fn exchange_code_on_a_busy_store_spends_nothing() {
+        let (dir, store) = open_temp();
+        store.register_client(client("c1")).unwrap();
+        let code = store
+            .issue_code("c1", "https://cb", "chal", "res", "brain")
+            .unwrap()
+            .code;
+        let busy = AuthStore::open_at(dir.path().join("gateway"))
+            .unwrap()
+            .with_lock_wait(std::time::Duration::from_millis(100));
+        let guard = store.lock_exclusive().unwrap();
+        assert!(is_store_busy(
+            &busy.exchange_code(&code, |_| true).unwrap_err()
+        ));
+        drop(guard);
+        assert!(
+            matches!(
+                store.exchange_code(&code, |_| true).unwrap(),
+                CodeExchange::Issued { .. }
+            ),
+            "a busy lock must not burn the code; the retry succeeds"
+        );
+    }
 
     /// #428 premise: with no in-process `Mutex<AuthStore>`, the gateway's
     /// threads share ONE `AuthStore` and rely on `auth.lock` alone to
