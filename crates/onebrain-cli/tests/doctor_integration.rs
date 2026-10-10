@@ -5,7 +5,6 @@
 
 mod support;
 
-use assert_cmd::Command;
 use predicates::prelude::*;
 use std::path::Path;
 use tempfile::tempdir;
@@ -2130,7 +2129,7 @@ fn sandboxed_spawn_hides_a_real_home_gateway_yml_from_doctor() {
     )
     .unwrap();
     let gateway_rows = |sandbox: bool| {
-        let mut cmd = Command::cargo_bin("onebrain").unwrap();
+        let mut cmd = assert_cmd::Command::cargo_bin("onebrain").unwrap();
         cmd.current_dir(vault.path())
             .env("HOME", real_home.path())
             .env("USERPROFILE", real_home.path())
