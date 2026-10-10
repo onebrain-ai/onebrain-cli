@@ -138,8 +138,8 @@ impl RegistrationWindow {
 /// Both fields are mutated ONLY while holding [`AuthCtx::attempts`]'s lock
 /// across the full read-decide-write sequence in
 /// [`AuthCtx::check_pairing_code`] — see that method's doc comment for the
-/// exact lock-ordering discipline (`attempts` locked first, `store` nested
-/// inside, never the reverse).
+/// locking discipline (the `attempts` lock is the only lock; the pairing
+/// read under it takes no `auth.lock`).
 #[derive(Debug, Default)]
 pub struct AttemptState {
     /// Consecutive WRONG pairing-code submissions since the last correct
@@ -163,11 +163,14 @@ pub struct AttemptState {
 /// Serialization now comes from `auth.lock` alone, which works across
 /// threads because each `lock_exclusive` opens its own handle (store.rs
 /// `two_threads_sharing_one_store_serialize_on_auth_lock`). Each single-use
-/// step is atomic under that lock: `consume_code` spends a code exactly
-/// once, `rotate_refresh_for_client` runs the whole reuse-detection cascade
-/// in one locked pass. Every store call from an async handler runs on
-/// `spawn_blocking` (the lock waits up to [`super::auth::store::LOCK_WAIT`],
-/// then fails with `StoreBusy` → 503), never on a runtime worker.
+/// operation is ONE locked store call: `exchange_code` spends a code,
+/// mints and links its pair (replay → family revoked) in one hold;
+/// `rotate_refresh_for_client` runs the whole reuse-detection cascade in
+/// one hold. Every store call that can wait on `auth.lock` (up to
+/// [`super::auth::store::LOCK_WAIT`], then `StoreBusy` → 503) runs on
+/// `spawn_blocking`, never on a runtime worker. The one store call made on
+/// a worker — `verify_pairing` inside [`Self::check_pairing_code`], reached
+/// from the `/approvals` middleware — is a lock-free read of one small file.
 pub struct AuthCtx {
     pub store: AuthStore,
     /// The gateway's own OAuth issuer base URL — e.g. `http://127.0.0.1:7717`
@@ -247,19 +250,20 @@ impl AuthCtx {
     /// (`super::approval_routes::require_pairing_header`) are today's two
     /// callers.
     ///
-    /// Lock ORDER is `attempts` first, `store` nested inside — held as ONE
-    /// continuous critical section across "check lockout → verify code →
-    /// record the result", which is what makes
+    /// The `attempts` lock is held as ONE continuous critical section across
+    /// "check lockout → verify code (a lock-free read of `pairing.json`;
+    /// there is no store mutex since #428) → record the result", which is
+    /// what makes
     /// "[`MAX_PAIRING_FAILURES`] consecutive failures → a
     /// [`PAIRING_LOCKOUT_SECS`] lockout, and a CORRECT code inside that
     /// window still rejected" true even under concurrent submissions (two
     /// racing wrong submissions can't both slip in under the threshold, and
     /// a correct-code submission that arrives while locked can't observe a
     /// lock that a concurrently-expiring window just cleared out from under
-    /// it). `store` is never held while a second `attempts` lock is taken
-    /// anywhere, so this ordering can't deadlock against any other path.
+    /// it). It is the only lock taken here, so there is no ordering to get
+    /// wrong.
     ///
-    /// Synchronous and guard-free on return by construction: both guards are
+    /// Synchronous and guard-free on return by construction: the guard is
     /// released before the [`PairingCheck`] is handed back, so an `async`
     /// caller (the `/approvals` middleware, which then `.await`s
     /// `next.run(req)`) never holds a `std::sync::Mutex` across an await.
@@ -447,8 +451,8 @@ struct OAuthErrorBody {
 /// every response through here also carries `Cache-Control: no-store` /
 /// `Pragma: no-cache`, matching [`token_error`]'s own headers. Before this
 /// fix, the three `/token` store-I/O 500s that go through THIS function
-/// (`token_authorization_code_grant`'s `consume_code`/`issue_token_pair`
-/// failures and `token_refresh_grant`'s `rotate_refresh` failure) shipped
+/// (`token_authorization_code_grant`'s `exchange_code` failure and
+/// `token_refresh_grant`'s `rotate_refresh` failure) shipped
 /// without the header pair that every other `/token` response has — no
 /// credential is in these particular bodies, so it was never a leak, just an
 /// inconsistency. `oauth_error` is ALSO the error builder for `/register`
@@ -1457,13 +1461,15 @@ fn authorize_post(ctx: &AuthCtx, params: &AuthorizeParams) -> Response {
 }
 
 /// Mint the auth code for a validated request. `Ok(None)` = the client was
-/// removed meanwhile (the code was burned, nothing may redirect with it).
+/// removed meanwhile (nothing may redirect with the code).
 ///
 /// Validation (`get_client`) and `issue_code` are separate locked calls, so
 /// `AuthStore::remove_client` (another process) can run between them. After
 /// issuing we re-check registration: a remove AFTER the re-check deletes the
-/// new code itself, and a remove BEFORE it is caught here, so no redeemable
-/// code survives for a removed client.
+/// new code itself, and a remove BEFORE it is caught here. Burning the code
+/// on that path is best-effort (`let _ = consume_code`): if it fails, the
+/// code still cannot mint anything, because `exchange_code` re-checks
+/// registration under `auth.lock` before minting.
 fn issue_authorize_code(
     store: &AuthStore,
     validated: &ValidatedAuthorize,
@@ -2537,6 +2543,42 @@ mod tests {
         json!({"redirect_uris": ["https://claude.ai/api/mcp/auth_callback"]})
     }
 
+    /// An `AuthCtx` whose store gives up on `auth.lock` after 100 ms, plus a
+    /// guard holding that lock from a second handle (#428 busy arms).
+    fn busy_ctx(
+        issuer: &str,
+    ) -> (
+        tempfile::TempDir,
+        Arc<AuthCtx>,
+        super::super::auth::store::StoreLock,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("auth");
+        let store = AuthStore::open_at(root.clone())
+            .unwrap()
+            .with_lock_wait(std::time::Duration::from_millis(100));
+        let ctx = Arc::new(AuthCtx::new(store));
+        ctx.issuer.set(issuer.to_string()).unwrap();
+        let guard = AuthStore::open_at(root).unwrap().lock_exclusive().unwrap();
+        (dir, ctx, guard)
+    }
+
+    #[tokio::test]
+    async fn register_on_a_busy_store_is_503_temporarily_unavailable_with_retry_after() {
+        let (_dir, ctx, guard) = busy_ctx("http://127.0.0.1:7717");
+        let router = register_router(ctx.clone());
+        let resp = post_register_raw(&router, web_registration()).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "2");
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"], "temporarily_unavailable", "{body}");
+        drop(guard);
+        assert_eq!(ctx.store.client_count().unwrap(), 0, "nothing registered");
+    }
+
     #[test]
     fn registration_window_admits_ten_per_minute_then_resets() {
         let mut window = RegistrationWindow::default();
@@ -3224,6 +3266,37 @@ mod tests {
             StatusCode::FOUND,
             "an elapsed lockout must not block a correct code"
         );
+    }
+
+    #[tokio::test]
+    async fn post_authorize_on_a_busy_store_is_a_503_page_with_retry_after() {
+        let (dir, ctx, guard) = busy_ctx("http://127.0.0.1:7717");
+        // The client and pairing code need the lock; set them up first,
+        // then hold it again for the request under test.
+        drop(guard);
+        let client_id = register_web_client(&ctx, None, "https://claude.ai/cb");
+        let real_code = ctx.store.pairing_code().unwrap();
+        let _held = AuthStore::open_at(dir.path().join("auth"))
+            .unwrap()
+            .lock_exclusive()
+            .unwrap();
+        let router = authorize_router(ctx.clone());
+
+        let mut params = valid_params(&client_id, "https://claude.ai/cb", "s1");
+        params.push(("pairing_code", real_code.as_str()));
+        let resp = post_authorize(&router, &params).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "2");
+        assert!(resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+        let html = body_text(resp).await;
+        assert!(html.contains("The gateway is busy right now"), "{html}");
+        assert!(!html.contains("code="), "a busy page never carries a code");
     }
 
     #[tokio::test]
@@ -4370,14 +4443,14 @@ mod tests {
     /// `oauth_error`'s doc comment): the `/token` store-I/O 500s go through
     /// `oauth_error`, not `token_error`, so they need their own regression
     /// test to prove they carry the same `Cache-Control`/`Pragma` headers as
-    /// every other `/token` response. All three 500 paths
-    /// (`consume_code`/`issue_token_pair`/`rotate_refresh` failures) share
-    /// this ONE `oauth_error` call site, so exercising `consume_code`'s is
-    /// enough to prove the invariant for the other two — same "one call
+    /// every other `/token` response. Both 500 paths (`exchange_code` and
+    /// `rotate_refresh` failures) share this ONE `oauth_error` call site, so
+    /// exercising `exchange_code`'s is enough to prove the invariant for the
+    /// other — same "one call
     /// site, one test" reasoning as
     /// `authorize_html_responses_carry_frame_and_csp_headers`. Corrupts
     /// `codes.json` on disk (mirrors `store::tests::corrupt_codes_file_is_an_error_not_empty_default`)
-    /// to force `consume_code`'s `Err` branch without touching store
+    /// to force `exchange_code`'s `Err` branch without touching store
     /// internals.
     #[tokio::test]
     async fn token_store_io_error_response_also_carries_no_store_cache_headers() {
