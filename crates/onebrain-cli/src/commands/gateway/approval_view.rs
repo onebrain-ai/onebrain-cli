@@ -301,7 +301,7 @@ pub fn dialog_lines(p: &PendingApproval, remaining_secs: u64) -> Vec<String> {
         format!("{} {}{suffix}", who(p), action_phrase(&p.tool)),
         String::new(),
     ];
-    let row = |label: &str, value: String| format!("{label:<13}{value}");
+    let row = |label: &str, value: String| format!("{label} {value}");
     let vault = p
         .vault
         .as_deref()

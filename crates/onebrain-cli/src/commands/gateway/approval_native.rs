@@ -645,9 +645,9 @@ mod tests {
         assert_eq!(
             build_dialog_script(&p, 240),
             "display dialog \"Claude wants to save a new note to OneBrain\\n\\n\
-             Note title:  ทดสอบ approve จากมือถือ 1\\n\
-             Vault:       default\\n\
-             Length:      25 characters\\n\\n\
+             Note title: ทดสอบ approve จากมือถือ 1\\n\
+             Vault: default\\n\
+             Length: 25 characters\\n\\n\
              Asked by Claude (self-declared name \u{b7} id rKkfrep1\u{2026}Y58) \u{b7} answer within 4 min\" \
              with title \"OneBrain\" buttons {\"Deny\", \"Allow\"} default button \"Allow\" \
              with icon caution giving up after 240"
@@ -662,7 +662,7 @@ mod tests {
         p.subject = Default::default();
         let script = build_dialog_script(&p, 30);
         assert!(
-            script.contains("An unnamed app wants to run brain_zap\\n\\nVault:       t1\\n\\n"),
+            script.contains("An unnamed app wants to run brain_zap\\n\\nVault: t1\\n\\n"),
             "{script}"
         );
         assert!(
