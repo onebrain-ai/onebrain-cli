@@ -270,6 +270,29 @@ pub(crate) fn origin_cert_candidates(
 pub(crate) struct SystemCloudflared {
     pub bin: PathBuf,
     pub home: PathBuf,
+    /// Bound on each one-shot call (`tunnel list` / `create` / `route dns`
+    /// / `token`), which talk to the Cloudflare API and could otherwise hang
+    /// on a stalled network. [`ONE_SHOT_TIMEOUT`] in production; tests
+    /// shorten it. Not applied to `login` (it waits for the browser) or to
+    /// `spawn_quick` (its own `timeout` argument).
+    pub timeout: Duration,
+}
+
+/// Default bound on a one-shot `cloudflared` call.
+pub(crate) const ONE_SHOT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Read `stream` to EOF on a thread (so a chatty child never blocks on a
+/// full pipe while we wait for it).
+fn collect(stream: Option<impl Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut s) = stream {
+            let _ = s.read_to_end(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+    rx
 }
 
 impl SystemCloudflared {
@@ -278,15 +301,46 @@ impl SystemCloudflared {
         Self {
             bin: which::which("cloudflared").unwrap_or_else(|_| PathBuf::from("cloudflared")),
             home,
+            timeout: ONE_SHOT_TIMEOUT,
         }
     }
 
+    /// Run one `cloudflared` call to completion, at most `self.timeout`.
+    /// On timeout the child is killed and reaped; its output readers are
+    /// left to finish on their own (a grandchild may still hold the pipe).
     fn output(&self, what: &str, args: &[&str]) -> anyhow::Result<Output> {
-        Command::new(&self.bin)
+        use wait_timeout::ChildExt;
+        let mut child = Command::new(&self.bin)
             .args(args)
             .stdin(Stdio::null())
-            .output()
-            .with_context(|| format!("run `cloudflared {what}` ({})", self.bin.display()))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("run `cloudflared {what}` ({})", self.bin.display()))?;
+        let stdout = collect(child.stdout.take());
+        let stderr = collect(child.stderr.take());
+        let status = match child
+            .wait_timeout(self.timeout)
+            .with_context(|| format!("wait for `cloudflared {what}`"))?
+        {
+            Some(status) => status,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!(
+                    "`cloudflared {what}` did not finish within {:?} — check the network connection and retry",
+                    self.timeout
+                );
+            }
+        };
+        // The child has exited, so its pipes are closed (barring a
+        // grandchild); bound the wait anyway.
+        let read = |rx: mpsc::Receiver<Vec<u8>>| rx.recv_timeout(self.timeout).unwrap_or_default();
+        Ok(Output {
+            status,
+            stdout: read(stdout),
+            stderr: read(stderr),
+        })
     }
 }
 
@@ -334,6 +388,9 @@ impl Cloudflared for SystemCloudflared {
             .any(|p| p.is_file())
     }
 
+    /// Deliberately unbounded (no [`SystemCloudflared::timeout`]): it waits
+    /// for the user to finish the browser step, which takes as long as it
+    /// takes; Ctrl-C ends it.
     fn login(&self) -> anyhow::Result<()> {
         let status = Command::new(&self.bin)
             .args(["tunnel", "login"])
@@ -703,6 +760,7 @@ mod tests {
         let cf = SystemCloudflared {
             bin: dir.path().join("nope"),
             home: dir.path().to_path_buf(),
+            timeout: ONE_SHOT_TIMEOUT,
         };
         assert_eq!(cf.path(), None);
         let err = cf.find_tunnel("x").unwrap_err().to_string();
@@ -716,6 +774,7 @@ mod tests {
         let cf = SystemCloudflared {
             bin: dir.path().join("nope"),
             home: dir.path().to_path_buf(),
+            timeout: ONE_SHOT_TIMEOUT,
         };
         std::fs::create_dir_all(dir.path().join(".cloudflared")).unwrap();
         std::fs::write(dir.path().join(".cloudflared/cert.pem"), "x").unwrap();
@@ -752,7 +811,14 @@ mod system_tests {
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
-        (dir, SystemCloudflared { bin, home })
+        (
+            dir,
+            SystemCloudflared {
+                bin,
+                home,
+                timeout: ONE_SHOT_TIMEOUT,
+            },
+        )
     }
 
     fn argv(dir: &tempfile::TempDir) -> Vec<String> {
@@ -956,6 +1022,49 @@ mod system_tests {
         if let Ok(pid) = std::fs::read_to_string(d.path().join("pid")) {
             let pid: u32 = pid.trim().parse().unwrap();
             assert!(!alive(pid), "a timed-out cloudflared must be killed");
+        }
+    }
+
+    /// Concern 2: a one-shot call that hangs (stalled network) is killed
+    /// after `timeout` and named in the error. The call runs on a thread
+    /// under a 10 s guard so a missing timeout fails red instead of
+    /// hanging the suite.
+    #[test]
+    fn one_shot_calls_time_out_kill_the_child_and_name_the_command() {
+        let (d, mut cf) = fake("echo $$ > \"$(dirname \"$0\")/pid\"; exec sleep 30");
+        cf.timeout = Duration::from_millis(500);
+        type Call = fn(&SystemCloudflared) -> anyhow::Result<()>;
+        let calls: [(&str, Call); 4] = [
+            ("tunnel list", |c| c.find_tunnel("t").map(drop)),
+            ("tunnel create", |c| c.create_tunnel("t").map(drop)),
+            ("tunnel route dns", |c| {
+                c.route_dns("t", "brain.example.com", false).map(drop)
+            }),
+            ("tunnel token", |c| c.token("t").map(drop)),
+        ];
+        let cf = std::sync::Arc::new(cf);
+        for (what, call) in calls {
+            let _ = std::fs::remove_file(d.path().join("pid"));
+            let (tx, rx) = mpsc::channel();
+            let c = cf.clone();
+            let start = Instant::now();
+            std::thread::spawn(move || {
+                let _ = tx.send(call(&c).unwrap_err().to_string());
+            });
+            let err = rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| panic!("`cloudflared {what}` hung: no timeout"));
+            assert!(start.elapsed() < Duration::from_secs(3), "{what}");
+            assert!(err.contains(&format!("`cloudflared {what}`")), "{err}");
+            assert!(err.contains("did not finish within 500ms"), "{err}");
+            assert!(err.contains("check the network"), "{err}");
+            std::thread::sleep(Duration::from_millis(300));
+            if let Ok(pid) = std::fs::read_to_string(d.path().join("pid")) {
+                assert!(
+                    !alive(pid.trim().parse().unwrap()),
+                    "{what}: child not killed"
+                );
+            }
         }
     }
 
