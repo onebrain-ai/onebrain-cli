@@ -52,6 +52,9 @@ fn tunnel_setup_over_piped_stdin_stores_the_token_and_public_url() {
     let home = root.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     let bin = fake_cloudflared(root.path());
+    // A vault is already configured: this test pins the token/public_url contract.
+    std::fs::create_dir_all(home.join(".onebrain")).unwrap();
+    std::fs::write(home.join(".onebrain/gateway.yml"), "default_vault: /v\n").unwrap();
     let mut child = onebrain(&home, Some(&bin))
         .args(["gateway", "tunnel", "setup"])
         .stdin(Stdio::piped())
@@ -86,6 +89,85 @@ fn tunnel_setup_over_piped_stdin_stores_the_token_and_public_url() {
         yml["public_url"].as_str(),
         Some("https://brain.example.com")
     );
+}
+
+#[test]
+fn tunnel_setup_writes_default_vault_when_missing() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let vault = root.path().join("vault");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::write(vault.join("onebrain.yml"), "").unwrap();
+    let bin = fake_cloudflared(root.path());
+    let mut child = onebrain(&home, Some(&bin))
+        .current_dir(&vault)
+        .args(["gateway", "tunnel", "setup"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // hostname, token, then Enter to accept the vault found from the cwd.
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("brain.example.com\n{FAKE_TOKEN}\n\n").as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let yml: serde_yaml::Value =
+        serde_yaml::from_str(&std::fs::read_to_string(home.join(".onebrain/gateway.yml")).unwrap())
+            .unwrap();
+    // current_dir reports the canonical path (/private/var on macOS).
+    let written = PathBuf::from(yml["default_vault"].as_str().unwrap());
+    assert_eq!(
+        written.canonicalize().unwrap(),
+        vault.canonicalize().unwrap()
+    );
+    assert!(yml["public_url"].as_str().is_some());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn service_install_hides_pairing_code_when_piped() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let vault = root.path().join("vault");
+    std::fs::create_dir_all(home.join(".onebrain")).unwrap();
+    std::fs::create_dir_all(&vault).unwrap();
+    std::fs::write(
+        home.join(".onebrain/gateway.yml"),
+        format!(
+            "port: {}\ndefault_vault: {}\n",
+            free_port(),
+            vault.display()
+        ),
+    )
+    .unwrap();
+    let out = onebrain(&home, None)
+        .args(["gateway", "service", "install"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("Pairing code: run `onebrain gateway pair`"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("/mcp"), "{stdout}");
+    // The store was never asked for a code.
+    assert!(!home.join(".onebrain/gateway/pairing.json").exists());
 }
 
 /// A port nothing listens on, so the port-clash probe stays quiet.

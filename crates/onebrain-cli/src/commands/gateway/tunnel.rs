@@ -241,12 +241,83 @@ fn hinted(plain: impl Into<String>, hint: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(crate::output::HintedError::new(plain, hint))
 }
 
+/// Read one line; a 0-byte read (EOF) is a cancelled prompt, never "Enter".
+fn prompt_line(input: &mut dyn BufRead) -> anyhow::Result<String> {
+    let mut line = String::new();
+    if input.read_line(&mut line)? == 0 {
+        anyhow::bail!("input ended before the vault was chosen");
+    }
+    Ok(line.trim().to_string())
+}
+
+/// Read-only: choose the vault the gateway serves. The vault found by
+/// walking up from `cwd` is offered (`[Y/n]`, Enter = yes); otherwise (or on
+/// "n") a path is asked for. The path must be a vault root (`onebrain.yml`
+/// or legacy `vault.yml` directly inside). Writes nothing.
+pub(crate) fn pick_vault(
+    cwd: &Path,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+) -> anyhow::Result<PathBuf> {
+    if let Some(found) = onebrain_core::find_vault_root(cwd) {
+        write!(
+            out,
+            "The gateway needs a vault. Use {}? [Y/n] ",
+            found.as_path().display()
+        )?;
+        out.flush()?;
+        let answer = prompt_line(input)?.to_ascii_lowercase();
+        if answer.is_empty() || answer == "y" || answer == "yes" {
+            return Ok(found.as_path().to_path_buf());
+        }
+    }
+    write!(out, "Path to your vault (the folder with onebrain.yml): ")?;
+    out.flush()?;
+    let raw = prompt_line(input)?;
+    if raw.is_empty() {
+        anyhow::bail!("no vault path entered");
+    }
+    let path = cwd.join(raw);
+    onebrain_core::VaultRoot::from_path(&path)
+        .map(|v| v.as_path().to_path_buf())
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "no onebrain.yml (or vault.yml) in {} - that is not a vault root",
+                path.display()
+            )
+        })
+}
+
+/// The `default_vault` already in `gateway_yml` (returned untouched, no
+/// prompt), else [`pick_vault`] and write it. A service starts in `/`, so a
+/// gateway with no vault answers no tool call.
+pub(crate) fn ensure_default_vault(
+    gateway_yml: &Path,
+    cwd: &Path,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+) -> anyhow::Result<PathBuf> {
+    let config = super::config::load_gateway_config_at(gateway_yml)?;
+    if let Some(existing) = config.default_vault {
+        return Ok(existing);
+    }
+    let vault = pick_vault(cwd, input, out)?;
+    let value = serde_yaml::Value::String(vault.to_string_lossy().into_owned());
+    let mut one = serde_yaml::Mapping::new();
+    one.insert("default_vault".into(), value.clone());
+    let rendered = serde_yaml::to_string(&serde_yaml::Value::Mapping(one))?;
+    super::config_write::set_top_level_key(gateway_yml, "default_vault", value, &rendered)?;
+    writeln!(out, "default_vault set to {}", vault.display())?;
+    Ok(vault)
+}
+
 /// The wizard. Validates everything before writing anything; then writes the
 /// token (0600) and `public_url`. Never prints the token.
 pub(crate) fn run_tunnel_setup(
     input: &mut dyn BufRead,
     out: &mut dyn Write,
     onebrain_dir: &Path,
+    cwd: &Path,
     host: &dyn TunnelHost,
 ) -> anyhow::Result<TunnelSetupOutcome> {
     let gateway_yml = onebrain_dir.join("gateway.yml");
@@ -300,6 +371,10 @@ pub(crate) fn run_tunnel_setup(
             "copy the token again from the tunnel's install command in the dashboard",
         )
     })?;
+
+    // Validate-then-write: the vault is chosen (and any bad answer fails)
+    // before the token file is touched.
+    ensure_default_vault(&gateway_yml, cwd, input, out)?;
 
     let token_path = tunnel_token_path(onebrain_dir);
     super::config_write::ensure_private_dir(token_path.parent().unwrap_or(onebrain_dir))?;
@@ -394,7 +469,15 @@ pub fn tunnel_setup(_mode: &crate::output::OutputMode) -> anyhow::Result<()> {
         stdin_is_tty: stdin.is_terminal(),
     };
     let mut input = stdin.lock();
-    run_tunnel_setup(&mut input, &mut std::io::stdout(), &onebrain_dir, &host).map(|_| ())
+    let cwd = std::env::current_dir()?;
+    run_tunnel_setup(
+        &mut input,
+        &mut std::io::stdout(),
+        &onebrain_dir,
+        &cwd,
+        &host,
+    )
+    .map(|_| ())
 }
 
 /// `onebrain gateway tunnel status`.
@@ -586,9 +669,13 @@ mod tests {
     }
 
     fn run(stdin: &str, h: &FakeHost, dir: &Path) -> (anyhow::Result<TunnelSetupOutcome>, String) {
-        let mut input = std::io::Cursor::new(stdin.as_bytes().to_vec());
+        // The vault prompt follows the token: cwd is a real vault and the
+        // appended Enter accepts it.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("onebrain.yml"), "").unwrap();
+        let mut input = std::io::Cursor::new(format!("{stdin}\n").into_bytes());
         let mut out = Vec::new();
-        let r = run_tunnel_setup(&mut input, &mut out, dir, h);
+        let r = run_tunnel_setup(&mut input, &mut out, dir, vault.path(), h);
         (r, String::from_utf8(out).unwrap())
     }
 
@@ -725,14 +812,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("gateway.yml"),
-            "# my notes\npublic_url: 'https://old.example.com'\n",
+            "# my notes\ndefault_vault: /v\npublic_url: 'https://old.example.com'\n",
         )
         .unwrap();
         let (r, _) = run(&format!("new.example.com\n{FAKE_TOKEN}\n"), &host(), &dir);
         r.unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("gateway.yml")).unwrap(),
-            "# my notes\npublic_url: 'https://new.example.com'\n"
+            "# my notes\ndefault_vault: /v\npublic_url: 'https://new.example.com'\n"
         );
     }
 
@@ -766,5 +853,140 @@ mod tests {
         .read_secret("Token:", &mut input, &mut out)
         .unwrap();
         assert_eq!(got.trim(), "abc");
+    }
+
+    fn vault_dir(parent: &Path, name: &str) -> PathBuf {
+        let v = parent.join(name);
+        std::fs::create_dir_all(&v).unwrap();
+        std::fs::write(v.join("onebrain.yml"), "").unwrap();
+        v
+    }
+
+    fn ensure(yml: &Path, cwd: &Path, stdin: &str) -> (anyhow::Result<PathBuf>, String) {
+        let mut input = std::io::Cursor::new(stdin.as_bytes().to_vec());
+        let mut out = Vec::new();
+        let r = ensure_default_vault(yml, cwd, &mut input, &mut out);
+        (r, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn keeps_an_existing_default_vault_without_prompting() {
+        let root = tempfile::tempdir().unwrap();
+        let yml = root.path().join("gateway.yml");
+        std::fs::write(&yml, "# c\ndefault_vault: /x\n").unwrap();
+        let before = std::fs::read(&yml).unwrap();
+        let (r, out) = ensure(&yml, root.path(), "");
+        assert_eq!(r.unwrap(), PathBuf::from("/x"));
+        assert_eq!(std::fs::read(&yml).unwrap(), before);
+        assert!(out.is_empty(), "{out}");
+    }
+
+    #[test]
+    fn detects_the_vault_from_cwd_and_writes_it_on_enter() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = vault_dir(root.path(), "v");
+        let sub = vault.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let yml = root.path().join("gateway.yml");
+        let (r, _) = ensure(&yml, &sub, "\n");
+        assert_eq!(r.unwrap(), vault);
+        let cfg = super::super::config::load_gateway_config_at(&yml).unwrap();
+        assert_eq!(cfg.default_vault, Some(vault));
+    }
+
+    #[test]
+    fn asks_for_a_path_when_cwd_is_not_a_vault() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = vault_dir(root.path(), "v");
+        let plain = root.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let yml = root.path().join("gateway.yml");
+        let (r, out) = ensure(&yml, &plain, &format!("{}\n", vault.display()));
+        assert_eq!(r.unwrap(), vault);
+        assert!(out.contains("Path to your vault"), "{out}");
+        let cfg = super::super::config::load_gateway_config_at(&yml).unwrap();
+        assert_eq!(cfg.default_vault, Some(vault));
+    }
+
+    #[test]
+    fn declining_the_detected_vault_asks_for_another() {
+        let root = tempfile::tempdir().unwrap();
+        let detected = vault_dir(root.path(), "a");
+        let other = vault_dir(root.path(), "b");
+        let (r, _) = ensure(
+            &root.path().join("gateway.yml"),
+            &detected,
+            &format!("n\n{}\n", other.display()),
+        );
+        assert_eq!(r.unwrap(), other);
+    }
+
+    #[test]
+    fn rejects_a_path_that_is_not_a_vault_root() {
+        let root = tempfile::tempdir().unwrap();
+        let plain = root.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let yml = root.path().join("gateway.yml");
+        let (r, _) = ensure(&yml, &plain, &format!("{}\n", plain.display()));
+        assert!(format!("{:#}", r.unwrap_err()).contains("no onebrain.yml"));
+        assert!(!yml.exists());
+    }
+
+    #[test]
+    fn eof_at_the_vault_prompt_is_an_error_not_a_yes() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = vault_dir(root.path(), "v");
+        let yml = root.path().join("gateway.yml");
+        let (r, _) = ensure(&yml, &vault, "");
+        assert!(r.is_err());
+        assert!(!yml.exists());
+    }
+
+    #[test]
+    fn pick_vault_writes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = vault_dir(root.path(), "v");
+        let mut input = std::io::Cursor::new(b"\n".to_vec());
+        let mut out = Vec::new();
+        assert_eq!(pick_vault(&vault, &mut input, &mut out).unwrap(), vault);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn a_vault_path_with_a_quote_round_trips_through_gateway_yml() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = vault_dir(root.path(), "it's a vault");
+        let yml = root.path().join("gateway.yml");
+        let (r, _) = ensure(&yml, &vault, "\n");
+        r.unwrap();
+        let cfg = super::super::config::load_gateway_config_at(&yml).unwrap();
+        assert_eq!(cfg.default_vault, Some(vault));
+    }
+
+    #[test]
+    fn setup_writes_default_vault_when_missing_and_asks_after_the_token() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".onebrain");
+        let (r, out) = run(&format!("brain.example.com\n{FAKE_TOKEN}\n"), &host(), &dir);
+        r.unwrap();
+        let cfg = super::super::config::load_gateway_config_at(&dir.join("gateway.yml")).unwrap();
+        assert!(cfg.default_vault.is_some());
+        assert!(out.contains("default_vault set to"), "{out}");
+    }
+
+    #[test]
+    fn a_bad_vault_answer_leaves_no_token_and_no_config() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".onebrain");
+        let plain = root.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let mut input = std::io::Cursor::new(
+            format!("brain.example.com\n{FAKE_TOKEN}\n{}\n", plain.display()).into_bytes(),
+        );
+        let mut out = Vec::new();
+        let r = run_tunnel_setup(&mut input, &mut out, &dir, &plain, &host());
+        assert!(r.is_err());
+        assert!(!tunnel_token_path(&dir).exists());
+        assert!(!dir.join("gateway.yml").exists());
     }
 }

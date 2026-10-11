@@ -123,6 +123,31 @@ pub(crate) struct InstallInputs {
     pub token_file_supported: bool,
     /// `None` = do not poll (activation disabled).
     pub wait_for_up: Option<Duration>,
+    /// Fetch the pairing code for the finish block (a TTY-only secret).
+    pub show_pairing_code: bool,
+    /// Print the finish block (connector URL, pairing code, log path).
+    /// The setup wizard prints its own and passes `false`.
+    pub print_finish: bool,
+}
+
+/// The finish block: connector URL, then the pairing code (or where to get
+/// it). `public_url` `None` = local-only, so the loopback URL.
+pub(crate) fn finish_lines(
+    public_url: Option<&str>,
+    port: u16,
+    pairing_code: Option<&str>,
+) -> Vec<String> {
+    let url = match public_url {
+        Some(u) => format!("{}/mcp", u.trim_end_matches('/')),
+        None => format!("http://127.0.0.1:{port}/mcp"),
+    };
+    vec![
+        format!("Connector URL for the Claude app: {url}"),
+        match pairing_code {
+            Some(code) => format!("Pairing code: {code}  (rotate: onebrain gateway pair --rotate)"),
+            None => "Pairing code: run `onebrain gateway pair`".to_string(),
+        },
+    ]
 }
 
 fn hinted(plain: impl Into<String>, hint: impl Into<String>) -> anyhow::Error {
@@ -276,6 +301,64 @@ fn remove_agent(
     }
 }
 
+fn tunnel_spec(
+    paths: &ServicePaths,
+    inputs: &InstallInputs,
+    cloudflared: &Path,
+    token_path: &Path,
+) -> anyhow::Result<service_plist::AgentSpec> {
+    let auth = if inputs.token_file_supported {
+        TunnelAuth::TokenFile(token_path.to_path_buf())
+    } else {
+        let token = std::fs::read_to_string(token_path)
+            .with_context(|| format!("read {}", token_path.display()))?;
+        TunnelAuth::EnvToken(token.trim().to_string())
+    };
+    Ok(service_plist::tunnel_agent(
+        cloudflared,
+        &auth,
+        &paths.log_dir,
+    ))
+}
+
+/// True when every agent `install_service` would write is loaded and its
+/// plist on disk is byte-identical to a fresh render, and no unwanted tunnel
+/// agent lingers. Any doubt (unreadable config, render error) is `false`.
+#[allow(dead_code)] // consumed by the gateway setup wizard (v3.5.2 T4)
+pub(crate) fn agents_current(
+    paths: &ServicePaths,
+    inputs: &InstallInputs,
+    launcher: &dyn Launcher,
+) -> bool {
+    let Ok(config) = super::config::load_gateway_config_at(&paths.onebrain_dir.join("gateway.yml"))
+    else {
+        return false;
+    };
+    let token_path = super::tunnel::tunnel_token_path(&paths.onebrain_dir);
+    let mut expected = vec![service_plist::gateway_agent(
+        &inputs.onebrain_exe,
+        &paths.log_dir,
+    )];
+    if config.public_url.is_some() && token_path.exists() {
+        let Some(cloudflared) = inputs.cloudflared.as_deref() else {
+            return false;
+        };
+        match tunnel_spec(paths, inputs, cloudflared, &token_path) {
+            Ok(spec) => expected.push(spec),
+            Err(_) => return false,
+        }
+    } else if launcher.print(TUNNEL_LABEL).is_some() || paths.plist(TUNNEL_LABEL).exists() {
+        return false;
+    }
+    expected.iter().all(|spec| {
+        launcher.print(spec.label).is_some()
+            && service_plist::render_keepalive_plist(spec)
+                .ok()
+                .zip(std::fs::read_to_string(paths.plist(spec.label)).ok())
+                .is_some_and(|(want, have)| want == have)
+    })
+}
+
 /// Idempotent: (re)writes and (re)loads both agents, which also restarts a
 /// running gateway — how a changed `public_url` (T1 host guard) takes effect.
 pub(crate) fn install_service(
@@ -327,14 +410,7 @@ pub(crate) fn install_service(
 
     if let (true, Some(cloudflared)) = (tunnel, inputs.cloudflared.as_deref()) {
         let mut tunnel_step = || -> anyhow::Result<()> {
-            let auth = if inputs.token_file_supported {
-                TunnelAuth::TokenFile(token_path.clone())
-            } else {
-                let token = std::fs::read_to_string(&token_path)
-                    .with_context(|| format!("read {}", token_path.display()))?;
-                TunnelAuth::EnvToken(token.trim().to_string())
-            };
-            let spec = service_plist::tunnel_agent(cloudflared, &auth, &paths.log_dir);
+            let spec = tunnel_spec(paths, inputs, cloudflared, &token_path)?;
             let plist = write_agent(paths, &spec, launcher)?;
             writeln!(
                 out,
@@ -410,15 +486,21 @@ pub(crate) fn install_service(
         }
         writeln!(out, "✓ gateway answering on 127.0.0.1:{}", config.port)?;
     }
-    if let Some(url) = config.public_url.as_deref() {
-        writeln!(
-            out,
-            "Connector URL for the Claude app: {}/mcp",
-            url.trim_end_matches('/')
-        )?;
+    if inputs.print_finish {
+        // A busy or unreadable store degrades to the "run pair" line.
+        let code = inputs
+            .show_pairing_code
+            .then(|| {
+                super::auth::AuthStore::open_at(paths.onebrain_dir.join("gateway"))
+                    .and_then(|s| s.pairing_code())
+                    .ok()
+            })
+            .flatten();
+        for line in finish_lines(config.public_url.as_deref(), config.port, code.as_deref()) {
+            writeln!(out, "{line}")?;
+        }
+        writeln!(out, "Logs: {}", paths.log_dir.join("gateway.log").display())?;
     }
-    writeln!(out, "Pairing code: run `onebrain gateway pair`")?;
-    writeln!(out, "Logs: {}", paths.log_dir.join("gateway.log").display())?;
     Ok(())
 }
 
@@ -442,12 +524,10 @@ fn home() -> anyhow::Result<PathBuf> {
     crate::home::home_dir().context("resolve home directory")
 }
 
-/// `onebrain gateway service install`.
-pub fn service_install(_mode: &crate::output::OutputMode) -> anyhow::Result<()> {
-    if !service_supported() {
-        return Err(unsupported_os_error());
-    }
-    let paths = ServicePaths::for_home(&home()?);
+/// The machine-derived [`InstallInputs`] for a real install (cloudflared on
+/// PATH, token-file probe, exe choice). Prints the exe line / warning.
+pub(crate) fn system_install_inputs() -> anyhow::Result<InstallInputs> {
+    use std::io::IsTerminal;
     let cloudflared = which::which("cloudflared").ok();
     let token_file_supported = cloudflared
         .as_deref()
@@ -461,12 +541,23 @@ pub fn service_install(_mode: &crate::output::OutputMode) -> anyhow::Result<()> 
         eprintln!("⚠ {w}");
     }
     println!("gateway agent program: {}", onebrain_exe.display());
-    let inputs = InstallInputs {
+    Ok(InstallInputs {
         onebrain_exe,
         cloudflared,
         token_file_supported,
         wait_for_up: activate.then_some(Duration::from_secs(10)),
-    };
+        show_pairing_code: std::io::stdout().is_terminal(),
+        print_finish: true,
+    })
+}
+
+/// `onebrain gateway service install`.
+pub fn service_install(_mode: &crate::output::OutputMode) -> anyhow::Result<()> {
+    if !service_supported() {
+        return Err(unsupported_os_error());
+    }
+    let paths = ServicePaths::for_home(&home()?);
+    let inputs = system_install_inputs()?;
     install_service(
         &paths,
         &inputs,
@@ -575,6 +666,8 @@ mod tests {
             cloudflared: cloudflared.then(|| PathBuf::from("/opt/homebrew/bin/cloudflared")),
             token_file_supported: token_file,
             wait_for_up: Some(Duration::from_millis(200)),
+            show_pairing_code: false,
+            print_finish: true,
         }
     }
 
@@ -1018,5 +1111,115 @@ mod tests {
         .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("no public_url"), "{text}");
+    }
+
+    fn installed(yml: &str, token: bool) -> (tempfile::TempDir, ServicePaths, FakeLauncher) {
+        let (r, paths) = home_with(yml, token);
+        let l = FakeLauncher::default();
+        install_service(
+            &paths,
+            &inputs(token, true),
+            &l,
+            &UpAfterBootstrap(&l),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        (r, paths, l)
+    }
+
+    fn install_text(show_pairing_code: bool, print_finish: bool) -> String {
+        let (_r, paths) = home_with("default_vault: /v\nport: 7799\n", false);
+        let l = FakeLauncher::default();
+        let mut i = inputs(false, false);
+        i.show_pairing_code = show_pairing_code;
+        i.print_finish = print_finish;
+        let mut out = Vec::new();
+        install_service(&paths, &i, &l, &UpAfterBootstrap(&l), &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn finish_lines_cover_public_local_code_and_no_code() {
+        let with = finish_lines(Some("https://b.example.com/"), 7717, Some("ABCD-1234"));
+        assert_eq!(
+            with[0],
+            "Connector URL for the Claude app: https://b.example.com/mcp"
+        );
+        assert!(with[1].starts_with("Pairing code: ABCD-1234"), "{with:?}");
+        assert!(with[1].contains("onebrain gateway pair --rotate"));
+        let without = finish_lines(None, 7717, None);
+        assert_eq!(
+            without[0],
+            "Connector URL for the Claude app: http://127.0.0.1:7717/mcp"
+        );
+        assert_eq!(without[1], "Pairing code: run `onebrain gateway pair`");
+    }
+
+    #[test]
+    fn install_shows_the_pairing_code_only_when_asked() {
+        let shown = install_text(true, true);
+        assert!(shown.contains("Pairing code: "), "{shown}");
+        assert!(!shown.contains("run `onebrain gateway pair`"), "{shown}");
+        assert!(shown.contains("http://127.0.0.1:7799/mcp"), "{shown}");
+        let code = shown
+            .lines()
+            .find_map(|l| l.strip_prefix("Pairing code: "))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        assert!(code.len() >= 8, "{code}");
+        let hidden = install_text(false, true);
+        assert!(hidden.contains("run `onebrain gateway pair`"), "{hidden}");
+        assert!(!hidden.contains(code), "{hidden}");
+    }
+
+    #[test]
+    fn install_without_print_finish_omits_the_finish_block() {
+        let t = install_text(true, false);
+        assert!(!t.contains("Connector URL"), "{t}");
+        assert!(!t.contains("Pairing code"), "{t}");
+        assert!(!t.contains("Logs:"), "{t}");
+    }
+
+    #[test]
+    fn agents_current_is_false_before_install_and_true_after() {
+        let (_r, paths) = home_with(WITH_VAULT, true);
+        let l = FakeLauncher::default();
+        assert!(!agents_current(&paths, &inputs(true, true), &l));
+        let (_r, paths, l) = installed(WITH_VAULT, true);
+        assert!(agents_current(&paths, &inputs(true, true), &l));
+    }
+
+    #[test]
+    fn agents_current_is_false_when_a_plist_drifted() {
+        let (_r, paths, l) = installed(WITH_VAULT, true);
+        std::fs::write(paths.plist("gateway"), "stale").unwrap();
+        assert!(!agents_current(&paths, &inputs(true, true), &l));
+    }
+
+    #[test]
+    fn agents_current_is_false_when_an_agent_is_not_loaded() {
+        let (_r, paths, l) = installed(WITH_VAULT, true);
+        l.bootout("gateway-tunnel");
+        assert!(!agents_current(&paths, &inputs(true, true), &l));
+    }
+
+    #[test]
+    fn agents_current_is_false_when_the_exe_changed() {
+        let (_r, paths, l) = installed(WITH_VAULT, true);
+        let mut other = inputs(true, true);
+        other.onebrain_exe = PathBuf::from("/elsewhere/onebrain");
+        assert!(!agents_current(&paths, &other, &l));
+    }
+
+    #[test]
+    fn agents_current_is_false_when_an_unwanted_tunnel_agent_lingers() {
+        let (_r, paths, l) = installed(WITH_VAULT, true);
+        std::fs::remove_file(crate::commands::gateway::tunnel::tunnel_token_path(
+            &paths.onebrain_dir,
+        ))
+        .unwrap();
+        assert!(!agents_current(&paths, &inputs(true, true), &l));
     }
 }
