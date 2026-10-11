@@ -439,11 +439,11 @@ pub struct GatewayTokensRevokeArgs {
     #[arg(allow_hyphen_values = true)]
     pub id: Option<String>,
     /// Revoke every token issued to this client id.
-    #[arg(long, value_name = "CLIENT_ID", allow_hyphen_values = true)]
+    #[arg(long, value_name = "CLIENT_ID")]
     pub client: Option<String>,
     /// Revoke every token in this family (id or unique prefix, as shown by
     /// `tokens list`) — cuts off one login completely.
-    #[arg(long, value_name = "FAMILY_ID", allow_hyphen_values = true)]
+    #[arg(long, value_name = "FAMILY_ID")]
     pub family: Option<String>,
 }
 
@@ -1675,6 +1675,9 @@ mod tests {
 
     #[test]
     fn gateway_ids_may_start_with_a_hyphen() {
+        // The positional cases (`clients remove`, `tokens revoke <id>`) are
+        // guarded by `allow_hyphen_values`; the `--client` / `--family` option
+        // cases pin clap's built-in behaviour (an option value may start with `-`).
         let parse =
             |argv: &[&str]| Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
         let revoke = |argv: &[&str]| match parse(argv).command {
@@ -1718,6 +1721,17 @@ mod tests {
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::DisplayHelp, "remove {flag}");
         }
+    }
+
+    #[test]
+    fn gateway_revoke_client_without_a_value_is_a_clap_error() {
+        // `--client --family` must not parse as client = "--family".
+        let err = Cli::try_parse_from([
+            "onebrain", "gateway", "tokens", "revoke", "--client", "--family",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{err}");
+        assert!(err.to_string().contains("a value is required"), "{err}");
     }
 
     #[test]
