@@ -802,6 +802,12 @@ mod system_tests {
             assert!(err.contains("ERR cert expired"), "{err}");
             assert!(!err.contains("STDOUT-SECRET"), "{err}");
         }
+        // Silent stderr: the error still never falls back to stdout (for
+        // `tunnel token`, stdout is the secret).
+        let (_d, cf) = fake("echo STDOUT-SECRET; exit 1");
+        let err = cf.token("x").unwrap_err().to_string();
+        assert!(!err.contains("STDOUT-SECRET"), "{err}");
+        assert!(err.contains("no output"), "{err}");
     }
 
     #[test]
