@@ -532,12 +532,12 @@ pub fn pair(_mode: &OutputMode, rotate: bool) -> anyhow::Result<()> {
     if rotate {
         let code = auth_store
             .rotate_pairing_code()
-            .context("rotate gateway pairing code")?;
+            .map_err(access::store_write_failed)?;
         println!("pairing code rotated: {code}");
     } else {
         let code = auth_store
             .pairing_code()
-            .context("mint/read gateway pairing code")?;
+            .map_err(access::store_write_failed)?;
         println!("pairing code: {code}");
     }
     Ok(())

@@ -475,3 +475,40 @@ fn a_busy_store_fails_clients_remove_naming_the_holder_pid() {
     assert!(stderr.contains("pid 424242"), "{stderr}");
     assert!(stderr.contains("busy"), "{stderr}");
 }
+
+/// #453: `gateway pair` (mint/read and `--rotate`) takes `auth.lock` too, so a
+/// busy store gets the same holder-naming message and hint as tokens/clients.
+#[test]
+fn a_busy_store_fails_pair_naming_the_holder_pid() {
+    for args in [
+        &["gateway", "pair"][..],
+        &["gateway", "pair", "--rotate"][..],
+    ] {
+        let root = tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir_all(home.join(".onebrain/gateway")).unwrap();
+        let _lock = hold_auth_lock(&home, 424_243);
+
+        let out = Command::new(env!("CARGO_BIN_EXE_onebrain"))
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("ONEBRAIN_CACHE_DIR", root.path().join("cache"))
+            .env_remove("ONEBRAIN_VAULT")
+            .current_dir(root.path())
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run onebrain gateway pair");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success(),
+            "{args:?} must exit non-zero: {stderr}"
+        );
+        assert!(stderr.contains("pid 424243"), "{args:?}: {stderr}");
+        assert!(stderr.contains("busy"), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("wait for that process to finish"),
+            "{args:?}: {stderr}"
+        );
+    }
+}

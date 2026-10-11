@@ -106,7 +106,7 @@ fn store_unwritable() -> HintedError {
 /// Context for a failed locked mutator: a busy `auth.lock` (#428) says so
 /// and names the holder when the sidecar allows; anything else is
 /// [`store_unwritable`]. The `StoreBusy` stays in the chain either way.
-fn store_write_failed(e: anyhow::Error) -> anyhow::Error {
+pub(crate) fn store_write_failed(e: anyhow::Error) -> anyhow::Error {
     let hinted = match store_busy(&e) {
         Some(busy) => HintedError::new(
             busy.to_string(),
