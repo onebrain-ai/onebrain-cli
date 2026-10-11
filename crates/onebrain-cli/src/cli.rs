@@ -1742,11 +1742,7 @@ mod tests {
             "onebrain", "gateway", "tokens", "revoke", "--client", "--family", "x",
         ])
         .unwrap_err();
-        assert_eq!(
-            err.kind(),
-            clap::error::ErrorKind::ArgumentConflict,
-            "{err}"
-        );
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{err}");
     }
 
     #[test]
