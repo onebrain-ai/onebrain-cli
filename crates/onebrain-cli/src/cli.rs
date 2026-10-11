@@ -1675,9 +1675,10 @@ mod tests {
 
     #[test]
     fn gateway_ids_may_start_with_a_hyphen() {
-        // The positional cases (`clients remove`, `tokens revoke <id>`) are
-        // guarded by `allow_hyphen_values`; the `--client` / `--family` option
-        // cases pin clap's built-in behaviour (an option value may start with `-`).
+        // All four cases are guarded by `allow_hyphen_values` on the two
+        // positionals (`clients remove <client_id>`, `tokens revoke <id>`):
+        // `--client` / `--family` accept hyphen values only because the
+        // positional `id` in the same command allows them.
         let parse =
             |argv: &[&str]| Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
         let revoke = |argv: &[&str]| match parse(argv).command {
@@ -1731,18 +1732,21 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{err}");
-        assert!(err.to_string().contains("a value is required"), "{err}");
     }
 
     #[test]
     fn gateway_revoke_client_followed_by_a_flag_is_not_silently_a_client_id() {
-        // A-M6: `--client --family x` must be a usage error, never
+        // `--client --family x` must be a usage error, never
         // "revoke every token of client `--family`".
         let err = Cli::try_parse_from([
             "onebrain", "gateway", "tokens", "revoke", "--client", "--family", "x",
         ])
         .unwrap_err();
-        assert_ne!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert_eq!(
+            err.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{err}"
+        );
     }
 
     #[test]

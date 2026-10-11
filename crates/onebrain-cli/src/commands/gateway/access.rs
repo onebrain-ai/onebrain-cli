@@ -82,7 +82,7 @@ pub fn clients_remove(mode: &OutputMode, client_id: &str) -> Result<()> {
     emit(&env, mode, std::io::stdout().lock(), render_clients_remove)
 }
 
-fn open_store() -> Result<AuthStore> {
+pub(crate) fn open_store() -> Result<AuthStore> {
     AuthStore::open().context(HintedError::new(
         "couldn't open the gateway auth store (~/.onebrain/gateway)",
         "check that your home directory is writable, then retry",

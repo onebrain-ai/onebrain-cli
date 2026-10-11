@@ -512,3 +512,58 @@ fn a_busy_store_fails_pair_naming_the_holder_pid() {
         );
     }
 }
+
+/// Sibling of #453: `gateway run`'s startup mint/read of the pairing code takes
+/// `auth.lock` too, so a held lock stops startup with the holder-naming message
+/// and the hint (not a bare "mint/read gateway pairing code").
+#[test]
+fn a_busy_store_fails_gateway_run_startup_naming_the_holder_pid() {
+    let root = tempdir().unwrap();
+    let home = root.path().join("home");
+    let vault = tempdir().unwrap();
+    write(vault.path(), "onebrain.yml", "folders: {}\n");
+    write(
+        &home,
+        ".onebrain/gateway.yml",
+        &format!(
+            "default_vault: {v}\nvaults:\n  t1: {v}\n",
+            v = vault.path().display()
+        ),
+    );
+    std::fs::create_dir_all(home.join(".onebrain/gateway")).unwrap();
+    let _lock = hold_auth_lock(&home, 424_244);
+
+    let child = Command::new(env!("CARGO_BIN_EXE_onebrain"))
+        .env("ONEBRAIN_CACHE_DIR", root.path().join("cache"))
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("ONEBRAIN_GATEWAY_DISABLE_NATIVE_APPROVAL", "1")
+        .env("ONEBRAIN_GATEWAY_DISABLE_DAEMON_REINDEX", "1")
+        .env_remove("ONEBRAIN_VAULT")
+        .current_dir(vault.path())
+        .args(["gateway", "run", "--port", "0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn onebrain gateway run");
+    let pid_guard = child.id();
+    let waiter = std::thread::spawn(move || child.wait_with_output());
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while !waiter.is_finished() {
+        if Instant::now() > deadline {
+            let _ = Command::new("kill").arg(pid_guard.to_string()).status();
+            panic!("gateway run did not give up on a held auth.lock within 45s");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let out = waiter.join().unwrap().expect("wait for gateway run");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "must exit non-zero: {stderr}");
+    assert!(stderr.contains("pid 424244"), "{stderr}");
+    assert!(stderr.contains("busy"), "{stderr}");
+    assert!(
+        stderr.contains("wait for that process to finish"),
+        "{stderr}"
+    );
+}
