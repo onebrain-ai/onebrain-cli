@@ -376,7 +376,6 @@ fn tunnel_spec(
 /// is `false`). It does NOT mean the running gateway has the current
 /// gateway.yml / tunnel token (those are not in the plist) and it does not
 /// probe health - callers that wrote config must reinstall.
-#[allow(dead_code)] // consumed by the gateway setup wizard (v3.5.2 T4)
 pub(crate) fn agents_current(
     paths: &ServicePaths,
     inputs: &InstallInputs,

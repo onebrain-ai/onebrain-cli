@@ -328,6 +328,8 @@ pub struct GatewayCmd {
 }
 #[derive(Subcommand, Debug)]
 pub enum GatewayVerb {
+    /// Guided setup: vault, connection (Cloudflare own domain · existing token · Quick Tunnel · local only), Telegram (optional), service, then the connector URL, pairing code and QR.
+    Setup,
     /// Run the gateway in the foreground until Ctrl-C or SIGTERM. Binds 127.0.0.1 only
     /// (no bind flag — remote access goes through a tunnel, see `gateway tunnel setup`).
     Run {
@@ -1671,6 +1673,18 @@ mod tests {
             }) if client_id == "c1"
         ));
         assert!(Cli::try_parse_from(["onebrain", "gateway", "clients", "list"]).is_ok());
+    }
+
+    #[test]
+    fn gateway_setup_parses() {
+        let cli = Cli::try_parse_from(["onebrain", "gateway", "setup"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Cmd::Gateway(GatewayCmd {
+                verb: GatewayVerb::Setup
+            })
+        ));
+        assert!(Cli::try_parse_from(["onebrain", "gateway", "setup", "extra"]).is_err());
     }
 
     #[test]

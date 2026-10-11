@@ -41,6 +41,7 @@ pub mod qr;
 pub mod server;
 pub mod service;
 pub mod service_plist;
+pub mod setup;
 pub mod telegram;
 pub mod telegram_api;
 pub mod telegram_setup;
@@ -53,6 +54,7 @@ pub mod tunnel;
 pub use config::{load_gateway_config, GatewayConfig};
 pub use server::{build_gateway_router, GatewayState};
 pub use service::{service_install, service_status, service_uninstall};
+pub use setup::gateway_setup;
 pub use telegram_setup::telegram_setup;
 pub use tunnel::{tunnel_setup, tunnel_status};
 

@@ -15,9 +15,6 @@
 //! process shell over them. A tunnel token is never printed, logged, or put
 //! in an error message: `token`'s stdout is only ever parsed.
 
-// Consumed by `gateway setup` (v3.5.2 T4), which lands next and drops this.
-#![allow(dead_code)]
-
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};

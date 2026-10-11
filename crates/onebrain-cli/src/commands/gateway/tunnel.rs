@@ -470,14 +470,8 @@ pub(crate) fn run_tunnel_setup(
     ensure_default_vault(&gateway_yml, cwd, input, out)?;
 
     let token_path = tunnel_token_path(onebrain_dir);
-    super::config_write::ensure_private_dir(token_path.parent().unwrap_or(onebrain_dir))?;
-    super::config_write::write_private_file(&token_path, token.as_bytes())?;
-    let outcome = super::config_write::set_top_level_key(
-        &gateway_yml,
-        "public_url",
-        serde_yaml::Value::String(public_url.clone()),
-        &format!("public_url: '{public_url}'\n"),
-    )?;
+    // A dashboard tunnel: its ingress is remote (clears a leftover `local`).
+    let outcome = store_tunnel(onebrain_dir, &token, &public_url, None)?;
 
     let token_file_supported = host
         .cloudflared_run_help(&cloudflared)
@@ -492,9 +486,9 @@ pub(crate) fn run_tunnel_setup(
     writeln!(out, "public_url set to {public_url}")?;
     if matches!(
         outcome,
-        super::config_write::WriteOutcome::Rewrote {
+        Some(super::config_write::WriteOutcome::Rewrote {
             dropped_comments: true
-        }
+        })
     ) {
         writeln!(
             out,
@@ -523,7 +517,8 @@ pub(crate) fn run_tunnel_setup(
             &cloudflared,
             &token_path,
             token_file_supported,
-            config.tunnel_origin().as_deref(),
+            // store_tunnel cleared any `tunnel_ingress`: a dashboard tunnel.
+            None,
         ) {
             writeln!(out, "{line}")?;
         }
@@ -532,6 +527,51 @@ pub(crate) fn run_tunnel_setup(
         public_url,
         token_file_supported,
     })
+}
+
+/// Store a tunnel: the token (0600, never echoed) and `public_url`, then
+/// `tunnel_ingress` exactly as given — `Some(Local)` for a CLI-created
+/// tunnel (`gateway setup`, own domain), `None` for a dashboard token
+/// (`tunnel setup` / the wizard's "I already have a token"), which clears a
+/// leftover `local` so cloudflared is not handed `--url` for a tunnel whose
+/// ingress is remote (v3.5.2 A-T3b). An ingress that already matches is
+/// rewritten, and neither is an unchanged token or `public_url` (a re-run
+/// with the same answers leaves both files byte-identical). Returns the
+/// `public_url` write's outcome, `None` when it was already set.
+pub(crate) fn store_tunnel(
+    onebrain_dir: &Path,
+    token: &str,
+    public_url: &str,
+    ingress: Option<super::config::TunnelIngress>,
+) -> anyhow::Result<Option<super::config_write::WriteOutcome>> {
+    let gateway_yml = onebrain_dir.join("gateway.yml");
+    let token_path = tunnel_token_path(onebrain_dir);
+    super::config_write::ensure_private_dir(token_path.parent().unwrap_or(onebrain_dir))?;
+    if std::fs::read(&token_path).ok().as_deref() != Some(token.as_bytes()) {
+        super::config_write::write_private_file(&token_path, token.as_bytes())?;
+    }
+    let current = super::config::load_gateway_config_at(&gateway_yml)?;
+    let outcome = if current.public_url.as_deref() == Some(public_url) {
+        None
+    } else {
+        Some(super::config_write::set_top_level_key(
+            &gateway_yml,
+            "public_url",
+            serde_yaml::Value::String(public_url.to_string()),
+            &format!("public_url: '{public_url}'\n"),
+        )?)
+    };
+    if current.tunnel_ingress != ingress {
+        let (value, rendered) = match ingress {
+            Some(super::config::TunnelIngress::Local) => (
+                serde_yaml::Value::String("local".into()),
+                "tunnel_ingress: local\n",
+            ),
+            None => (serde_yaml::Value::Null, "tunnel_ingress: null\n"),
+        };
+        super::config_write::set_top_level_key(&gateway_yml, "tunnel_ingress", value, rendered)?;
+    }
+    Ok(outcome)
 }
 
 /// Where no service manager is supported (Linux / Windows today, design
@@ -1278,10 +1318,12 @@ mod tests {
         assert_eq!(manual_run_lines(cf, tok, false, None)[3], env_line);
     }
 
-    /// `run_tunnel_setup` passes gateway.yml's ingress through to the
-    /// manual lines (the same origin the service plist would carry).
+    /// v3.5.2 A-T3b: `tunnel setup` stores a DASHBOARD token, so a leftover
+    /// `tunnel_ingress: local` (from `gateway setup`'s own-domain path) is
+    /// cleared, and the manual lines carry no `--url` — matching what the
+    /// service plist would now render.
     #[test]
-    fn setup_without_service_support_includes_the_origin_for_local_ingress() {
+    fn setup_with_a_dashboard_token_clears_a_leftover_local_ingress() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join(".onebrain");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1300,6 +1342,53 @@ mod tests {
         };
         let (r, out) = run(&format!("brain.example.com\n{FAKE_TOKEN}\n"), &h, &dir);
         r.unwrap();
-        assert!(out.contains(" --url http://127.0.0.1:7802\n"), "{out}");
+        assert!(!out.contains("--url"), "{out}");
+        let cfg =
+            crate::commands::gateway::config::load_gateway_config_at(&dir.join("gateway.yml"))
+                .unwrap();
+        assert_eq!(cfg.tunnel_ingress, None);
+        assert_eq!(cfg.public_url.as_deref(), Some("https://brain.example.com"));
+    }
+
+    #[test]
+    fn store_tunnel_sets_and_clears_the_ingress_and_leaves_a_match_alone() {
+        use crate::commands::gateway::config::{load_gateway_config_at, TunnelIngress};
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".onebrain");
+        let yml = dir.join("gateway.yml");
+        store_tunnel(
+            &dir,
+            FAKE_TOKEN,
+            "https://a.example.com",
+            Some(TunnelIngress::Local),
+        )
+        .unwrap();
+        let cfg = load_gateway_config_at(&yml).unwrap();
+        assert_eq!(cfg.tunnel_ingress, Some(TunnelIngress::Local));
+        assert_eq!(cfg.public_url.as_deref(), Some("https://a.example.com"));
+        assert_eq!(
+            std::fs::read_to_string(tunnel_token_path(&dir)).unwrap(),
+            FAKE_TOKEN
+        );
+        // Same values again: byte-identical file.
+        let before = std::fs::read(&yml).unwrap();
+        store_tunnel(
+            &dir,
+            FAKE_TOKEN,
+            "https://a.example.com",
+            Some(TunnelIngress::Local),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&yml).unwrap(), before);
+        // A dashboard token clears it.
+        store_tunnel(&dir, FAKE_TOKEN, "https://b.example.com", None).unwrap();
+        let cfg = load_gateway_config_at(&yml).unwrap();
+        assert_eq!(cfg.tunnel_ingress, None);
+        assert_eq!(cfg.public_url.as_deref(), Some("https://b.example.com"));
+        // ...and with nothing to clear, no `tunnel_ingress` line is added.
+        let fresh = root.path().join("fresh");
+        store_tunnel(&fresh, FAKE_TOKEN, "https://c.example.com", None).unwrap();
+        let text = std::fs::read_to_string(fresh.join("gateway.yml")).unwrap();
+        assert!(!text.contains("tunnel_ingress"), "{text}");
     }
 }
