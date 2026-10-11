@@ -1,19 +1,19 @@
 //! Query-result memoization (design §3a) — lossless.
 //!
 //! Key = SHA-256 of `(normalized query, mode, top_k, min_candidates,
-//! min_score, index_generation, index_nonce, reranker_enabled,
+//! min_score, index_generation, index_instance_id, reranker_enabled,
 //! reranker_model, rerank_min_score, fusion_weights)`; value = the resolved
 //! hit set (an opaque serialized string the caller owns — the crate stays
 //! ignorant of the hit shape). The index-identity components make stale
 //! service across a reindex/rebuild structurally impossible:
 //! - **`generation`** (bumped on every reindex, `onebrain-search`) invalidates
 //!   entries when the SAME index changes.
-//! - **`index_nonce`** (a stable per-index-instance id, reset only when the
+//! - **`index_instance_id`** (a stable per-index-instance id, reset only when the
 //!   index is rebuilt from scratch) invalidates entries across a rebuild —
 //!   `generation` alone restarts at 0→1 on a `--force`/wipe and would collide
 //!   with pre-rebuild entries stored under the old instance's generation 1.
 //!
-//! `generation` and `index_nonce` live in DIFFERENT redb files (`meta.redb`
+//! `generation` and `index_instance_id` live in DIFFERENT redb files (`meta.redb`
 //! under `index/` vs the memo store in `token.redb`), with independent
 //! lifecycles — folding BOTH into the key is what covers a rebuild that resets
 //! one without touching the other.
@@ -39,12 +39,12 @@ impl MemoKey {
     /// little-endian `u64` (platform-independent — `usize` is widened first),
     /// and every float (`min_score`, `rerank_min_score`, each fusion weight) is
     /// hashed by its raw IEEE-754 bits so two byte-identical floats always hash
-    /// the same. `index_nonce` (design §3a / MAJOR 2) disambiguates index
+    /// the same. `index_instance_id` (design §3a / MAJOR 2) disambiguates index
     /// INSTANCES so a rebuilt index — whose `generation` restarts at 0→1 —
     /// never reuses a prior instance's key space.
     ///
     /// **Query-config completeness (design §3a / T4 M2):** beyond the index
-    /// identity (`generation` + `index_nonce`), the key also folds every
+    /// identity (`generation` + `index_instance_id`), the key also folds every
     /// result-determining knob that can change WITHOUT a reindex — the reranker
     /// on/off state + model, the rerank-score gate (`rerank_min_score`, the
     /// successor to the retired absolute `vec_floor`), and the hybrid
@@ -61,7 +61,7 @@ impl MemoKey {
         min_candidates: usize,
         min_score: f32,
         generation: u64,
-        index_nonce: &str,
+        index_instance_id: &str,
         reranker_enabled: bool,
         reranker_model: &str,
         rerank_min_score: f32,
@@ -78,7 +78,7 @@ impl MemoKey {
         h.update((min_candidates as u64).to_le_bytes());
         h.update(min_score.to_bits().to_le_bytes());
         h.update(generation.to_le_bytes());
-        h.update(index_nonce.as_bytes());
+        h.update(index_instance_id.as_bytes());
         h.update([0u8]);
         // Result-determining query knobs that change without a reindex.
         h.update([reranker_enabled as u8]);
@@ -157,15 +157,15 @@ mod tests {
     const RERANK_MODEL: &str = "onebrain-rerank-v1";
     const WEIGHTS: &[f64] = &[2.0, 1.0];
 
-    // Index-instance nonce values for tests are derived at RUNTIME (process id +
+    // Index-instance id values for tests are derived at RUNTIME (process id +
     // tag), never hard-coded string literals. This is a cache-key identity token
-    // fed to the memo hash, NOT a cryptographic nonce — a literal here trips
+    // fed to the memo hash, NOT a cryptographic value — a literal here trips
     // CodeQL `rust/hard-coded-cryptographic-value`, a false positive for a
     // content-addressed cache key. Same tag -> same value (stable within a run,
     // so identical-input keys still match); distinct tags -> distinct values
     // (drives the rebuilt-index cache-miss assertions).
-    fn nonce(tag: &str) -> String {
-        format!("idx-nonce-{tag}-{}", std::process::id())
+    fn instance_id(tag: &str) -> String {
+        format!("idx-inst-{tag}-{}", std::process::id())
     }
 
     /// Build a key with the default query-config knobs, so the pre-M2 tests
@@ -178,7 +178,7 @@ mod tests {
         min_candidates: usize,
         min_score: f32,
         generation: u64,
-        nonce: &str,
+        instance_id: &str,
     ) -> MemoKey {
         MemoKey::new(
             query,
@@ -187,7 +187,7 @@ mod tests {
             min_candidates,
             min_score,
             generation,
-            nonce,
+            instance_id,
             true,
             RERANK_MODEL,
             0.30,
@@ -197,25 +197,28 @@ mod tests {
 
     #[test]
     fn same_components_produce_the_same_key() {
-        let a = key("rust errors", "hybrid", 10, 50, 0.30, 7, &nonce("A"));
-        let b = key("rust errors", "hybrid", 10, 50, 0.30, 7, &nonce("A"));
+        let a = key("rust errors", "hybrid", 10, 50, 0.30, 7, &instance_id("A"));
+        let b = key("rust errors", "hybrid", 10, 50, 0.30, 7, &instance_id("A"));
         assert_eq!(a, b);
         assert_eq!(a.as_str().len(), 64, "sha-256 hex is 64 chars");
     }
 
     #[test]
     fn any_component_change_changes_the_key() {
-        let base = key("q", "hybrid", 10, 50, 0.30, 1, &nonce("A"));
-        assert_ne!(base, key("q2", "hybrid", 10, 50, 0.30, 1, &nonce("A")));
-        assert_ne!(base, key("q", "lex", 10, 50, 0.30, 1, &nonce("A")));
-        assert_ne!(base, key("q", "hybrid", 11, 50, 0.30, 1, &nonce("A")));
-        assert_ne!(base, key("q", "hybrid", 10, 51, 0.30, 1, &nonce("A")));
-        assert_ne!(base, key("q", "hybrid", 10, 50, 0.31, 1, &nonce("A")));
-        assert_ne!(base, key("q", "hybrid", 10, 50, 0.30, 2, &nonce("A")));
+        let base = key("q", "hybrid", 10, 50, 0.30, 1, &instance_id("A"));
         assert_ne!(
             base,
-            key("q", "hybrid", 10, 50, 0.30, 1, &nonce("B")),
-            "a different index nonce must change the key"
+            key("q2", "hybrid", 10, 50, 0.30, 1, &instance_id("A"))
+        );
+        assert_ne!(base, key("q", "lex", 10, 50, 0.30, 1, &instance_id("A")));
+        assert_ne!(base, key("q", "hybrid", 11, 50, 0.30, 1, &instance_id("A")));
+        assert_ne!(base, key("q", "hybrid", 10, 51, 0.30, 1, &instance_id("A")));
+        assert_ne!(base, key("q", "hybrid", 10, 50, 0.31, 1, &instance_id("A")));
+        assert_ne!(base, key("q", "hybrid", 10, 50, 0.30, 2, &instance_id("A")));
+        assert_ne!(
+            base,
+            key("q", "hybrid", 10, 50, 0.30, 1, &instance_id("B")),
+            "a different index instance id must change the key"
         );
     }
 
@@ -230,7 +233,7 @@ mod tests {
             50,
             0.30,
             1,
-            &nonce("A"),
+            &instance_id("A"),
             true,
             RERANK_MODEL,
             0.30,
@@ -246,7 +249,7 @@ mod tests {
                 50,
                 0.30,
                 1,
-                &nonce("A"),
+                &instance_id("A"),
                 false,
                 RERANK_MODEL,
                 0.30,
@@ -264,7 +267,7 @@ mod tests {
                 50,
                 0.30,
                 1,
-                &nonce("A"),
+                &instance_id("A"),
                 true,
                 "other-rerank",
                 0.30,
@@ -282,7 +285,7 @@ mod tests {
                 50,
                 0.30,
                 1,
-                &nonce("A"),
+                &instance_id("A"),
                 true,
                 RERANK_MODEL,
                 0.31,
@@ -300,7 +303,7 @@ mod tests {
                 50,
                 0.30,
                 1,
-                &nonce("A"),
+                &instance_id("A"),
                 true,
                 RERANK_MODEL,
                 0.30,
@@ -317,7 +320,7 @@ mod tests {
                 50,
                 0.30,
                 1,
-                &nonce("A"),
+                &instance_id("A"),
                 true,
                 RERANK_MODEL,
                 0.30,
@@ -331,8 +334,8 @@ mod tests {
     fn no_concatenation_collision_between_adjacent_string_fields() {
         // "ab"+"c" must not hash the same as "a"+"bc" — the NUL delimiter
         // between query and mode is what prevents it.
-        let x = key("ab", "c", 0, 0, 0.0, 0, &nonce("A"));
-        let y = key("a", "bc", 0, 0, 0.0, 0, &nonce("A"));
+        let x = key("ab", "c", 0, 0, 0.0, 0, &instance_id("A"));
+        let y = key("a", "bc", 0, 0, 0.0, 0, &instance_id("A"));
         assert_ne!(x, y);
     }
 
@@ -340,7 +343,7 @@ mod tests {
     fn put_then_get_hits() {
         let (_dir, cache) = cache();
         let memo = cache.memo();
-        let key = key("q", "hybrid", 10, 50, 0.30, 1, &nonce("A"));
+        let key = key("q", "hybrid", 10, 50, 0.30, 1, &instance_id("A"));
         assert_eq!(memo.get(&key).unwrap(), None, "cold cache misses");
         memo.put(&key, r#"[{"path":"a.md"}]"#).unwrap();
         assert_eq!(
@@ -356,10 +359,10 @@ mod tests {
     fn generation_bump_invalidates_prior_entries() {
         let (_dir, cache) = cache();
         let memo = cache.memo();
-        let gen1 = key("q", "hybrid", 10, 50, 0.30, 1, &nonce("A"));
+        let gen1 = key("q", "hybrid", 10, 50, 0.30, 1, &instance_id("A"));
         memo.put(&gen1, "old-results").unwrap();
 
-        let gen2 = key("q", "hybrid", 10, 50, 0.30, 2, &nonce("A"));
+        let gen2 = key("q", "hybrid", 10, 50, 0.30, 2, &instance_id("A"));
         assert_eq!(
             memo.get(&gen2).unwrap(),
             None,
@@ -372,22 +375,22 @@ mod tests {
 
     /// MAJOR 2: an index REBUILD resets generation to 0→1, colliding with an
     /// entry stored under the OLD instance's generation 1. Folding the
-    /// per-instance nonce into the key makes the rebuilt index (new nonce) miss
+    /// per-instance id into the key makes the rebuilt index (new id) miss
     /// the stale entry — even though the generation number is identical.
     #[test]
-    fn fresh_index_nonce_invalidates_prior_entries_at_same_generation() {
+    fn fresh_index_instance_id_invalidates_prior_entries_at_same_generation() {
         let (_dir, cache) = cache();
         let memo = cache.memo();
         // Old index instance, generation 1.
-        let old = key("q", "hybrid", 10, 50, 0.30, 1, &nonce("old"));
+        let old = key("q", "hybrid", 10, 50, 0.30, 1, &instance_id("old"));
         memo.put(&old, "pre-rebuild-results").unwrap();
 
-        // Rebuilt index: generation restarts at 1, but the nonce is new.
-        let rebuilt = key("q", "hybrid", 10, 50, 0.30, 1, &nonce("new"));
+        // Rebuilt index: generation restarts at 1, but the id is new.
+        let rebuilt = key("q", "hybrid", 10, 50, 0.30, 1, &instance_id("new"));
         assert_eq!(
             memo.get(&rebuilt).unwrap(),
             None,
-            "a rebuilt index (new nonce) must miss entries from the old instance \
+            "a rebuilt index (new id) must miss entries from the old instance \
              even at the same generation number"
         );
     }

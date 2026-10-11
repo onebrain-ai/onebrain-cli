@@ -64,7 +64,7 @@ const LAST_INDEXED_KEY: &str = "last_indexed_at";
 /// constantly-firing PostToolUse lex-only reindex hook changes lex results
 /// without ever embedding.
 const GENERATION_KEY: &str = "generation";
-/// Stable per-index-instance nonce (design §3a). Written ONCE when a fresh
+/// Stable per-index-instance id (design §3a). Written ONCE when a fresh
 /// `engine.redb` is created and NEVER reset by a reindex — only a brand-new
 /// index (the `reindex --force` / cache-split-migration / `rm index/` wipe of
 /// `engine.redb`, which drops this whole header) gets a new one. The memo
@@ -72,7 +72,25 @@ const GENERATION_KEY: &str = "generation";
 /// index — whose `generation` restarts at 0→1 and would otherwise COLLIDE with
 /// stale memo entries written under the old index's generation 1 — instead
 /// lands in a fresh key space and can never serve a pre-rebuild hit.
-const INDEX_NONCE_KEY: &str = "index_nonce";
+///
+/// The stored key string stays `"index_nonce"` (the pre-rename name) so
+/// existing indexes keep their id and no memo entry is invalidated. This is an
+/// identity token, not a cryptographic nonce.
+const INDEX_INSTANCE_ID_KEY: &str = "index_nonce";
+
+/// Hard ceiling on a caller-supplied `top_k` (and the candidate pools sized
+/// from it). Every legitimate caller is far below this: the default
+/// `search.default_top_k` and `reranker.min_candidates` are both 10, and the
+/// CLI/MCP/daemon/gateway paths forward whatever the user typed unvalidated.
+/// Clamping at the engine boundary keeps an absurd value (e.g. `usize::MAX`)
+/// from sizing allocations such as `resolve_hits`'s `Vec::with_capacity`.
+/// `0` is preserved: the lexical `TopDocs::with_limit(0)` guard must still fire.
+pub const MAX_TOP_K: usize = 1000;
+
+/// Clamp a caller-supplied `top_k` to [`MAX_TOP_K`].
+pub(crate) fn clamp_top_k(top_k: usize) -> usize {
+    top_k.min(MAX_TOP_K)
+}
 
 const CHUNK_MAX_TOKENS: usize = 512;
 const CHUNK_OVERLAP_TOKENS: usize = 64;
@@ -918,14 +936,14 @@ impl Engine {
                 if header.get(ACTIVE_MODEL_KEY)?.is_none() {
                     header.insert(ACTIVE_MODEL_KEY, embed_model)?;
                 }
-                // Mint the index-instance nonce exactly once, when this
+                // Mint the index-instance id exactly once, when this
                 // `engine.redb` is first created (or after a `--force`/wipe
                 // dropped the header). Present ⟹ same index instance ⟹ keep it
                 // stable across every reopen and reindex; absent ⟹ fresh index
-                // ⟹ a new nonce so the memo cache can't reuse a prior instance's
+                // ⟹ a new id so the memo cache can't reuse a prior instance's
                 // key space (design §3a / MAJOR 2).
-                if header.get(INDEX_NONCE_KEY)?.is_none() {
-                    header.insert(INDEX_NONCE_KEY, fresh_index_nonce().as_str())?;
+                if header.get(INDEX_INSTANCE_ID_KEY)?.is_none() {
+                    header.insert(INDEX_INSTANCE_ID_KEY, fresh_index_instance_id().as_str())?;
                 }
             }
             write_txn.commit()?;
@@ -1788,6 +1806,7 @@ impl Engine {
         mut fused: Vec<(String, f64)>,
         top_k: usize,
     ) -> Result<Vec<Hit>> {
+        let top_k = clamp_top_k(top_k);
         let Some(reranker) = self.reranker() else {
             let mut unreranked: Vec<(String, f64, Option<f32>)> =
                 fused.into_iter().map(|(id, s)| (id, s, None)).collect();
@@ -1925,6 +1944,7 @@ impl Engine {
     /// available this degenerates to fused (insertion) order with
     /// `rerank_score: None`, same as [`Self::rerank_hits`].
     pub fn rerank_paths(&self, query: &str, paths: Vec<String>, top_k: usize) -> Result<Vec<Hit>> {
+        let top_k = clamp_top_k(top_k);
         // Chunk ids per candidate path (order preserved for the round-robin).
         let per_path: Vec<Vec<String>> = paths
             .iter()
@@ -1934,7 +1954,7 @@ impl Engine {
         // Round-robin gather up to `budget` chunks so every candidate path is
         // represented (its first chunk) before any path adds a second — bounds
         // the cross-encode cost regardless of how long the candidate docs are.
-        let budget = self.rerank_settings.min_candidates.max(top_k);
+        let budget = clamp_top_k(self.rerank_settings.min_candidates.max(top_k));
         let mut fused: Vec<(String, f64)> = Vec::new();
         let mut round = 0;
         'gather: loop {
@@ -1996,6 +2016,7 @@ impl Engine {
     /// through the Tier-2 rerank stage ([`Self::apply_rerank`]), resolved to
     /// `top_k` [`Hit`]s. Fused ids whose meta is missing are skipped.
     pub fn query(&self, text: &str, top_k: usize) -> Result<Vec<Hit>> {
+        let top_k = clamp_top_k(top_k);
         let query_vec = self.embedder()?.embed_query(text)?;
         // Recall-first: keep the vec top cluster (relative) and let RRF + the
         // rerank stage provide precision. The old absolute floor silently
@@ -2006,7 +2027,7 @@ impl Engine {
 
         // Fuse wide enough for the rerank stage to see its full reranked
         // pool even when the caller asks for a small top_k.
-        let fuse_k = top_k.max(self.rerank_settings.min_candidates);
+        let fuse_k = clamp_top_k(top_k.max(self.rerank_settings.min_candidates));
         let fused = rrf_fuse(&lex_hits, &vec_hits, RRF_K, fuse_k);
         self.apply_rerank(text, fused, top_k)
     }
@@ -2016,8 +2037,9 @@ impl Engine {
     /// the Tier-2 rerank stage ([`Self::apply_rerank`]). Used by the CLI's
     /// `search vsearch` verb.
     pub fn vector_search(&self, text: &str, top_k: usize) -> Result<Vec<Hit>> {
+        let top_k = clamp_top_k(top_k);
         let query_vec = self.embedder()?.embed_query(text)?;
-        let fetch_k = top_k.max(self.rerank_settings.min_candidates);
+        let fetch_k = clamp_top_k(top_k.max(self.rerank_settings.min_candidates));
         let vec_hits = keep_top_cluster(self.vec.search(&query_vec, fetch_k), VEC_CLUSTER_WINDOW);
         let ranked: Vec<(String, f64)> = vec_hits
             .into_iter()
@@ -2205,7 +2227,7 @@ impl Engine {
         .unwrap_or(0)
     }
 
-    /// The stable per-index-instance nonce (design §3a / MAJOR 2). Constant for
+    /// The stable per-index-instance id (design §3a / MAJOR 2). Constant for
     /// the life of one `engine.redb`; changes only when the index is created
     /// fresh (a `--force`/wipe/`rm index/` that drops the header). The memo
     /// cache folds this into every key alongside [`Engine::generation`] so a
@@ -2213,11 +2235,13 @@ impl Engine {
     /// with stale entries stored under the old instance's generation 1 — gets a
     /// disjoint key space instead. Empty string only if the header can't be
     /// read (treated as "unknown instance" — a memo miss, never a false hit).
-    pub fn index_nonce(&self) -> String {
+    pub fn index_instance_id(&self) -> String {
         (|| -> Result<Option<String>> {
             let read_txn = self.meta.begin_read()?;
             let header = read_txn.open_table(ENGINE_HEADER)?;
-            Ok(header.get(INDEX_NONCE_KEY)?.map(|v| v.value().to_string()))
+            Ok(header
+                .get(INDEX_INSTANCE_ID_KEY)?
+                .map(|v| v.value().to_string()))
         })()
         .ok()
         .flatten()
@@ -2767,19 +2791,19 @@ fn now_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Mint a fresh index-instance nonce ([`INDEX_NONCE_KEY`]). Combines
+/// Mint a fresh index-instance id ([`INDEX_INSTANCE_ID_KEY`]). Combines
 /// wall-clock nanoseconds with a process-wide monotonic counter so that two
 /// index recreations — even back-to-back within the same nanosecond in a
 /// test — never collide: the counter disambiguates within a process, the
 /// nanos across process restarts.
-fn fresh_index_nonce() -> String {
+fn fresh_index_instance_id() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
-    static NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static INSTANCE_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let seq = NONCE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let seq = INSTANCE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{nanos:x}-{seq:x}")
 }
 
@@ -3122,6 +3146,36 @@ mod tests {
         let hits = e.query("memory safety", 3).unwrap();
         assert!(!hits.is_empty());
         assert_eq!(hits[0].doc_path, "rust.md");
+    }
+
+    /// CodeQL `rust/uncontrolled-allocation-size`: a caller-supplied `top_k`
+    /// must never size an allocation unbounded. `usize::MAX` has to return
+    /// normally on every public entry (the lexical collector heap, the vector
+    /// scan, fusion and `resolve_hits` all derive capacity from it).
+    #[test]
+    fn huge_top_k_is_clamped_and_returns_normally() {
+        assert_eq!(clamp_top_k(usize::MAX), MAX_TOP_K);
+        assert_eq!(
+            clamp_top_k(0),
+            0,
+            "0 must survive for the with_limit(0) guard"
+        );
+        assert_eq!(clamp_top_k(10), 10);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = fake_engine(dir.path());
+        e.index_doc("rust.md", "# Rust\nerror handling and memory safety")
+            .unwrap();
+        e.index_doc("cook.md", "# Cooking\npasta recipe with tomato")
+            .unwrap();
+
+        let hits = e.query("memory safety", usize::MAX).unwrap();
+        assert_eq!(hits[0].doc_path, "rust.md");
+        assert!(!e
+            .vector_search("memory safety", usize::MAX)
+            .unwrap()
+            .is_empty());
+        assert!(!e.lex.search("memory", usize::MAX).unwrap().is_empty());
     }
 
     #[test]
@@ -6105,37 +6159,57 @@ mod tests {
         );
     }
 
-    // ---- MAJOR 2: index-instance nonce ----
+    // ---- MAJOR 2: index-instance id ----
 
     #[test]
-    fn index_nonce_is_set_at_creation_and_stable_across_reopen_and_reindex() {
+    fn index_instance_id_is_set_at_creation_and_stable_across_reopen_and_reindex() {
         let cache_dir = tempfile::tempdir().unwrap();
         let vault_dir = tempfile::tempdir().unwrap();
         std::fs::write(vault_dir.path().join("a.md"), "# A\nbody").unwrap();
 
-        let nonce = {
+        let id = {
             let e = fake_engine(cache_dir.path());
-            let n = e.index_nonce();
-            assert!(!n.is_empty(), "a fresh index has a nonce");
+            let n = e.index_instance_id();
+            assert!(!n.is_empty(), "a fresh index has an id");
             n
         };
-        // Reopen + reindex must NOT change the nonce — same index instance.
+        // Reopen + reindex must NOT change the id — same index instance.
         let mut e = fake_engine(cache_dir.path());
-        assert_eq!(e.index_nonce(), nonce, "nonce stable across reopen");
+        assert_eq!(e.index_instance_id(), id, "id stable across reopen");
         e.reindex_all(vault_dir.path()).unwrap();
-        assert_eq!(e.index_nonce(), nonce, "reindex must not reset the nonce");
+        assert_eq!(e.index_instance_id(), id, "reindex must not reset the id");
+    }
+
+    /// Pins the persisted header key. The id was historically stored as
+    /// `"index_nonce"`; an index written before the identifier rename must
+    /// keep reporting the same id after reopen, or every memo entry is lost.
+    #[test]
+    fn instance_id_is_persisted_under_the_legacy_index_nonce_key() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        {
+            let e = fake_engine(cache_dir.path());
+            let write_txn = e.meta.begin_write().unwrap();
+            {
+                let mut header = write_txn.open_table(ENGINE_HEADER).unwrap();
+                header.insert("index_nonce", "legacy-id-fixture").unwrap();
+            }
+            write_txn.commit().unwrap();
+        }
+        let e = fake_engine(cache_dir.path());
+        assert_eq!(e.index_instance_id(), "legacy-id-fixture");
+        assert_eq!(INDEX_INSTANCE_ID_KEY, "index_nonce");
     }
 
     #[test]
-    fn a_freshly_created_index_gets_a_different_nonce() {
+    fn a_freshly_created_index_gets_a_different_instance_id() {
         // Two independent fresh indexes (stand-in for a rebuild that dropped
-        // and recreated engine.redb) must get distinct nonces, so their memo
+        // and recreated engine.redb) must get distinct ids, so their memo
         // key spaces can never overlap.
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
-        let na = fake_engine(a.path()).index_nonce();
-        let nb = fake_engine(b.path()).index_nonce();
-        assert_ne!(na, nb, "distinct index instances must have distinct nonces");
+        let na = fake_engine(a.path()).index_instance_id();
+        let nb = fake_engine(b.path()).index_instance_id();
+        assert_ne!(na, nb, "distinct index instances must have distinct ids");
     }
 
     #[test]

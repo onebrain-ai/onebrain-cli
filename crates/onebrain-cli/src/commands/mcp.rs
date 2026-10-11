@@ -522,7 +522,7 @@ fn query_memo_key(
     limit: usize,
     min_score: f32,
     generation: u64,
-    index_nonce: &str,
+    index_instance_id: &str,
     reranker: &onebrain_core::config::RerankerConfig,
     weights: &[f64],
 ) -> MemoKey {
@@ -533,7 +533,7 @@ fn query_memo_key(
         reranker.min_candidates,
         min_score,
         generation,
-        index_nonce,
+        index_instance_id,
         reranker.enabled,
         &reranker.model,
         reranker
@@ -986,20 +986,20 @@ impl McpServer {
 
         // Query-result memoization (design §3a / M2) — Direct mode only (the
         // daemon owns `token.redb`; no daemon memo route this release). The key
-        // folds the index identity (generation + nonce) AND every
+        // folds the index identity (generation + instance id) AND every
         // result-determining knob that changes without a reindex (reranker
         // on/off + model, the rerank-score gate, fusion weights), so a config
         // change can never serve stale hits.
         let memo_key = if matches!(self.backend, Backend::Direct(_)) {
-            let (generation, index_nonce) = self
-                .with_engine(|e| Ok((e.generation(), e.index_nonce())))
+            let (generation, index_instance_id) = self
+                .with_engine(|e| Ok((e.generation(), e.index_instance_id())))
                 .await?;
             Some(query_memo_key(
                 &q_norm,
                 limit,
                 min_score as f32,
                 generation,
-                &index_nonce,
+                &index_instance_id,
                 &vault_cfg.search.reranker,
                 &weights,
             ))
@@ -1514,7 +1514,7 @@ mod tests {
             "fixture must differ from the default gate"
         );
         let key = |r: &RerankerConfig| {
-            query_memo_key("q", 10, 0.0, 1, "nonce", r, &[2.0, 1.0])
+            query_memo_key("q", 10, 0.0, 1, "inst", r, &[2.0, 1.0])
                 .as_str()
                 .to_string()
         };

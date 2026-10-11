@@ -645,6 +645,8 @@ impl LexIndex {
         if top_k == 0 {
             return Ok(Vec::new());
         }
+        // `with_limit` sizes its collector heap from `top_k`; cap it.
+        let top_k = crate::engine::clamp_top_k(top_k);
         let Some(query) = self.build_query(query) else {
             return Ok(Vec::new());
         };
