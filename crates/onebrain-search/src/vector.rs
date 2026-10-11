@@ -330,6 +330,7 @@ impl VectorStore {
         if top_k == 0 || query_vec.len() != self.dims {
             return Vec::new();
         }
+        let top_k = crate::engine::clamp_top_k(top_k);
 
         // The return type stays infallible (an empty result on a corrupt
         // store is the least-surprising behavior for a search), but a silent

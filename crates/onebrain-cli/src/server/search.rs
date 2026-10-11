@@ -111,12 +111,12 @@ const SEARCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// every other config-read-with-fallback seam in this crate (best-effort,
 /// never fails the search over a config hiccup).
 fn resolve_top_k(root: &Path, requested: Option<usize>) -> usize {
-    if let Some(top_k) = requested {
-        return top_k;
-    }
-    onebrain_core::load_vault_config_at(root)
-        .map(|cfg| cfg.search.default_top_k)
-        .unwrap_or(TOP_K)
+    let top_k = requested.unwrap_or_else(|| {
+        onebrain_core::load_vault_config_at(root)
+            .map(|cfg| cfg.search.default_top_k)
+            .unwrap_or(TOP_K)
+    });
+    top_k.min(onebrain_search::engine::MAX_TOP_K)
 }
 
 pub(crate) async fn get_vault_search(

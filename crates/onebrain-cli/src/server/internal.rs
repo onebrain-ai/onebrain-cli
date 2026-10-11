@@ -591,7 +591,11 @@ async fn post_internal_rerank(
     // as reindex/status.
     let hits = tokio::task::spawn_blocking(move || {
         let engine = engine.lock().unwrap_or_else(|p| p.into_inner());
-        engine.rerank_paths(&req.query, req.paths, req.top_k)
+        engine.rerank_paths(
+            &req.query,
+            req.paths,
+            req.top_k.min(onebrain_search::engine::MAX_TOP_K),
+        )
     })
     .await
     .map_err(|e| {

@@ -522,7 +522,7 @@ fn query_memo_key(
     limit: usize,
     min_score: f32,
     generation: u64,
-    index_nonce: &str,
+    index_instance_id: &str,
     reranker: &onebrain_core::config::RerankerConfig,
     weights: &[f64],
 ) -> MemoKey {
@@ -533,7 +533,7 @@ fn query_memo_key(
         reranker.min_candidates,
         min_score,
         generation,
-        index_nonce,
+        index_instance_id,
         reranker.enabled,
         &reranker.model,
         reranker
@@ -954,7 +954,10 @@ impl McpServer {
             ));
         }
 
-        let limit = params.limit.unwrap_or(10);
+        let limit = params
+            .limit
+            .unwrap_or(10)
+            .min(onebrain_search::engine::MAX_TOP_K);
         let min_score = params.min_score.unwrap_or(0.0);
         let has_lex = params
             .searches
@@ -986,20 +989,20 @@ impl McpServer {
 
         // Query-result memoization (design §3a / M2) — Direct mode only (the
         // daemon owns `token.redb`; no daemon memo route this release). The key
-        // folds the index identity (generation + nonce) AND every
+        // folds the index identity (generation + instance id) AND every
         // result-determining knob that changes without a reindex (reranker
         // on/off + model, the rerank-score gate, fusion weights), so a config
         // change can never serve stale hits.
         let memo_key = if matches!(self.backend, Backend::Direct(_)) {
-            let (generation, index_nonce) = self
-                .with_engine(|e| Ok((e.generation(), e.index_nonce())))
+            let (generation, index_instance_id) = self
+                .with_engine(|e| Ok((e.generation(), e.index_instance_id())))
                 .await?;
             Some(query_memo_key(
                 &q_norm,
                 limit,
                 min_score as f32,
                 generation,
-                &index_nonce,
+                &index_instance_id,
                 &vault_cfg.search.reranker,
                 &weights,
             ))
@@ -1061,7 +1064,7 @@ impl McpServer {
             // vault's `search.default_top_k` (10) and shrink fusion depth.
             Backend::Daemon(handle) => {
                 let handle = handle.clone();
-                let fetch_k = limit.max(10) * 3;
+                let fetch_k = limit.max(10).saturating_mul(3);
                 tokio::task::spawn_blocking(move || {
                     let mut ranked = Vec::with_capacity(params.searches.len());
                     for (i, sub) in params.searches.into_iter().enumerate() {
@@ -1090,7 +1093,7 @@ impl McpServer {
             // so RRF has depth to fuse; this path can return multiple chunks of
             // one doc, unlike the doc-level daemon path.
             Backend::Direct(_) => {
-                let fetch_k = limit.max(10) * 3;
+                let fetch_k = limit.max(10).saturating_mul(3);
                 let resolved = self.resolved.clone();
                 self.with_engine(move |eng| {
                     let mut ranked = Vec::with_capacity(params.searches.len());
@@ -1514,7 +1517,7 @@ mod tests {
             "fixture must differ from the default gate"
         );
         let key = |r: &RerankerConfig| {
-            query_memo_key("q", 10, 0.0, 1, "nonce", r, &[2.0, 1.0])
+            query_memo_key("q", 10, 0.0, 1, "inst", r, &[2.0, 1.0])
                 .as_str()
                 .to_string()
         };
@@ -2367,6 +2370,26 @@ mod tests {
                 st_a.0.doc_count().is_some(),
                 "daemon status has a doc_count"
             );
+        }
+
+        // Input-boundary cap: a user-supplied `limit = usize::MAX` must not
+        // overflow `limit.max(10) * 3` (debug panic / release wrap) or size
+        // any allocation; it is capped at `MAX_TOP_K` before use.
+        #[test]
+        fn huge_query_limit_is_capped_and_returns_normally() {
+            let vault = tempdir().unwrap();
+            let cache = tempdir().unwrap();
+            let _env = crate::test_env::set_var("ONEBRAIN_CACHE_DIR", cache.path());
+            seed_vault(vault.path());
+            let (engine, resolved) =
+                crate::commands::search_common::open_engine(Some(vault.path().to_path_buf()))
+                    .expect("direct engine open");
+            let server = McpServer::with_direct_engine(engine, resolved);
+
+            let Parameters(mut params) = lex_query();
+            params.limit = Some(usize::MAX);
+            let out = block_on(server.query(Parameters(params))).expect("huge-limit query");
+            assert_eq!(out.0.results.len(), 1, "huge limit: {:?}", out.0.results);
         }
 
         // Fallback: with NO daemon, a lone MCP server opens the engine directly
