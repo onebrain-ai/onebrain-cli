@@ -53,7 +53,7 @@ From zero to a working OneBrain vault in three steps:
 ```bash
 # 1. Verify the install
 onebrain --version
-# → onebrain 3.5.0
+# → onebrain 3.5.1
 
 # 2. Scaffold a vault and let init pull the OneBrain plugin
 mkdir my-vault && cd my-vault
@@ -120,7 +120,7 @@ Interactive commands print human-readable text; every command also speaks struct
 - [x] **v3.4** — **Native Search + Warm Daemon** *(complete, v3.4.0–v3.4.13)*: native Rust search replaces qmd (native engine + `onebrain search` verbs · native MCP server · 0 node/python deps, v3.4.5), a **warm daemon** that owns the engine so mcp + CLI coexist across live sessions (v3.4.6) — per-vault daemon slots since v3.4.13, a Tier-2 cross-encoder reranker (`onebrain-rerank-v1`) for calibrated result relevance (v3.4.7), self-documenting `onebrain.yml` + doctor validation (v3.4.8), and the **token-optimization layer** — transform ladder, already-sent ledger with a production-gating read-hook, and `onebrain token gain` telemetry (v3.4.10–v3.4.13) ([milestone](https://github.com/onebrain-ai/onebrain-cli/milestone/4)).
 
 ### 🛰️ Phase 1 · Remote, runtime & review (v3.5–v3.7)
-- [x] **v3.5** — **"Gateway"**: remote MCP gateway for the Claude app's custom connector (and other remote-MCP clients) over a Cloudflare tunnel, with OAuth 2.1 + device pairing, policy + approvals (native dialog, Telegram) + audit, `gateway tunnel|service|tokens|clients` commands and a `doctor` Gateway section. Follow-ups are tracked in the [v3.5.x milestone](https://github.com/onebrain-ai/onebrain-cli/milestone/14).
+- [x] **v3.5** — **"Gateway"**: remote MCP gateway for the Claude app's custom connector (and other remote-MCP clients) over a Cloudflare tunnel, with OAuth 2.1 + device pairing, policy + approvals (native dialog, Telegram) + audit, `gateway tunnel|service|tokens|clients` commands and a `doctor` Gateway section. **v3.5.1 "Hardening"** — revoking access reaches calls waiting for approval, a stuck process can no longer freeze the gateway, auth writes are durable, and a locked search index names its holder. Follow-ups are tracked in the [v3.5.x milestone](https://github.com/onebrain-ai/onebrain-cli/milestone/14).
 - [ ] **v3.6** — **"Agent Runtime"** — an always-on personal agent on top of the gateway: chat with OneBrain over Telegram without an open agent session (one headless run per message, conversation continuity per chat, tool approvals through the gateway policy engine), model routing per schedule / skill / chat, file-watch and webhook triggers, a skill-learning loop that proposes new skills for approval, and sandboxed unattended runs ([milestone](https://github.com/onebrain-ai/onebrain-cli/milestone/12)).
 - [ ] **v3.7** — **"Council"** — multi-model review: hand one diff to claude + codex + gemini in parallel and get back findings that survived a cross-vendor vote; `council review` report-only first, then planner + implementer with worktree-scoped writes ([milestone](https://github.com/onebrain-ai/onebrain-cli/milestone/13)).
 

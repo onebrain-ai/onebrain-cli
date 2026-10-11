@@ -1,6 +1,6 @@
 ---
-latest_version: 3.5.0
-released: 2026-10-10
+latest_version: 3.5.1
+released: 2026-10-11
 ---
 
 # OneBrain CLI Changelog (v3.x · Rust)
@@ -9,6 +9,22 @@ All notable changes to the OneBrain CLI binary (`onebrain`) in the v3.x Rust rew
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 > **Versioning:** CLI version is tracked in workspace `Cargo.toml`. v3.x is the Rust port of [v2.x (TypeScript/Bun)](https://github.com/onebrain-ai/onebrain). `v3.0.0-alpha.1` is the first user-facing alpha (binary artifacts published to GitHub Releases for 7 platforms).
+
+## [3.5.1] — 2026-10-11 — Hardening
+
+Hardens the v3.5.0 gateway and search after the first real-world use: revoking access now reaches calls already waiting for approval, a stuck process can no longer freeze the gateway, and a locked search index says who holds it.
+
+- **Revoking access reaches waiting calls.** `gateway tokens revoke` (`<ID>`, `--client`, `--family`) and `gateway clients remove` now also deny a call already waiting for approval — within about 5 s, or at the moment of Allow — and nothing is written (audit channel `revoked`; Telegram "Access was revoked"). An Allow that cannot be verified against the auth store is denied (`unverified`). `ask_once` grants are tied to the login (token family) and recorded only after that check, so an app cut off with `--client`, `--family` or `clients remove` is asked again when it reconnects (a single-token `revoke <ID>` does not end the login). ([#427](https://github.com/onebrain-ai/onebrain-cli/issues/427))
+- **A stuck process can no longer freeze the gateway.** `auth.lock` waits are bounded (5 s) and fair; while it is held, `/token`, `/register` and `/authorize` answer `503` with `Retry-After: 2`, `/mcp` keeps serving, and `tokens`/`clients` commands name the holding process. An authorization code is redeemed in a single lock hold. ([#428](https://github.com/onebrain-ai/onebrain-cli/issues/428))
+- **Durable auth writes.** Auth-store files are fsynced before the rename (and the directory after it, on macOS/Linux), and a failed write leaves no temp file behind. ([#429](https://github.com/onebrain-ai/onebrain-cli/issues/429))
+- **Telegram buttons go away on shutdown.** On SIGTERM the gateway waits up to 2 s for its "Gateway stopped" edits to land. ([#430](https://github.com/onebrain-ai/onebrain-cli/issues/430))
+- **Captured notes keep their title.** `brain_capture` writes the caller's title (Thai included, sanitised to one line) as the note's `# ` heading; the filename is unchanged. ([#431](https://github.com/onebrain-ai/onebrain-cli/issues/431))
+- **A locked search index names its holder.** `search status`, `doctor`, CLI busy errors and the daemon/gateway logs now say e.g. "in use by onebrain mcp 3.4.25 (pid N) — from before an upgrade, restart that agent session", or tell you to restart open agent sessions after an upgrade. ([#426](https://github.com/onebrain-ai/onebrain-cli/issues/426))
+- **Code-scanning and test hygiene.** All open CodeQL alerts on `main` are cleared (the search index's per-instance id is no longer named like a cryptographic nonce — its on-disk key is unchanged — and search result counts are capped); `doctor` integration tests no longer read the developer's real `~/.onebrain`, and a flaky hook test is deterministic. ([#445](https://github.com/onebrain-ai/onebrain-cli/issues/445), [#436](https://github.com/onebrain-ai/onebrain-cli/issues/436), [#437](https://github.com/onebrain-ai/onebrain-cli/issues/437))
+- **Changed.** `gateway run` exits with an error when `auth.lock` stays held at startup instead of waiting forever. Existing `ask_once` grants do not carry over (grants are now per login). New audit channels `revoked` and `unverified`. A search returns at most 1000 hits: larger `--top-k` / `limit` / `top_k` values (CLI, MCP, gateway, daemon API) and `reranker.min_candidates` pools are capped. Decisions: ADRs [0044](docs/decisions/0044-gateway-auth-store-bounded-lock-and-atomic-exchange.md), [0045](docs/decisions/0045-name-the-search-index-lock-holder.md), [0046](docs/decisions/0046-approvals-honour-revocation-and-shutdown-edits.md).
+
+### Upgrade notes
+After upgrading: restart open agent sessions (Claude Code / Codex / Gemini), stop daemons left over from the old version (`onebrain daemon stop --vault <vault>`), and re-run `onebrain gateway service install` so the LaunchAgent uses the new binary. See [`docs/install.md`](docs/install.md) ("After upgrading").
 
 ## [3.5.0] — 2026-10-10 — Gateway
 
