@@ -134,21 +134,33 @@ fn kill_pids(pids: &[u32]) {
     let _ = pids;
 }
 
+/// The registry as the panic hook sees it. `try_lock`: the panic may have
+/// happened while this thread held the lock — never deadlock the hook.
+fn registry_snapshot() -> Vec<u32> {
+    match LIVE_QUICK.try_lock() {
+        Ok(g) => g.clone(),
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().clone(),
+        Err(std::sync::TryLockError::WouldBlock) => Vec::new(),
+    }
+}
+
 /// Install (once per process) a panic hook that kills every registered
 /// Quick Tunnel child, then chains to the previous hook.
+///
+/// A no-op in unit-test builds: libtest runs every test in ONE process, so
+/// the hook would turn any test's panic into SIGTERMs for other tests'
+/// live children (observed under stress: one panicking test failed two
+/// `spawn_quick` tests with "exited before reporting"). Its two parts,
+/// [`registry_snapshot`] and [`kill_pids`], are tested directly.
 fn install_quick_panic_hook() {
+    if cfg!(test) {
+        return;
+    }
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            // try_lock: the panic may have happened while this thread held
-            // the registry lock; never deadlock the hook.
-            let pids = match LIVE_QUICK.try_lock() {
-                Ok(g) => g.clone(),
-                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().clone(),
-                Err(std::sync::TryLockError::WouldBlock) => Vec::new(),
-            };
-            kill_pids(&pids);
+            kill_pids(&registry_snapshot());
             previous(info);
         }));
     });
@@ -853,11 +865,15 @@ mod tests {
 
     #[test]
     fn quick_registry_registers_and_deregisters() {
-        let pid = u32::MAX - 7; // never a real child of this test process
+        // Never signalled (the hook is not installed in tests), so any
+        // value works; a real child pid is not needed.
+        let pid = u32::MAX - 7;
         register_quick(pid);
         assert!(live_quick().contains(&pid));
+        assert!(registry_snapshot().contains(&pid));
         deregister_quick(pid);
         assert!(!live_quick().contains(&pid));
+        assert!(!registry_snapshot().contains(&pid));
     }
 
     #[test]
@@ -1096,7 +1112,7 @@ mod system_tests {
 
     #[test]
     fn spawn_quick_times_out_and_kills_a_silent_child() {
-        let (d, cf) = fake("echo $$ > \"$(dirname \"$0\")/pid\"; exec sleep 30");
+        let (d, cf) = fake("d=$(dirname \"$0\"); echo $$ > \"$d/pid.tmp\" && mv \"$d/pid.tmp\" \"$d/pid\"; exec sleep 30");
         let start = Instant::now();
         let err = cf
             .spawn_quick(7717, Duration::from_secs(1))
@@ -1125,7 +1141,7 @@ mod system_tests {
     /// hanging the suite.
     #[test]
     fn one_shot_calls_time_out_kill_the_child_and_name_the_command() {
-        let (d, mut cf) = fake("echo $$ > \"$(dirname \"$0\")/pid\"; exec sleep 30");
+        let (d, mut cf) = fake("d=$(dirname \"$0\"); echo $$ > \"$d/pid.tmp\" && mv \"$d/pid.tmp\" \"$d/pid\"; exec sleep 30");
         cf.timeout = Duration::from_millis(500);
         type Call = fn(&SystemCloudflared) -> anyhow::Result<()>;
         let calls: [(&str, Call); 4] = [
@@ -1196,9 +1212,26 @@ mod system_tests {
     }
 
     #[test]
-    fn install_quick_panic_hook_is_idempotent() {
+    fn install_quick_panic_hook_never_signals_from_a_test_panic() {
         install_quick_panic_hook();
         install_quick_panic_hook();
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        register_quick(pid);
+        let caught = std::panic::catch_unwind(|| panic!("a test panic"));
+        assert!(caught.is_err());
+        std::thread::sleep(Duration::from_millis(200));
+        let still_running = child.try_wait().unwrap().is_none();
+        deregister_quick(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(
+            still_running,
+            "a panic in one test must not kill another test's child"
+        );
     }
 
     #[test]
