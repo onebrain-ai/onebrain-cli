@@ -92,6 +92,12 @@ pub(crate) fn clamp_top_k(top_k: usize) -> usize {
     top_k.min(MAX_TOP_K)
 }
 
+/// Candidate-pool size `max(top_k, min_candidates)`, capped at [`MAX_TOP_K`].
+/// `min_candidates` is config/flag-sourced, so it is clamped too.
+pub(crate) fn pool_k(top_k: usize, min_candidates: usize) -> usize {
+    clamp_top_k(top_k.max(min_candidates))
+}
+
 const CHUNK_MAX_TOKENS: usize = 512;
 const CHUNK_OVERLAP_TOKENS: usize = 64;
 const LEX_TOP_K: usize = 50;
@@ -1954,7 +1960,7 @@ impl Engine {
         // Round-robin gather up to `budget` chunks so every candidate path is
         // represented (its first chunk) before any path adds a second — bounds
         // the cross-encode cost regardless of how long the candidate docs are.
-        let budget = clamp_top_k(self.rerank_settings.min_candidates.max(top_k));
+        let budget = pool_k(top_k, self.rerank_settings.min_candidates);
         let mut fused: Vec<(String, f64)> = Vec::new();
         let mut round = 0;
         'gather: loop {
@@ -2027,7 +2033,7 @@ impl Engine {
 
         // Fuse wide enough for the rerank stage to see its full reranked
         // pool even when the caller asks for a small top_k.
-        let fuse_k = clamp_top_k(top_k.max(self.rerank_settings.min_candidates));
+        let fuse_k = pool_k(top_k, self.rerank_settings.min_candidates);
         let fused = rrf_fuse(&lex_hits, &vec_hits, RRF_K, fuse_k);
         self.apply_rerank(text, fused, top_k)
     }
@@ -2039,7 +2045,7 @@ impl Engine {
     pub fn vector_search(&self, text: &str, top_k: usize) -> Result<Vec<Hit>> {
         let top_k = clamp_top_k(top_k);
         let query_vec = self.embedder()?.embed_query(text)?;
-        let fetch_k = clamp_top_k(top_k.max(self.rerank_settings.min_candidates));
+        let fetch_k = pool_k(top_k, self.rerank_settings.min_candidates);
         let vec_hits = keep_top_cluster(self.vec.search(&query_vec, fetch_k), VEC_CLUSTER_WINDOW);
         let ranked: Vec<(String, f64)> = vec_hits
             .into_iter()
@@ -3161,6 +3167,11 @@ mod tests {
             "0 must survive for the with_limit(0) guard"
         );
         assert_eq!(clamp_top_k(10), 10);
+        // The fusion/fetch/rerank pool also folds in config-sourced
+        // `min_candidates`, so it must be capped independently of `top_k`.
+        assert_eq!(pool_k(10, usize::MAX), MAX_TOP_K);
+        assert_eq!(pool_k(usize::MAX, 10), MAX_TOP_K);
+        assert_eq!(pool_k(10, 10), 10);
 
         let dir = tempfile::tempdir().unwrap();
         let mut e = fake_engine(dir.path());

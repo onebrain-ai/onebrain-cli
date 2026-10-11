@@ -91,7 +91,7 @@ a completeness test enforces this against the config structs.
 | `checkpoint.minutes` | Minutes between Stop-hook checkpoint emissions | `30` | integer ≥ 1 | yes |
 | `search.collection` | Collection name binding the vault to its index — absent = search disabled; `onebrain search reindex` sets it | *(unset)* | non-empty name | **no — report-only** |
 | `search.embed_model` | Embedding model (see `onebrain search model list`) | `multilingual-e5-small` | model-registry name | yes — **prints a reindex-required warning** (old vectors are stale) |
-| `search.default_top_k` | Result count when a caller doesn't pass `top_k` | `10` | integer ≥ 1 | yes |
+| `search.default_top_k` | Result count when a caller doesn't pass `top_k` (any `top_k`, including this default, is capped at 1000) | `10` | integer ≥ 1 | yes |
 | `search.exclude` | Extra index-exclusion patterns on top of the built-ins | `["attachments"]` | list of path prefixes / dir names | not validated |
 | `search.embed.auto` | Auto-embed changed docs on/off (gate parsed; enforcement pending) | `true` | `true`, `false` | not validated |
 | `search.embed.threshold` | Changed docs required before an auto-embed run triggers | `10` | integer ≥ 1 | not validated |
@@ -100,7 +100,7 @@ a completeness test enforces this against the config structs.
 | `search.embed.schedule` | Cron schedule for a periodic full re-embed | *(unset)* | cron expression | not validated |
 | `search.reranker.enabled` | Tier-2 cross-encoder rerank stage on/off | `true` | `true`, `false` | yes |
 | `search.reranker.model` | Reranker model (see `onebrain search model list`) | `onebrain-rerank-v1` | reranker-registry name | yes |
-| `search.reranker.min_candidates` | Minimum candidate pool to rerank (a floor, not a ceiling) | `10` | integer ≥ 1 | yes |
+| `search.reranker.min_candidates` | Minimum candidate pool to rerank (a floor, not a ceiling; pools above 1000 are capped) | `10` | integer ≥ 1 | yes |
 | `search.reranker.min_score` | Score gate: hits below this calibrated 0–1 score are dropped | `0.0` (engine-calibrated — drops nothing by default as of v3.4.16, [ADR 0034](decisions/0034-heading-search-schema-selfheal-rerank-gate-decouple.md); key may also be omitted) — vaults initialized on v3.4.7–v3.4.15 have `0.30` written out explicitly, flagged as **superseded** by `doctor` (a legal value, but no longer the recommended default) | number in `[0, 1]` | yes |
 | `token_optimization.level` | Token-optimization ladder rung — see [`token-optimization.md`](token-optimization.md) | `conservative` | `off`, `conservative`, `balanced`, `aggressive` | not validated |
 | `token_optimization.get_max_tokens` | `search get` / MCP `get` continuation cap, in estimated tokens. Unset → per-level ladder (6000/4000/4000); a set value pins a fixed cap at every active level; `0` = unlimited | *unset* (per-level) | integer ≥ 0 | not validated |

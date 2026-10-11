@@ -786,7 +786,7 @@ Commands:
 {subcommands}
 
 Search flags (query · search · vsearch):
-  --top-k <N>        Maximum hits to return (default 10)
+  --top-k <N>        Maximum hits to return (default 10; at most 1000, larger values are capped)
   --min-score <S>    Drop low-confidence hits (vsearch: cosine, ≈0.85+ is confident; search: BM25; query: RRF)
 
 Options:
@@ -887,12 +887,20 @@ pub struct SearchModelRemoveArgs {
     pub force: bool,
 }
 
+/// Parse `--top-k`, capping at the engine's `MAX_TOP_K` so the reported count
+/// matches what is actually returned.
+fn parse_top_k(s: &str) -> Result<usize, String> {
+    let n: usize = s.parse().map_err(|e| format!("{e}"))?;
+    Ok(n.min(onebrain_search::engine::MAX_TOP_K))
+}
+
 #[derive(Args, Debug)]
 pub struct SearchQueryArgs {
     /// Query text.
     pub text: String,
-    /// Maximum hits to return.
-    #[arg(long = "top-k", default_value_t = 10)]
+    /// Maximum hits to return (default 10; at most 1000, larger values are
+    /// capped).
+    #[arg(long = "top-k", default_value_t = 10, value_parser = parse_top_k)]
     pub top_k: usize,
     /// Drop hits scoring below this value. When the Tier-2 reranker is active
     /// (`query`/`vsearch` with the model available), this filters the
@@ -905,8 +913,8 @@ pub struct SearchQueryArgs {
     pub min_score: Option<f64>,
     /// Override `search.reranker.min_candidates` for this query: the minimum
     /// pool of top fused results fed to the Tier-2 reranker. Acts as a FLOOR
-    /// — the reranked pool is actually `max(min_candidates, top_k)`, so every
-    /// returned hit is always reranked regardless of this value. Omit to use
+    /// — the reranked pool is actually `max(min_candidates, top_k)` (capped at
+    /// 1000), so every returned hit is always reranked regardless of this value. Omit to use
     /// the vault's configured value. Applies to `query` and `vsearch`; has no
     /// effect on the pure-lex `search` verb (never reranked).
     #[arg(long = "min-candidates")]

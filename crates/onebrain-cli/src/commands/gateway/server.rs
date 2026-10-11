@@ -2118,7 +2118,9 @@ impl GatewayServer {
                     let resolved = resolve_vault_arg(&self.state, params.vault.as_deref())?;
                     let vault_path = resolved.root.as_path().to_path_buf();
                     let query = params.query.clone();
-                    let top_k = params.top_k;
+                    let top_k = params
+                        .top_k
+                        .map(|k| k.min(onebrain_search::engine::MAX_TOP_K));
 
                     // The gateway is a long-lived, multi-vault process: it
                     // must never open a direct `redb` engine itself,
