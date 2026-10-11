@@ -1735,7 +1735,10 @@ impl Engine {
         let read_txn = self.meta.begin_read()?;
         let chunk_meta = read_txn.open_table(CHUNK_META)?;
 
-        let mut hits = Vec::with_capacity(ranked.len());
+        // No capacity hint: `ranked` is already capped at MAX_TOP_K by every
+        // caller, and sizing from its length is what CodeQL's
+        // uncontrolled-allocation query flags (#445 / alert #23).
+        let mut hits = Vec::new();
         for (chunk_id, score, rerank_score) in ranked {
             let Some(encoded) = chunk_meta
                 .get(chunk_id.as_str())?
