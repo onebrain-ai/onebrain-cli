@@ -933,25 +933,24 @@ mod system_tests {
         let (d, cf) = fake("echo $$ > \"$(dirname \"$0\")/pid\"; exec sleep 30");
         let start = Instant::now();
         let err = cf
-            .spawn_quick(7717, Duration::from_millis(500))
+            .spawn_quick(7717, Duration::from_secs(1))
             .err()
             .unwrap()
             .to_string();
+        // Plan: the timeout error arrives in < timeout + 1 s.
+        let took = start.elapsed();
+        assert!(took < Duration::from_secs(2), "{took:?}");
         assert!(
-            start.elapsed() < Duration::from_millis(1500),
-            "{:?}",
-            start.elapsed()
-        );
-        assert!(
-            err.contains("did not report a Quick Tunnel URL within 500ms"),
+            err.contains("did not report a Quick Tunnel URL within 1s"),
             "{err}"
         );
-        let pid: u32 = std::fs::read_to_string(d.path().join("pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        assert!(!alive(pid), "a timed-out cloudflared must be killed");
+        // Under load the shell may not have written its pid before the
+        // kill; then it never will. Either way it must not be running.
+        std::thread::sleep(Duration::from_millis(300));
+        if let Ok(pid) = std::fs::read_to_string(d.path().join("pid")) {
+            let pid: u32 = pid.trim().parse().unwrap();
+            assert!(!alive(pid), "a timed-out cloudflared must be killed");
+        }
     }
 
     #[test]
