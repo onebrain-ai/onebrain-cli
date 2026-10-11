@@ -215,6 +215,15 @@ pub(crate) fn validate_gateway_config(config: &GatewayConfig) -> anyhow::Result<
             anyhow::bail!("gateway.yml `public_url` ({url:?}) is invalid: {reason}");
         }
     }
+    // v3.5.2 B1: a CLI-created tunnel forwards to `--url
+    // http://127.0.0.1:<port>`; port 0 (OS-assigned at bind) has no fixed
+    // address for cloudflared to reach.
+    if config.tunnel_ingress == Some(config::TunnelIngress::Local) && config.port == 0 {
+        return Err(anyhow::Error::new(crate::output::HintedError::new(
+            "gateway.yml sets `tunnel_ingress: local` with `port: 0` — the tunnel needs a fixed port to forward to",
+            "set `port:` in ~/.onebrain/gateway.yml to a fixed port (the default is 7717)",
+        )));
+    }
     Ok(())
 }
 
@@ -359,6 +368,10 @@ pub(crate) fn effective_config(
     overrides: &RunOverrides,
 ) -> anyhow::Result<GatewayConfig> {
     if let Some(url) = &overrides.public_url {
+        // Named for where it came from — not gateway.yml.
+        if let Err(reason) = validate_public_url(url) {
+            anyhow::bail!("Quick Tunnel URL ({url:?}) is invalid: {reason}");
+        }
         config.public_url = Some(url.clone());
     }
     if let Some(vault) = &overrides.default_vault {
@@ -773,12 +786,38 @@ mod tests {
             )
             .unwrap_err()
             .to_string();
-            assert!(err.contains("public_url"), "{bad}: {err}");
+            assert!(err.contains("Quick Tunnel URL"), "{bad}: {err}");
+            assert!(!err.contains("gateway.yml"), "{bad}: {err}");
         }
         // ...and a bad configured value is still caught with no override.
         let mut cfg = configured();
         cfg.public_url = Some("http://evil.com".into());
-        assert!(effective_config(cfg, &RunOverrides::default()).is_err());
+        let err = effective_config(cfg, &RunOverrides::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("gateway.yml `public_url`"), "{err}");
+    }
+
+    /// Review fix 3: `tunnel_ingress: local` needs a fixed origin port.
+    #[test]
+    fn local_tunnel_ingress_with_port_zero_is_rejected_with_a_hint() {
+        let mut cfg = GatewayConfig {
+            port: 0,
+            tunnel_ingress: Some(config::TunnelIngress::Local),
+            ..GatewayConfig::default()
+        };
+        let err = validate_gateway_config(&cfg).unwrap_err();
+        let hinted = err
+            .downcast_ref::<crate::output::HintedError>()
+            .expect("hinted");
+        assert!(hinted.plain.contains("port: 0"), "{}", hinted.plain);
+        assert!(hinted.hint.contains("7717"), "{}", hinted.hint);
+        cfg.port = 7717;
+        validate_gateway_config(&cfg).unwrap();
+        // A dashboard tunnel with port 0 stays legal (its origin is remote).
+        cfg.port = 0;
+        cfg.tunnel_ingress = None;
+        validate_gateway_config(&cfg).unwrap();
     }
 
     async fn get_discovery(router: &axum::Router, host: &str) -> (u16, String) {

@@ -88,7 +88,73 @@ impl Drop for QuickTunnel {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        deregister_quick(self.child.id());
     }
+}
+
+/// Pids of live Quick Tunnel children. The release profile is
+/// `panic = "abort"`, so a panic never runs [`QuickTunnel`]'s `Drop`; the
+/// panic hook installed by [`install_quick_panic_hook`] kills these
+/// instead, so a crashed wizard never leaves `cloudflared` forwarding a
+/// public URL to a dead port (or, worse, to whatever binds it next).
+static LIVE_QUICK: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+fn live_quick() -> std::sync::MutexGuard<'static, Vec<u32>> {
+    LIVE_QUICK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn register_quick(pid: u32) {
+    live_quick().push(pid);
+}
+
+fn deregister_quick(pid: u32) {
+    live_quick().retain(|p| *p != pid);
+}
+
+/// Best-effort kill of `pids` from inside a panic hook: no allocation-heavy
+/// work, errors ignored.
+/// - unix: `SIGTERM` (cloudflared shuts its connections down on it).
+/// - Windows: `taskkill /PID <pid> /F` — ASSUMED to work, untested here
+///   (no Windows leg runs this; a missing `taskkill` just leaves the gap
+///   the panic would have left anyway).
+fn kill_pids(pids: &[u32]) {
+    for &pid in pids {
+        #[cfg(unix)]
+        // SAFETY: plain kill(2) on a pid we spawned; no memory involved.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// Install (once per process) a panic hook that kills every registered
+/// Quick Tunnel child, then chains to the previous hook.
+fn install_quick_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // try_lock: the panic may have happened while this thread held
+            // the registry lock; never deadlock the hook.
+            let pids = match LIVE_QUICK.try_lock() {
+                Ok(g) => g.clone(),
+                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().clone(),
+                Err(std::sync::TryLockError::WouldBlock) => Vec::new(),
+            };
+            kill_pids(&pids);
+            previous(info);
+        }));
+    });
 }
 
 /// The tunnel name the wizard creates / reuses for `host`:
@@ -298,8 +364,15 @@ fn collect(stream: Option<impl Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>
 impl SystemCloudflared {
     /// `cloudflared` from PATH; when absent, [`Cloudflared::path`] is `None`.
     pub(crate) fn discover(home: PathBuf) -> Self {
+        Self::from_lookup(which::which("cloudflared").ok(), home)
+    }
+
+    /// Not found → an EMPTY `bin` (never a relative `cloudflared`, which
+    /// `path()` could resolve against a stray `./cloudflared` in the cwd),
+    /// so [`Cloudflared::path`] is `None`.
+    fn from_lookup(found: Option<PathBuf>, home: PathBuf) -> Self {
         Self {
-            bin: which::which("cloudflared").unwrap_or_else(|_| PathBuf::from("cloudflared")),
+            bin: found.unwrap_or_default(),
             home,
             timeout: ONE_SHOT_TIMEOUT,
         }
@@ -379,7 +452,7 @@ fn drain_lines(stream: impl Read, tx: mpsc::Sender<String>) {
 
 impl Cloudflared for SystemCloudflared {
     fn path(&self) -> Option<PathBuf> {
-        self.bin.is_file().then(|| self.bin.clone())
+        (!self.bin.as_os_str().is_empty() && self.bin.is_file()).then(|| self.bin.clone())
     }
 
     fn has_login(&self) -> bool {
@@ -461,6 +534,7 @@ impl Cloudflared for SystemCloudflared {
 
     fn spawn_quick(&self, port: u16, timeout: Duration) -> anyhow::Result<QuickTunnel> {
         let origin = format!("http://127.0.0.1:{port}");
+        install_quick_panic_hook();
         let mut child = Command::new(&self.bin)
             .args([
                 "tunnel",
@@ -485,7 +559,9 @@ impl Cloudflared for SystemCloudflared {
             std::thread::spawn(move || drain_lines(s, tx));
         }
         drop(tx);
-        // Owned by the guard from here on: every early return kills it.
+        // Owned by the guard from here on: every early return kills it
+        // (and deregisters it).
+        register_quick(child.id());
         let mut quick = QuickTunnel {
             url: String::new(),
             child,
@@ -769,6 +845,25 @@ mod tests {
     }
 
     #[test]
+    fn discover_without_cloudflared_has_no_path_even_with_a_stray_relative_file() {
+        let cf = SystemCloudflared::from_lookup(None, PathBuf::from("/h"));
+        assert_eq!(cf.bin, PathBuf::new(), "never a relative `cloudflared`");
+        assert_eq!(cf.path(), None);
+        assert_eq!(cf.timeout, ONE_SHOT_TIMEOUT);
+        let found = SystemCloudflared::from_lookup(Some("/x/cloudflared".into()), "/h".into());
+        assert_eq!(found.bin, PathBuf::from("/x/cloudflared"));
+    }
+
+    #[test]
+    fn quick_registry_registers_and_deregisters() {
+        let pid = u32::MAX - 7; // never a real child of this test process
+        register_quick(pid);
+        assert!(live_quick().contains(&pid));
+        deregister_quick(pid);
+        assert!(!live_quick().contains(&pid));
+    }
+
+    #[test]
     fn has_login_sees_a_cert_in_the_home() {
         let dir = tempfile::tempdir().unwrap();
         let cf = SystemCloudflared {
@@ -972,8 +1067,10 @@ mod system_tests {
         );
         let pid = q.child.id();
         assert!(alive(pid));
+        assert!(live_quick().contains(&pid), "spawn_quick must register");
         drop(q);
         assert!(!alive(pid), "Drop must kill and reap cloudflared");
+        assert!(!live_quick().contains(&pid), "Drop must deregister");
     }
 
     /// Red-team I5: after the URL the readers keep draining, so a chatty
@@ -1066,6 +1163,45 @@ mod system_tests {
                 );
             }
         }
+    }
+
+    /// Review fix 1: what the panic hook does — `kill_pids` on the
+    /// registry snapshot — terminates a live child. (The hook itself is not
+    /// triggered: a real panic would abort the test process in release.)
+    #[test]
+    fn panic_hook_kill_terminates_a_registered_child() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        register_quick(pid);
+        let snapshot: Vec<u32> = live_quick().iter().copied().filter(|p| *p == pid).collect();
+        kill_pids(&snapshot);
+        let start = Instant::now();
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break Some(s);
+            }
+            if start.elapsed() > Duration::from_secs(5) {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        deregister_quick(pid);
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let status = status.expect("kill_pids must terminate the child");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGTERM), "{status:?}");
+    }
+
+    #[test]
+    fn install_quick_panic_hook_is_idempotent() {
+        install_quick_panic_hook();
+        install_quick_panic_hook();
     }
 
     #[test]
