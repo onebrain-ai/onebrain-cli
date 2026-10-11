@@ -422,6 +422,11 @@ pub(crate) fn run_with(
     let port = port_flag.unwrap_or(config.port);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let public_url = config.public_url.clone();
+    // A Quick Tunnel (`gateway setup`) exposes this run publicly, so the
+    // "loopback only" line would be wrong — say what is actually served.
+    let quick_banner = overrides.public_url.as_ref().map(|u| {
+        format!("serving {u} through a Quick Tunnel (testing only) — /mcp requires OAuth; /.well-known/* discovery is public")
+    });
     // `approval_wait_seconds` above the 270 s ceiling is lowered to it, with a warning.
     if let Some(warning) = config.policy.clamp_approval_wait() {
         tracing::warn!("gateway.yml: {warning}");
@@ -529,7 +534,12 @@ pub(crate) fn run_with(
             // test parses this to learn the bound address (needed with
             // `--port 0`). Keep this line's shape exactly as-is.
             println!("gateway listening on http://{bound}/mcp");
-            eprintln!("loopback only — /mcp requires OAuth; /.well-known/* discovery is public");
+            match &quick_banner {
+                Some(line) => eprintln!("{line}"),
+                None => eprintln!(
+                    "loopback only — /mcp requires OAuth; /.well-known/* discovery is public"
+                ),
+            }
             // Resolve + publish the issuer AFTER the listener is confirmed up
             // (see module docs / #278) so every request that reaches a
             // handler observes a set value. `set` fails only if `on_bind`

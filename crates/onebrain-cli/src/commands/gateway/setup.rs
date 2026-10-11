@@ -8,7 +8,13 @@
 //! offers to keep it (Enter). Nothing is written until the connection step
 //! has fully validated (the DNS route included), and the service is only
 //! reinstalled — which restarts the gateway and denies pending approvals —
-//! when this run wrote something or the agents drifted (A-I1).
+//! when this run (or an unfinished earlier one, `setup.pending`) wrote
+//! something, or the agents drifted (A-I1).
+//!
+//! End of input (Ctrl-D, a closed pipe) or a failed step prints "Done so
+//! far" and exits non-zero. Ctrl-C stops the process immediately (there is
+//! no signal handler); re-running is safe — finished steps are kept and a
+//! pending restart is redone.
 //!
 //! Telegram runs BEFORE the service step (D1 lists it after): the gateway
 //! reads its `telegram:` block at startup, so a Telegram set up after the
@@ -87,6 +93,11 @@ pub(crate) trait SetupHost {
     fn pairing(&self) -> PairingLookup;
     fn stdout_is_tty(&self) -> bool;
     fn cwd(&self) -> PathBuf;
+    /// The global `--vault` flag, when given.
+    fn vault_flag(&self) -> Option<PathBuf>;
+    /// `tunnel list --name <name> -o json` stdout, for the advisory
+    /// "already connected elsewhere?" check; `None` on any failure.
+    fn tunnel_list_json(&self, name: &str) -> Option<String>;
 }
 
 fn hinted(plain: impl Into<String>, hint: impl Into<String>) -> anyhow::Error {
@@ -201,6 +212,83 @@ fn step(out: &mut dyn Write, done: &mut Vec<String>, what: String) -> anyhow::Re
     Ok(())
 }
 
+/// `~/.onebrain/gateway/setup.pending` (0600): written before this run's
+/// first config/token write, removed once the service was (re)installed —
+/// or, without a service, once the manual run lines were printed. A run
+/// that stopped in between (EOF, Ctrl-C, a failed step) leaves it behind,
+/// so the NEXT run reinstalls even when it changes nothing itself: the live
+/// gateway is still running the old config (review A).
+pub(crate) fn pending_marker(onebrain_dir: &Path) -> PathBuf {
+    onebrain_dir.join("gateway").join("setup.pending")
+}
+
+fn mark_pending(onebrain_dir: &Path) -> anyhow::Result<()> {
+    let marker = pending_marker(onebrain_dir);
+    if !marker.exists() {
+        super::config_write::ensure_private_dir(marker.parent().unwrap_or(onebrain_dir))?;
+        super::config_write::write_private_file(
+            &marker,
+            b"a `onebrain gateway setup` run changed the config; the service restart is pending\n",
+        )?;
+    }
+    Ok(())
+}
+
+fn clear_pending(onebrain_dir: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_file(pending_marker(onebrain_dir)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(anyhow::Error::new(e).context("remove the setup.pending marker"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Store a new token, saying so when it replaces a different one (kept as
+/// `tunnel.token.prev`, 0600) and when the previous tunnel / DNS record is
+/// left behind on Cloudflare (review B). Never prints a token, only ids.
+fn store_with_notes(
+    out: &mut dyn Write,
+    onebrain_dir: &Path,
+    previous_url: Option<&str>,
+    token: &str,
+    public_url: &str,
+    ingress: Option<TunnelIngress>,
+) -> anyhow::Result<()> {
+    let token_path = tunnel::tunnel_token_path(onebrain_dir);
+    let old = std::fs::read(&token_path).ok();
+    let old_id = old
+        .as_deref()
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .and_then(|t| tunnel::validate_tunnel_token(t.trim()).ok());
+    if let Some(old_bytes) = old.as_deref().filter(|b| *b != token.as_bytes()) {
+        writeln!(
+            out,
+            "Replacing the existing tunnel token (tunnel {}); the old one is kept in {}.prev",
+            old_id.as_deref().unwrap_or("unrecognised"),
+            token_path.display()
+        )?;
+        let prev = token_path.with_file_name("tunnel.token.prev");
+        super::config_write::write_private_file(&prev, old_bytes)?;
+    }
+    let new_id = tunnel::validate_tunnel_token(token).ok();
+    if let Some(prev_url) = previous_url {
+        if prev_url != public_url || (old_id.is_some() && old_id != new_id) {
+            let which = old_id
+                .as_deref()
+                .map_or_else(|| "<name or id>".to_string(), str::to_string);
+            writeln!(
+                out,
+                "The previous tunnel ({prev_url}) and its DNS record stay on Cloudflare. If unused, delete the tunnel with `cloudflared tunnel delete {which}` and the DNS record in the Cloudflare dashboard."
+            )?;
+        }
+    }
+    // Accepted ordering (review): the token is written before
+    // `public_url`; a crash in between leaves a half-switched config, which
+    // the next run's pending marker turns into a reinstall.
+    tunnel::store_tunnel(onebrain_dir, token, public_url, ingress)?;
+    Ok(())
+}
+
 fn wizard(
     input: &mut dyn BufRead,
     out: &mut dyn Write,
@@ -215,6 +303,13 @@ fn wizard(
 
     writeln!(out, "OneBrain gateway setup")?;
     writeln!(out)?;
+    let pending = pending_marker(onebrain_dir).exists();
+    if pending {
+        writeln!(
+            out,
+            "A previous setup didn't finish — the service will be restarted."
+        )?;
+    }
 
     // 1. Vault — chosen now, written only after the connection validated
     //    (and never for a Quick Tunnel, which passes it in memory).
@@ -229,16 +324,23 @@ fn wizard(
             step(
                 out,
                 done,
-                format!("tunnel kept ({})", configured.unwrap_or_default()),
+                format!("tunnel kept ({})", configured.clone().unwrap_or_default()),
             )?;
             Plan::Nothing
         }
         Connection::OwnDomain => own_domain(&config, input, out, host, done)?,
         Connection::PasteToken => paste_token(&config, input, out, host)?,
-        Connection::LocalOnly => local_only(configured.as_deref(), &token_path, input, out)?,
+        Connection::LocalOnly => {
+            let plan = local_only(configured.as_deref(), &token_path, input, out)?;
+            step(out, done, "local only (no tunnel)".to_string())?;
+            plan
+        }
     };
 
-    // Everything validated: write.
+    // Everything validated: write — the pending marker first.
+    if vault_to_write.is_some() || !matches!(plan, Plan::Nothing) {
+        mark_pending(onebrain_dir)?;
+    }
     if let Some(v) = &vault_to_write {
         write_default_vault(&yml, v)?;
         step(out, done, format!("default_vault set to {}", v.display()))?;
@@ -250,7 +352,14 @@ fn wizard(
             public_url,
             ingress,
         } => {
-            tunnel::store_tunnel(onebrain_dir, &token, &public_url, ingress)?;
+            store_with_notes(
+                out,
+                onebrain_dir,
+                configured.as_deref(),
+                &token,
+                &public_url,
+                ingress,
+            )?;
             step(
                 out,
                 done,
@@ -265,9 +374,15 @@ fn wizard(
             step(out, done, "tunnel removed from gateway.yml".to_string())?;
             writeln!(
                 out,
-                "  The token file ({}) and the Cloudflare tunnel are kept; delete them yourself if unused (`cloudflared tunnel delete <name>`).",
+                "  The token file ({}), the Cloudflare tunnel and its DNS record are kept; if unused, delete the tunnel with `cloudflared tunnel delete <name>` and the DNS record in the Cloudflare dashboard.",
                 token_path.display()
             )?;
+            if !host.service_supported() {
+                writeln!(
+                    out,
+                    "  Stop the `cloudflared tunnel run` you started for it."
+                )?;
+            }
         }
     }
 
@@ -276,6 +391,7 @@ fn wizard(
     if !config.telegram.bot_token.is_empty() && config.telegram.chat_id > 0 {
         step(out, done, "Telegram already configured".to_string())?;
     } else if ask_yes_no(input, out, "Set up Telegram approvals now?", false)? {
+        mark_pending(onebrain_dir)?;
         host.telegram_setup(input, out)?;
         step(out, done, "Telegram approvals configured".to_string())?;
     }
@@ -284,7 +400,7 @@ fn wizard(
     let config = load_gateway_config_at(&yml)?;
     let tunnel_on = config.public_url.is_some() && token_path.exists();
     if host.service_supported() {
-        if !snapshot.changed(&yml, &token_path) && host.service_current() {
+        if !pending && !snapshot.changed(&yml, &token_path) && host.service_current() {
             step(
                 out,
                 done,
@@ -321,6 +437,7 @@ fn wizard(
             writeln!(out, "{line}")?;
         }
     }
+    clear_pending(onebrain_dir)?;
 
     // 5. Finish screen.
     writeln!(out)?;
@@ -362,6 +479,19 @@ fn choose_vault(
     out: &mut dyn Write,
     host: &dyn SetupHost,
 ) -> anyhow::Result<(PathBuf, Option<PathBuf>)> {
+    // The global `--vault` is the answer when it names a vault root.
+    if let Some(flag) = host.vault_flag() {
+        let path = host.cwd().join(&flag);
+        if onebrain_core::VaultRoot::from_path(&path).is_ok() && path.to_str().is_some() {
+            let keep = config.default_vault.as_deref() == Some(path.as_path());
+            return Ok((path.clone(), (!keep).then_some(path)));
+        }
+        writeln!(
+            out,
+            "--vault {} is not a vault root (no onebrain.yml) — choosing interactively",
+            flag.display()
+        )?;
+    }
     if let Some(existing) = &config.default_vault {
         if !existing.as_os_str().is_empty() && onebrain_core::VaultRoot::from_path(existing).is_ok()
         {
@@ -479,6 +609,16 @@ fn own_domain(
     let tunnel = match cf.find_tunnel(&name)? {
         Some(t) => {
             step(out, done, format!("tunnel {name} (reused)"))?;
+            let live = host
+                .tunnel_list_json(&name)
+                .and_then(|json| active_connections(&json, &name))
+                .unwrap_or(0);
+            if live > 0 {
+                writeln!(
+                    out,
+                    "⚠ tunnel {name} already has {live} active connection(s) — is it running on another machine? Running it here too splits its traffic between them."
+                )?;
+            }
             t
         }
         None => {
@@ -522,7 +662,9 @@ fn route_dns(
         if !ask_yes_no(
             input,
             out,
-            &format!("A DNS record for {hostname} already exists. Replace it with this tunnel?"),
+            &format!(
+                "A DNS record for {hostname} already exists. Replacing it deletes that record and can't be undone — note its target in the Cloudflare dashboard first. Replace it with this tunnel?"
+            ),
             false,
         )? {
             return Err(hinted(
@@ -659,11 +801,13 @@ fn quick(
     let port = require_fixed_port(config)?;
     if host.port_in_use(port) {
         return Err(hinted(
-            format!("the gateway service is running on {port} (127.0.0.1:{port} is in use)"),
+            format!("port {port} is already in use (is the gateway service running?)"),
             "`onebrain gateway service uninstall` first, or pick another connection",
         ));
     }
-    let tunnel = cf.spawn_quick(port, QUICK_URL_TIMEOUT)?;
+    let tunnel = cf
+        .spawn_quick(port, QUICK_URL_TIMEOUT)
+        .map_err(|e| e.context("could not start the Quick Tunnel"))?;
     // Only a URL `parse_quick_url` accepts in full ever becomes the
     // in-memory public_url — the host guard and the OAuth issuer (A-T3r a).
     let url = match cloudflare::parse_quick_url(&tunnel.url) {
@@ -772,6 +916,7 @@ pub(crate) struct SystemSetupHost {
     pub stdin_is_tty: bool,
     pub stdout_is_tty: bool,
     pub cwd: PathBuf,
+    pub vault_flag: Option<PathBuf>,
 }
 
 impl SetupHost for SystemSetupHost {
@@ -791,7 +936,12 @@ impl SetupHost for SystemSetupHost {
             return inquire::Password::new(prompt)
                 .without_confirmation()
                 .prompt()
-                .map_err(|e| anyhow::anyhow!("read tunnel token: {e}"));
+                .map_err(|e| match e {
+                    // Ctrl-C / Esc in the prompt: a cancel, with the summary.
+                    inquire::InquireError::OperationInterrupted
+                    | inquire::InquireError::OperationCanceled => Cancelled.into(),
+                    e => anyhow::anyhow!("read tunnel token: {e}"),
+                });
         }
         read_answer(input, out, &format!("{prompt} "))
     }
@@ -829,7 +979,12 @@ impl SetupHost for SystemSetupHost {
                     REACHABLE_WAIT,
                     Duration::from_secs(2),
                 );
-                eprintln!("{}", reachability_line(ok, &url, REACHABLE_WAIT));
+                // stderr, beside the gateway's own diagnostics, prefixed
+                // so it is not mistaken for gateway output.
+                eprintln!(
+                    "gateway setup: {}",
+                    reachability_line(ok, &url, REACHABLE_WAIT)
+                );
             });
         }
         super::run_with(&self.mode, Some(port), overrides)
@@ -852,11 +1007,58 @@ impl SetupHost for SystemSetupHost {
     fn cwd(&self) -> PathBuf {
         self.cwd.clone()
     }
+    fn vault_flag(&self) -> Option<PathBuf> {
+        self.vault_flag.clone()
+    }
+    fn tunnel_list_json(&self, name: &str) -> Option<String> {
+        use std::io::Read;
+        use wait_timeout::ChildExt;
+        let mut child = std::process::Command::new(&self.cloudflared.bin)
+            .args(["tunnel", "list", "--name", name, "-o", "json"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        let mut stdout = child.stdout.take()?;
+        let reader = std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = stdout.read_to_string(&mut s);
+            s
+        });
+        match child.wait_timeout(Duration::from_secs(30)) {
+            Ok(Some(status)) if status.success() => reader.join().ok(),
+            Ok(Some(_)) => None,
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                None
+            }
+        }
+    }
+}
+
+/// Live connections of tunnel `name` in `tunnel list -o json` output.
+/// Advisory: anything unexpected is `None`, never an error.
+pub(crate) fn active_connections(list_json: &str, name: &str) -> Option<usize> {
+    let list: Vec<serde_json::Value> = serde_json::from_str(list_json.trim()).ok()?;
+    list.iter()
+        .find(|v| v.get("name").and_then(serde_json::Value::as_str) == Some(name))
+        .and_then(|v| v.get("connections")?.as_array().map(Vec::len))
 }
 
 /// `onebrain gateway setup`.
-pub fn gateway_setup(mode: &crate::output::OutputMode) -> anyhow::Result<()> {
+pub fn gateway_setup(
+    mode: &crate::output::OutputMode,
+    vault_flag: Option<&Path>,
+) -> anyhow::Result<()> {
     use std::io::IsTerminal;
+    if mode.is_structured() {
+        return Err(hinted(
+            "gateway setup is interactive — it has no --json/--yaml output",
+            "run `onebrain gateway setup` without --json/--yaml",
+        ));
+    }
     let home = crate::home::home_dir()?;
     let paths = service::ServicePaths::for_home(&home);
     let onebrain_dir = paths.onebrain_dir.clone();
@@ -868,6 +1070,7 @@ pub fn gateway_setup(mode: &crate::output::OutputMode) -> anyhow::Result<()> {
         stdin_is_tty: stdin.is_terminal(),
         stdout_is_tty: std::io::stdout().is_terminal(),
         cwd: std::env::current_dir()?,
+        vault_flag: vault_flag.map(Path::to_path_buf),
     };
     let mut input = stdin.lock();
     run_setup(&mut input, &mut std::io::stdout(), &onebrain_dir, &host)
@@ -999,6 +1202,8 @@ mod tests {
         pairing_busy: bool,
         cwd: PathBuf,
         install_fails: bool,
+        vault_flag: Option<PathBuf>,
+        list_json: Option<String>,
     }
 
     impl FakeHost {
@@ -1066,6 +1271,12 @@ mod tests {
         fn cwd(&self) -> PathBuf {
             self.cwd.clone()
         }
+        fn vault_flag(&self) -> Option<PathBuf> {
+            self.vault_flag.clone()
+        }
+        fn tunnel_list_json(&self, _name: &str) -> Option<String> {
+            self.list_json.clone()
+        }
     }
 
     /// A temp HOME: `<root>/.onebrain` (not created) and a vault the cwd
@@ -1107,6 +1318,8 @@ mod tests {
                 pairing_busy: false,
                 cwd: self.vault.clone(),
                 install_fails: false,
+                vault_flag: None,
+                list_json: None,
             }
         }
         /// gateway.yml with a valid vault, a fixed scratch port, `extra`.
@@ -1147,6 +1360,22 @@ mod tests {
             std::fs::read(env.yml()).ok(),
             std::fs::read(env.token()).ok(),
         )
+    }
+
+    /// (mtime, inode) of gateway.yml and the token file: a byte-identical
+    /// rewrite (tmp + rename) still changes these.
+    fn stamps(env: &Env) -> Vec<Option<(std::time::SystemTime, u64)>> {
+        [env.yml(), env.token()]
+            .iter()
+            .map(|p| {
+                let m = std::fs::metadata(p).ok()?;
+                #[cfg(unix)]
+                let ino = std::os::unix::fs::MetadataExt::ino(&m);
+                #[cfg(not(unix))]
+                let ino = 0;
+                Some((m.modified().ok()?, ino))
+            })
+            .collect()
     }
 
     fn hint_of(e: &anyhow::Error) -> String {
@@ -1507,7 +1736,7 @@ mod tests {
         let (r, _) = run("3\n", &env, &h);
         let msg = hint_of(&r.unwrap_err());
         assert!(
-            msg.contains("the gateway service is running on 7905"),
+            msg.contains("port 7905 is already in use (is the gateway service running?)"),
             "{msg}"
         );
         assert!(msg.contains("onebrain gateway service uninstall"), "{msg}");
@@ -1547,10 +1776,13 @@ mod tests {
         let env = Env::new();
         env.configure_tunnel();
         let before = files(&env);
+        let before_stamps = stamps(&env);
         let h = env.host();
         let (r, _) = run("n\n3\n", &env, &h);
         r.unwrap();
         assert_eq!(files(&env), before);
+        // Not even a byte-identical rewrite (review flip F2).
+        assert_eq!(stamps(&env), before_stamps);
         assert!(env
             .calls()
             .contains(&format!("run_foreground 7905 {QUICK_URL} None")));
@@ -1614,7 +1846,9 @@ mod tests {
         let mut h = env.host();
         h.cf.quick_url = None;
         let (r, out) = run("3\n", &env, &h);
-        assert!(r.unwrap_err().to_string().contains("within 30s"));
+        // The wizard's own wording, not the fake's.
+        let e = r.unwrap_err();
+        assert_eq!(e.to_string(), "could not start the Quick Tunnel");
         assert!(out.contains("Done so far:") && out.contains(RERUN), "{out}");
     }
 
@@ -1693,6 +1927,10 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains(TOKEN_STDOUT.trim()));
+        assert!(
+            !pending_marker(&env.dir).exists(),
+            "cleared after the manual lines"
+        );
 
         let env = Env::new();
         let mut h = env.host();
@@ -1746,8 +1984,10 @@ mod tests {
         assert!(out.contains(&qr), "{out}");
     }
 
-    /// Review Focus 3 / A-I4: EOF before the connection choice is a
-    /// cancel — non-zero, the finished steps listed, the re-run line.
+    /// Review Focus 3 / A-I4: end of input (Ctrl-D, a closed pipe) before
+    /// the connection choice is a cancel — non-zero, the finished steps
+    /// listed, the re-run line. (Ctrl-C kills the process without the
+    /// summary; the `setup.pending` marker covers what it interrupts.)
     #[test]
     fn eof_mid_wizard_prints_progress_summary() {
         let env = Env::new();
@@ -1817,6 +2057,238 @@ mod tests {
             env.config().default_vault.as_deref(),
             Some(env.vault.as_path())
         );
+    }
+
+    // ── review fix wave 1 ───────────────────────────────────────────────
+
+    /// A second fake dashboard token (tunnel 11111111-…); not a credential.
+    const OTHER_TOKEN: &str = "eyJhIjoiMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYiLCJ0IjoiMTExMTExMTEtMjIyMi00MzMzLTg0NDQtNTU1NTU1NTU1NTU1IiwicyI6ImJtOTBMV0V0Y21WaGJDMXpaV055WlhRPSJ9";
+
+    /// Review A (the reviewer's repro): run 1 writes a new public_url, then
+    /// input ends at the Telegram prompt — before the service step. Run 2
+    /// keeps everything, yet must still restart the gateway, which is
+    /// running the config from before run 1.
+    #[test]
+    fn an_unfinished_run_forces_the_restart_on_the_next_run() {
+        let env = Env::new();
+        env.configure_tunnel();
+        let mut h = env.host();
+        h.current = true;
+        h.cf.logged_in.set(true);
+        let (r, _) = run("n\n1\nnew.example.com\n", &env, &h);
+        assert!(r.unwrap_err().downcast_ref::<Cancelled>().is_some());
+        assert!(pending_marker(&env.dir).exists(), "marker left behind");
+        assert!(!env.calls().contains(&"install_service".to_string()));
+        #[cfg(unix)]
+        assert_token_is_private(&pending_marker(&env.dir));
+
+        let (r, out) = run("\n\n", &env, &h);
+        r.unwrap();
+        assert!(
+            out.contains("A previous setup didn't finish — the service will be restarted."),
+            "{out}"
+        );
+        assert_eq!(
+            env.calls().last().map(String::as_str),
+            Some("install_service")
+        );
+        assert!(
+            !pending_marker(&env.dir).exists(),
+            "cleared after the install"
+        );
+
+        // ...and the run after that is a no-op again.
+        env.log.borrow_mut().clear();
+        let (r, out) = run("\n\n", &env, &h);
+        r.unwrap();
+        assert!(env.calls().is_empty(), "{:?}", env.calls());
+        assert!(!out.contains("previous setup"), "{out}");
+    }
+
+    #[test]
+    fn a_failed_install_keeps_the_marker_and_no_write_never_creates_one() {
+        let env = Env::new();
+        let mut h = env.host();
+        h.install_fails = true;
+        run("\n4\n\n", &env, &h).0.unwrap_err();
+        assert!(pending_marker(&env.dir).exists());
+
+        let env = Env::new();
+        env.configure_tunnel();
+        let mut h = env.host();
+        h.current = true;
+        run("\n\n", &env, &h).0.unwrap();
+        assert!(!pending_marker(&env.dir).exists());
+        assert!(!env.dir.join("gateway").join("tunnel.token.prev").exists());
+    }
+
+    /// Review B: a different token is announced by tunnel id (never by
+    /// value), the old one kept as `tunnel.token.prev` (0600), and the old
+    /// tunnel / DNS record named as left on Cloudflare.
+    #[test]
+    fn replacing_a_token_keeps_the_old_one_and_says_what_stays_on_cloudflare() {
+        let env = Env::new();
+        env.configure_tunnel();
+        let h = env.host();
+        let (r, out) = run(
+            &format!("n\n2\nother.example.com\n{OTHER_TOKEN}\n\n"),
+            &env,
+            &h,
+        );
+        r.unwrap();
+        assert!(
+            out.contains(
+                "Replacing the existing tunnel token (tunnel 6ff42ae2-765d-4adf-8112-31c55c1551ef)"
+            ),
+            "{out}"
+        );
+        let prev = env.dir.join("gateway").join("tunnel.token.prev");
+        assert_eq!(std::fs::read_to_string(&prev).unwrap(), TOKEN_STDOUT.trim());
+        #[cfg(unix)]
+        assert_token_is_private(&prev);
+        assert_eq!(std::fs::read_to_string(env.token()).unwrap(), OTHER_TOKEN);
+        assert!(
+            out.contains("The previous tunnel (https://brain.example.com) and its DNS record stay on Cloudflare"),
+            "{out}"
+        );
+        assert!(
+            out.contains("cloudflared tunnel delete 6ff42ae2-765d-4adf-8112-31c55c1551ef"),
+            "{out}"
+        );
+        assert!(!out.contains(OTHER_TOKEN) && !out.contains(TOKEN_STDOUT.trim()));
+    }
+
+    /// Own domain → another host: the token may be the same tunnel's, but
+    /// the old DNS record stays; the same host again says nothing.
+    #[test]
+    fn a_new_host_names_the_old_record_and_the_same_host_does_not() {
+        let env = Env::new();
+        env.configure_tunnel();
+        let h = env.host();
+        h.cf.logged_in.set(true);
+        let (r, out) = run("n\n1\nnew.example.com\n\n", &env, &h);
+        r.unwrap();
+        assert!(
+            out.contains("The previous tunnel (https://brain.example.com)"),
+            "{out}"
+        );
+
+        let env = Env::new();
+        env.configure_tunnel();
+        let mut h = env.host();
+        h.cf.logged_in.set(true);
+        h.cf.list = LIST_JSON_MATCH;
+        let (r, out) = run("n\n1\nbrain.example.com\n\n", &env, &h);
+        r.unwrap();
+        assert!(!out.contains("previous tunnel"), "{out}");
+        assert!(!out.contains("Replacing"), "{out}");
+    }
+
+    /// Review E: removing the tunnel says what stays (token, tunnel, DNS),
+    /// and off macOS to stop the hand-started cloudflared.
+    #[test]
+    fn local_only_remove_names_everything_left_behind() {
+        let env = Env::new();
+        env.configure_tunnel();
+        let mut h = env.host();
+        h.service = false;
+        let (r, out) = run("n\n4\ny\n\n", &env, &h);
+        r.unwrap();
+        assert!(out.contains("✓ local only (no tunnel)"), "{out}");
+        assert!(
+            out.contains("the Cloudflare tunnel and its DNS record are kept"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Stop the `cloudflared tunnel run` you started"),
+            "{out}"
+        );
+        assert!(!out.contains("tunnel setup"), "{out}");
+        assert!(
+            !pending_marker(&env.dir).exists(),
+            "cleared after the manual lines"
+        );
+    }
+
+    /// Review H: the global `--vault` answers the vault question.
+    #[test]
+    fn the_global_vault_flag_answers_the_vault_question() {
+        let env = Env::new();
+        let other = env.vault.parent().unwrap().join("other-vault");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("onebrain.yml"), "").unwrap();
+        let mut h = env.host();
+        h.vault_flag = Some(other.clone());
+        // No vault prompt: "4" is the connection answer.
+        let (r, out) = run("4\n\n", &env, &h);
+        r.unwrap();
+        assert_eq!(env.config().default_vault.as_deref(), Some(other.as_path()));
+        assert!(!out.contains("Use "), "{out}");
+
+        let env = Env::new();
+        let mut h = env.host();
+        h.vault_flag = Some(PathBuf::from("/no/such/vault"));
+        let (r, out) = run("\n4\n\n", &env, &h);
+        r.unwrap();
+        assert!(out.contains("is not a vault root"), "{out}");
+        assert_eq!(
+            env.config().default_vault.as_deref(),
+            Some(env.vault.as_path())
+        );
+    }
+
+    /// Review H: reusing a tunnel that is connected elsewhere warns; any
+    /// odd `tunnel list` output is ignored, never an error.
+    #[test]
+    fn reusing_a_connected_tunnel_warns_and_bad_list_output_is_ignored() {
+        let connected = LIST_JSON_MATCH.replace(
+            r#""connections":[]"#,
+            r#""connections":[{"colo_name":"sin01"},{"colo_name":"sin02"}]"#,
+        );
+        assert_eq!(active_connections(&connected, NAME), Some(2));
+        assert_eq!(active_connections(LIST_JSON_MATCH, NAME), Some(0));
+        for odd in [
+            "",
+            "null",
+            "garbage",
+            r#"[{"name":"x"}]"#,
+            r#"[{"name":"onebrain-brain-example-com"}]"#,
+        ] {
+            assert_eq!(active_connections(odd, NAME), None, "{odd}");
+        }
+        let env = Env::new();
+        let mut h = env.host();
+        h.cf.logged_in.set(true);
+        h.cf.list = LIST_JSON_MATCH;
+        h.list_json = Some(connected);
+        let (r, out) = run("\n1\nbrain.example.com\nn\n", &env, &h);
+        r.unwrap();
+        assert!(out.contains("already has 2 active connection(s)"), "{out}");
+        h.list_json = Some("garbage".into());
+        let (r, out) = run("\n1\nbrain.example.com\nn\n", &env, &h);
+        r.unwrap();
+        assert!(!out.contains("active connection"), "{out}");
+    }
+
+    #[test]
+    fn the_overwrite_prompt_warns_the_old_record_is_gone_for_good() {
+        let env = Env::new();
+        let mut h = env.host();
+        h.cf.logged_in.set(true);
+        h.cf.routes = RefCell::new(VecDeque::from([(false, ROUTE_CONFLICT.to_string())]));
+        let (_, out) = run("\n1\nbrain.example.com\n\n", &env, &h);
+        assert!(out.contains("can't be undone — note its target"), "{out}");
+    }
+
+    #[test]
+    fn structured_output_modes_are_refused_up_front() {
+        for mode in [
+            crate::output::OutputMode::Json { pretty: false },
+            crate::output::OutputMode::Yaml,
+        ] {
+            let msg = hint_of(&gateway_setup(&mode, None).unwrap_err());
+            assert!(msg.contains("gateway setup is interactive"), "{msg}");
+        }
     }
 
     // ── helpers ─────────────────────────────────────────────────────────

@@ -4,7 +4,7 @@
 //! - **CLI provisioning** of a locally managed tunnel on the user's own
 //!   domain (`tunnel login` → `tunnel list`/`create` → `route dns` →
 //!   `tunnel token`). Partially supersedes ADR 0042 D3 (which avoided
-//!   `cert.pem`) — ADR 0043.
+//!   `cert.pem`) — ADR 0047.
 //! - **Quick Tunnel** (`cloudflared tunnel --url …`): a foreground,
 //!   testing-only `*.trycloudflare.com` URL. Nothing is written to disk.
 //!

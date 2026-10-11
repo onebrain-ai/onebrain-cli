@@ -331,7 +331,7 @@ pub enum GatewayVerb {
     /// Guided setup: vault, connection (Cloudflare own domain · existing token · Quick Tunnel · local only), Telegram (optional), service, then the connector URL, pairing code and QR.
     Setup,
     /// Run the gateway in the foreground until Ctrl-C or SIGTERM. Binds 127.0.0.1 only
-    /// (no bind flag — remote access goes through a tunnel, see `gateway tunnel setup`).
+    /// (no bind flag — remote access goes through a tunnel, see `gateway setup`).
     Run {
         /// Loopback port to bind. 0 = OS-assigned ephemeral port. Overrides
         /// `~/.onebrain/gateway.yml`'s `port` (default 7717) when given.
@@ -353,7 +353,7 @@ pub enum GatewayVerb {
     Tokens(GatewayTokensCmd),
     /// List or remove registered OAuth clients (connectors).
     Clients(GatewayClientsCmd),
-    /// Remote access through a Cloudflare tunnel (token from the Zero Trust dashboard).
+    /// Cloudflare tunnel: paste a dashboard token (`tunnel setup`) or check it (`tunnel status`). `gateway setup` creates one for you.
     Tunnel(TunnelCmd),
     /// Keep the gateway (and its tunnel) running as macOS LaunchAgents.
     Service(ServiceCmd),

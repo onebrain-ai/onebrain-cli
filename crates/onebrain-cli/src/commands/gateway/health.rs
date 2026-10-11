@@ -103,6 +103,9 @@ pub(crate) struct HealthEnv<'a> {
     pub service: Option<&'a ServicePaths>,
     pub launcher: &'a dyn Launcher,
     pub http: &'a dyn HttpProbe,
+    /// What a fresh `service install` would render (macOS); `Some` turns on
+    /// the drift check (loaded agents whose plists no longer match).
+    pub install_inputs: Option<&'a super::service::InstallInputs>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -161,7 +164,7 @@ pub(crate) fn collect(env: &HealthEnv) -> Option<Vec<DoctorResult>> {
     let service_installed = env.service.filter(|p| p.plist(GATEWAY_LABEL).exists());
     if let Some(cfg) = &config {
         if let Some(paths) = env.service {
-            rows.push(service_row(paths, env.launcher, cfg));
+            rows.push(service_row(paths, env.launcher, cfg, env.install_inputs));
         }
         rows.push(local_row(env.http, cfg, service_installed));
         rows.push(tunnel_row(env, cfg));
@@ -214,7 +217,12 @@ pub(crate) fn collect(env: &HealthEnv) -> Option<Vec<DoctorResult>> {
     Some(rows)
 }
 
-fn service_row(paths: &ServicePaths, launcher: &dyn Launcher, cfg: &GatewayConfig) -> DoctorResult {
+fn service_row(
+    paths: &ServicePaths,
+    launcher: &dyn Launcher,
+    cfg: &GatewayConfig,
+    inputs: Option<&super::service::InstallInputs>,
+) -> DoctorResult {
     let mut labels = vec![GATEWAY_LABEL];
     if cfg.public_url.is_some() {
         labels.push(TUNNEL_LABEL);
@@ -276,9 +284,20 @@ fn service_row(paths: &ServicePaths, launcher: &dyn Launcher, cfg: &GatewayConfi
     }
     let msg = parts.join(" · ");
     match worst {
+        // Running, but the plists are not what an install would write now
+        // (another onebrain, a changed ingress/origin, a stray tunnel agent).
+        DoctorStatus::Ok
+            if inputs.is_some_and(|i| !super::service::agents_current(paths, i, launcher)) =>
+        {
+            DoctorResult::warn(
+                CHECK_SERVICE,
+                format!("{msg} · service files are out of date"),
+            )
+            .with_hint("onebrain gateway setup (or onebrain gateway service install)")
+        }
         DoctorStatus::Ok => DoctorResult::ok(CHECK_SERVICE, msg),
         _ => DoctorResult::error(CHECK_SERVICE, msg).with_hint(if tunnel_missing {
-            "onebrain gateway tunnel setup, then onebrain gateway service install"
+            "onebrain gateway setup (it reinstalls the tunnel agent), or onebrain gateway service install"
         } else {
             "onebrain gateway service install"
         }),
@@ -322,7 +341,9 @@ fn tunnel_row(env: &HealthEnv, cfg: &GatewayConfig) -> DoctorResult {
             CHECK_TUNNEL,
             format!("public_url is set but {} is missing", token.display()),
         )
-        .with_hint("onebrain gateway tunnel setup");
+        .with_hint(
+            "onebrain gateway setup (or `onebrain gateway tunnel setup` to paste a dashboard token)",
+        );
     }
     #[cfg(unix)]
     {
@@ -359,10 +380,16 @@ fn tunnel_row(env: &HealthEnv, cfg: &GatewayConfig) -> DoctorResult {
                 v["issuer"].as_str().unwrap_or("(none)")
             ),
         )
-        .with_hint(format!(
-            "in the dashboard, point the public hostname at http://127.0.0.1:{}, then `onebrain gateway service install`",
-            cfg.port
-        )),
+        .with_hint(if cfg.tunnel_ingress.is_some() {
+            // A CLI-made tunnel has no dashboard routing to fix.
+            "re-run `onebrain gateway setup` (it re-routes the hostname to this gateway's tunnel and restarts it)"
+                .to_string()
+        } else {
+            format!(
+                "in the dashboard, point the public hostname at http://127.0.0.1:{}, then `onebrain gateway service install`",
+                cfg.port
+            )
+        }),
     }
 }
 
@@ -393,11 +420,16 @@ pub(crate) fn doctor_rows() -> Vec<DoctorResult> {
     };
     let paths = ServicePaths::for_home(&home);
     let launcher = super::service::system_launcher();
+    let supported = super::service::service_supported();
+    let inputs = supported
+        .then(super::service::system_install_inputs)
+        .and_then(Result::ok);
     let env = HealthEnv {
         onebrain_dir: &paths.onebrain_dir,
-        service: super::service::service_supported().then_some(&paths),
+        service: supported.then_some(&paths),
         launcher: launcher.as_ref(),
         http: &UreqProbe,
+        install_inputs: inputs.as_ref(),
     };
     collect(&env).unwrap_or_default()
 }
@@ -433,7 +465,7 @@ pub(crate) fn print_status(names: &[&str]) -> anyhow::Result<()> {
     if rows.is_empty() {
         writeln!(
             out,
-            "gateway not configured (~/.onebrain/gateway.yml missing) — start with `onebrain gateway tunnel setup`"
+            "gateway not configured (~/.onebrain/gateway.yml missing) — start with `onebrain gateway setup`"
         )?;
         return Ok(());
     }
@@ -544,6 +576,7 @@ mod tests {
             service: Some(paths),
             launcher: f,
             http: f,
+            install_inputs: None,
         };
         collect(&env)
             .expect("gateway.yml present")
@@ -572,6 +605,7 @@ mod tests {
             service: Some(&paths),
             launcher: &f,
             http: &f,
+            install_inputs: None,
         };
         assert!(collect(&env).is_none());
     }
@@ -600,6 +634,7 @@ mod tests {
             service: Some(&paths),
             launcher: &f,
             http: &f,
+            install_inputs: None,
         })
         .unwrap()
         .into_iter()
@@ -608,6 +643,79 @@ mod tests {
         .hint
         .unwrap();
         assert!(hint.contains("http://127.0.0.1:7717") && !hint.contains("localhost"));
+    }
+
+    /// Review F: a CLI-made tunnel (`tunnel_ingress: local`) has no
+    /// dashboard routing to fix — the hint sends the user to the wizard.
+    #[test]
+    fn issuer_mismatch_hint_for_a_cli_tunnel_points_at_gateway_setup() {
+        let (_r, paths) = healthy_home();
+        let yml = paths.onebrain_dir.join("gateway.yml");
+        let text = std::fs::read_to_string(&yml).unwrap();
+        std::fs::write(&yml, format!("{text}tunnel_ingress: local\n")).unwrap();
+        let mut f = green_fakes();
+        f.http.insert(
+            PUBLIC.into(),
+            Ok(serde_json::json!({"issuer": "https://elsewhere.example.com"})),
+        );
+        let hint = service_hint(&paths, &f, CHECK_TUNNEL);
+        assert!(hint.contains("re-run `onebrain gateway setup`"), "{hint}");
+        assert!(!hint.contains("dashboard"), "{hint}");
+    }
+
+    fn drift_inputs() -> super::super::service::InstallInputs {
+        super::super::service::InstallInputs {
+            onebrain_exe: PathBuf::from("/opt/homebrew/bin/onebrain"),
+            cloudflared: Some(PathBuf::from("/opt/homebrew/bin/cloudflared")),
+            token_file_supported: true,
+            wait_for_up: None,
+            show_pairing_code: false,
+            print_finish: false,
+            exe_warning: None,
+        }
+    }
+
+    /// Review F: loaded + running but the plists are not what an install
+    /// would write now → a warning naming `gateway setup`.
+    #[test]
+    fn running_agents_with_out_of_date_plists_are_a_drift_warning() {
+        let (_r, paths) = healthy_home();
+        let f = green_fakes();
+        let inputs = drift_inputs();
+        // Real plists, as `service install` renders them.
+        super::super::service::install_service(
+            &paths,
+            &inputs,
+            &f, // "loaded": skips the something-already-answers check
+            &f,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let row = |inputs| {
+            collect(&HealthEnv {
+                onebrain_dir: &paths.onebrain_dir,
+                service: Some(&paths),
+                launcher: &f,
+                http: &f,
+                install_inputs: inputs,
+            })
+            .unwrap()
+            .into_iter()
+            .find(|r| r.check == CHECK_SERVICE)
+            .unwrap()
+        };
+        let ok = row(Some(&inputs));
+        assert_eq!(ok.status, DoctorStatus::Ok, "{}", ok.message);
+        // The ingress changed after the install: the tunnel plist is stale.
+        let yml = paths.onebrain_dir.join("gateway.yml");
+        let text = std::fs::read_to_string(&yml).unwrap();
+        std::fs::write(&yml, format!("{text}tunnel_ingress: local\n")).unwrap();
+        let drift = row(Some(&inputs));
+        assert_eq!(drift.status, DoctorStatus::Warn, "{}", drift.message);
+        assert!(drift.message.contains("service files are out of date"));
+        assert!(drift.hint.unwrap().starts_with("onebrain gateway setup"));
+        // Without inputs (non-macOS / unknown) there is no drift check.
+        assert_eq!(row(None).status, DoctorStatus::Ok);
     }
 
     #[cfg(unix)]
@@ -692,6 +800,7 @@ mod tests {
             service: None,
             launcher: &f,
             http: &f,
+            install_inputs: None,
         };
         let rows = collect(&env).unwrap();
         assert!(rows.iter().all(|r| r.check != CHECK_SERVICE));
@@ -809,6 +918,7 @@ mod tests {
                 service: Some(&paths),
                 launcher: &f,
                 http: &f,
+                install_inputs: None,
             };
             for r in collect(&env).unwrap() {
                 let text = format!("{} {}", r.message, r.hint.unwrap_or_default());
@@ -823,6 +933,7 @@ mod tests {
             service: Some(paths),
             launcher: f,
             http: f,
+            install_inputs: None,
         })
         .unwrap()
         .into_iter()
@@ -833,11 +944,11 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_tunnel_agent_hint_starts_with_tunnel_setup() {
+    fn a_missing_tunnel_agent_hint_starts_with_gateway_setup() {
         let (_r, paths) = healthy_home();
         std::fs::remove_file(paths.plist("gateway-tunnel")).unwrap();
         let hint = service_hint(&paths, &green_fakes(), CHECK_SERVICE);
-        assert!(hint.starts_with("onebrain gateway tunnel setup"), "{hint}");
+        assert!(hint.starts_with("onebrain gateway setup"), "{hint}");
     }
 
     #[test]

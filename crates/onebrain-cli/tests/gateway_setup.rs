@@ -258,6 +258,13 @@ fn get(port: u16, host: &str, path: &str) -> Option<(u16, String)> {
     Some((status, body))
 }
 
+/// (mtime, inode): a byte-identical tmp+rename rewrite changes both.
+fn stamp(p: &Path) -> (std::time::SystemTime, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(p).unwrap();
+    (m.modified().unwrap(), m.ino())
+}
+
 fn alive(pid: &str) -> bool {
     Command::new("kill")
         .args(["-0", pid])
@@ -280,6 +287,7 @@ fn quick_tunnel_drives_the_issuer_and_host_guard_and_writes_nothing() {
     )
     .unwrap();
     let before = std::fs::read(sb.yml()).unwrap();
+    let before_stamp = stamp(&sb.yml());
     let quick_url = cf_fixture("QUICK_URL");
     let bin = fake_cloudflared(
         sb.dir(),
@@ -346,6 +354,16 @@ fn quick_tunnel_drives_the_issuer_and_host_guard_and_writes_nothing() {
         before,
         "gateway.yml changed"
     );
+    // Not even a byte-identical rewrite (review flip F2).
+    assert_eq!(stamp(&sb.yml()), before_stamp, "gateway.yml rewritten");
+    // `gateway run`'s banner says what is really served (review H).
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("through a Quick Tunnel (testing only)"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("loopback only"), "{stderr}");
+    assert!(!sb.home().join(".onebrain/gateway/setup.pending").exists());
     assert!(!sb.home().join(".onebrain/gateway/tunnel.token").exists());
     assert!(!sb.home().join("Library/LaunchAgents").exists());
     let pid = std::fs::read_to_string(sb.dir().join("cf.pid")).unwrap();

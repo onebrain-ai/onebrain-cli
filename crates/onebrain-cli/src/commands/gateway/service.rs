@@ -125,8 +125,9 @@ pub(crate) struct InstallInputs {
     pub wait_for_up: Option<Duration>,
     /// Fetch the pairing code for the finish block (a TTY-only secret).
     pub show_pairing_code: bool,
-    /// Print the finish block (connector URL, pairing code, log path).
-    /// The setup wizard prints its own and passes `false`.
+    /// Print the finish block (connector URL, pairing code, log path) and
+    /// the "no tunnel" notes. The setup wizard prints its own and passes
+    /// `false`.
     pub print_finish: bool,
     /// Set by [`system_install_inputs`] when the chosen exe path is fragile
     /// (a versioned Homebrew path). Informational; `install_service` ignores it.
@@ -160,8 +161,7 @@ pub(crate) fn finish_lines(
         ],
         None => vec![
             format!("Local MCP URL (this Mac only): http://127.0.0.1:{port}/mcp"),
-            "For the Claude app on your phone, set up a tunnel: onebrain gateway tunnel setup"
-                .to_string(),
+            "For the Claude app on your phone, set up a tunnel: onebrain gateway setup".to_string(),
             pairing,
         ],
     }
@@ -432,7 +432,7 @@ pub(crate) fn install_service(
         return Err(hinted(
             "gateway.yml names no vault — as a service the gateway starts in `/`, so no tool call could find one",
             format!(
-                "run `onebrain gateway tunnel setup` (it asks for the vault and writes it), or add `default_vault: /path/to/your/vault` to {}",
+                "run `onebrain gateway setup` (it asks for the vault and writes it), or add `default_vault: /path/to/your/vault` to {}",
                 gateway_yml.display()
             ),
         ));
@@ -514,10 +514,15 @@ pub(crate) fn install_service(
                 "• removed com.onebrain.{TUNNEL_LABEL} (no tunnel configured)"
             )?;
         }
-        if config.public_url.is_some() {
-            writeln!(out, "• public_url is set but there is no tunnel token — run `onebrain gateway tunnel setup`")?;
-        } else if token_path.exists() {
-            writeln!(out, "• a tunnel token exists but gateway.yml has no public_url — run `onebrain gateway tunnel setup`")?;
+        // The wizard (`print_finish: false`) says what it did with the
+        // tunnel itself; these lines are for a bare `service install`.
+        if inputs.print_finish {
+            if config.public_url.is_some() {
+                writeln!(out, "• public_url is set but there is no tunnel token — run `onebrain gateway setup`")?;
+            } else if token_path.exists() {
+                // Informational: a local-only setup keeps the token file.
+                writeln!(out, "• a tunnel token is stored but gateway.yml has no public_url, so no tunnel agent was installed (local only)")?;
+            }
         }
     }
 
@@ -1178,6 +1183,16 @@ mod tests {
         .unwrap();
         let text = String::from_utf8(out).unwrap();
         assert!(text.contains("no public_url"), "{text}");
+        assert!(text.contains("(local only)"), "informational: {text}");
+        assert!(!text.contains("tunnel setup"), "{text}");
+
+        // From the wizard (print_finish: false) the note is not printed.
+        let mut quiet = inputs(true, true);
+        quiet.print_finish = false;
+        let mut out = Vec::new();
+        install_service(&paths, &quiet, &l, &UpAfterBootstrap(&l), &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("public_url"), "{text}");
     }
 
     fn installed(yml: &str, token: bool) -> (tempfile::TempDir, ServicePaths, FakeLauncher) {
@@ -1219,10 +1234,7 @@ mod tests {
             without[0],
             "Local MCP URL (this Mac only): http://127.0.0.1:7717/mcp"
         );
-        assert!(
-            without[1].contains("onebrain gateway tunnel setup"),
-            "{without:?}"
-        );
+        assert!(without[1].contains("onebrain gateway setup"), "{without:?}");
         assert_eq!(without[2], "Pairing code: run `onebrain gateway pair`");
         assert!(
             !without.iter().any(|l| l.contains("for the Claude app:")),
@@ -1301,11 +1313,7 @@ mod tests {
         let h = err
             .downcast_ref::<crate::output::HintedError>()
             .expect("HintedError");
-        assert!(
-            h.hint.contains("onebrain gateway tunnel setup"),
-            "{}",
-            h.hint
-        );
+        assert!(h.hint.contains("onebrain gateway setup"), "{}", h.hint);
         assert!(h.hint.contains("default_vault:"), "{}", h.hint);
     }
 
