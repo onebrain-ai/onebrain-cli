@@ -114,27 +114,24 @@ fn deregister_quick(pid: u32) {
 }
 
 /// Best-effort kill of `pids` from inside a panic hook: no allocation-heavy
-/// work, errors ignored.
-/// - unix: `SIGTERM` (cloudflared shuts its connections down on it).
-/// - Windows: `taskkill /PID <pid> /F` — ASSUMED to work, untested here
-///   (no Windows leg runs this; a missing `taskkill` just leaves the gap
-///   the panic would have left anyway).
+/// work, errors ignored. unix: `SIGTERM` (cloudflared shuts its
+/// connections down on it).
+///
+/// Windows gap (deliberate, release gate 8 — no untested cfg-gated kill
+/// path): this is a no-op there, so on Windows a panic can leave the Quick
+/// Tunnel cloudflared running until it is closed; the host guard refuses
+/// its hostname (403). Normal exit, Ctrl-C and errors still kill it via
+/// [`QuickTunnel`]'s `Drop`.
 fn kill_pids(pids: &[u32]) {
+    #[cfg(unix)]
     for &pid in pids {
-        #[cfg(unix)]
         // SAFETY: plain kill(2) on a pid we spawned; no memory involved.
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
-        #[cfg(windows)]
-        {
-            let _ = Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/F"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
     }
+    #[cfg(not(unix))]
+    let _ = pids;
 }
 
 /// Install (once per process) a panic hook that kills every registered
