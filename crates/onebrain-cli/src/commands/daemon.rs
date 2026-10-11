@@ -1483,6 +1483,10 @@ fn inherited_fd_scan_limit() -> libc::c_int {
 /// `two_vault_daemons_coexist…` hang on macOS CI. The same holds for any
 /// production caller that pipes `daemon start`.
 ///
+/// Gap: a descriptor numbered at or above `limit` is not touched — one
+/// above the 65 536 cap, or above a soft `RLIMIT_NOFILE` that was lowered
+/// after it was opened, can still be inherited.
+///
 /// # Safety
 /// Only `fcntl`, which is async-signal-safe: callable from `pre_exec`.
 #[cfg(unix)]
@@ -1495,6 +1499,118 @@ unsafe fn mark_inherited_fds_cloexec(limit: libc::c_int) {
     }
 }
 
+/// Make `cmd`'s child inherit only stdin/stdout/stderr (see
+/// [`mark_inherited_fds_cloexec`]). For detached children that do not need
+/// [`detached_child_setup`]'s session/cwd changes (the hook path's
+/// background embed, `search_reindex::pending_embed_command`).
+#[cfg(all(unix, feature = "semantic"))]
+pub(crate) fn sanitize_inherited_fds(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    let limit = inherited_fd_scan_limit();
+    // SAFETY: the hook only calls fcntl (async-signal-safe), no allocation.
+    unsafe {
+        cmd.pre_exec(move || {
+            mark_inherited_fds_cloexec(limit);
+            Ok(())
+        });
+    }
+}
+
+/// Everything the detached `daemon __run` child does between fork and exec.
+///
+/// # Safety
+/// Runs in the forked child: only async-signal-safe calls — `fcntl`
+/// (descriptor marking), `setsid`, `chdir` — no allocation, no locks.
+/// - every inherited descriptor above stderr is marked close-on-exec
+///   ([`mark_inherited_fds_cloexec`]: #361's leaked-pipe hang).
+/// - setsid(): detaching into a new session makes the child a session leader
+///   with no controlling terminal.
+/// - chdir("/"): a long-lived daemon must not pin the cwd that `daemon start`
+///   happened to run from (which would block that directory from being
+///   unmounted/removed); root is always present.
+#[cfg(unix)]
+unsafe fn detached_child_setup(fd_limit: libc::c_int) -> std::io::Result<()> {
+    mark_inherited_fds_cloexec(fd_limit);
+    nix::unistd::setsid().map_err(std::io::Error::from)?;
+    // `chdir("/")`. We call `libc` directly rather than `nix::unistd::chdir`
+    // because the latter is gated behind nix's `fs` feature, which we don't
+    // enable. `c"/"` is a compile-time NUL-terminated C string, so no
+    // allocation happens inside this async-signal-safe context.
+    if libc::chdir(c"/".as_ptr()) != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The detached `<exe> daemon __run [--vault <v>]` command, fully
+/// configured (stdin null, the given stdout/stderr, [`detached_child_setup`]
+/// in `pre_exec`). The ONLY builder of that command — tests spawn through
+/// it with a probe script as `exe`.
+#[cfg(unix)]
+fn detached_run_command(
+    exe: &Path,
+    vault: Option<&Path>,
+    stdout: std::process::Stdio,
+    stderr: std::process::Stdio,
+) -> std::process::Command {
+    use std::os::unix::process::CommandExt; // for `pre_exec`
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("daemon")
+        .arg("__run")
+        .stdin(std::process::Stdio::null())
+        .stdout(stdout)
+        .stderr(stderr);
+    // Convey the vault to the child EXPLICITLY via `--vault` rather than
+    // mutating `$ONEBRAIN_VAULT` in the parent (unsound/deprecated). The child
+    // still honours `$ONEBRAIN_VAULT` as a fallback when no `--vault` is passed.
+    if let Some(v) = vault {
+        cmd.arg("--vault").arg(v);
+    }
+    let fd_limit = inherited_fd_scan_limit();
+    // SAFETY: `pre_exec` runs in the forked child before exec;
+    // `detached_child_setup` makes only async-signal-safe calls (fcntl,
+    // setsid, chdir) and touches no shared state — the `pre_exec` contract.
+    unsafe {
+        cmd.pre_exec(move || detached_child_setup(fd_limit));
+    }
+    cmd
+}
+
+/// Test probe for #361: open a pipe WITHOUT `FD_CLOEXEC` (what the macOS
+/// race leaves behind), write a script that records whether it can see the
+/// write end, let `spawn` run that script (and wait for it), and return
+/// `"leaked"` or `"clean"`.
+#[cfg(all(test, unix))]
+pub(crate) fn probe_leaked_fd(spawn: impl FnOnce(&Path)) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: plain pipe(2) into a local array; no FD_CLOEXEC on purpose.
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    let out = dir.path().join("out");
+    let script = dir.path().join("probe.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nif [ -e /dev/fd/{w} ]; then r=leaked; else r=clean; fi\necho $r > '{o}.tmp' && mv '{o}.tmp' '{o}'\n",
+            w = fds[1],
+            o = out.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    spawn(&script);
+    // SAFETY: closing the two descriptors opened above.
+    unsafe {
+        libc::close(fds[0]);
+        libc::close(fds[1]);
+    }
+    std::fs::read_to_string(&out)
+        .expect("probe script wrote no result")
+        .trim()
+        .to_string()
+}
+
 /// Spawn `<current-exe> daemon __run` as a detached background process and
 /// return its PID. The child:
 /// - runs in its OWN session ([`setsid`] in a `pre_exec` hook) so it survives
@@ -1502,13 +1618,13 @@ unsafe fn mark_inherited_fds_cloexec(limit: libc::c_int) {
 /// - has stdout+stderr redirected to `log_path` (stdin → `/dev/null`).
 ///
 /// No `unsafe fork`, no libc double-fork — `std::process::Command` does the
-/// `fork`+`exec` for us; we only add `setsid` + the stdio redirection.
+/// `fork`+`exec` for us; we only add [`detached_child_setup`] (fd marking,
+/// `setsid`, `chdir`) + the stdio redirection, via [`detached_run_command`].
 #[cfg(unix)]
 fn spawn_detached_run(log_path: &Path, vault: Option<&Path>) -> Result<u32> {
     use std::fs::OpenOptions;
     use std::os::unix::fs::OpenOptionsExt; // for `.mode(...)`
-    use std::os::unix::process::CommandExt; // for `pre_exec`
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
 
     // Ensure the run dir exists (0700) before opening the log inside it.
     if let Some(parent) = log_path.parent() {
@@ -1544,46 +1660,7 @@ fn spawn_detached_run(log_path: &Path, vault: Option<&Path>) -> Result<u32> {
         .try_clone()
         .context("clone daemon log handle for stderr")?;
 
-    let mut cmd = Command::new(exe);
-    cmd.arg("daemon")
-        .arg("__run")
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err));
-    // Convey the vault to the child EXPLICITLY via `--vault` rather than
-    // mutating `$ONEBRAIN_VAULT` in the parent (unsound/deprecated). The child
-    // still honours `$ONEBRAIN_VAULT` as a fallback when no `--vault` is passed.
-    if let Some(v) = vault {
-        cmd.arg("--vault").arg(v);
-    }
-
-    // SAFETY: `pre_exec` runs in the forked child *before* exec. Both setsid()
-    // and chdir() are async-signal-safe and we touch no shared state (no
-    // allocation, no locks), which is the contract `pre_exec` requires.
-    // - setsid(): detaching into a new session makes the child a session leader
-    //   with no controlling terminal.
-    // - chdir("/"): a long-lived daemon must not pin the cwd that `daemon start`
-    //   happened to run from (which would block that directory from being
-    //   unmounted/removed); root is always present.
-    // - every inherited descriptor above stderr is marked close-on-exec
-    //   (see `mark_inherited_fds_cloexec`: #361's leaked-pipe hang).
-    let fd_limit = inherited_fd_scan_limit();
-    unsafe {
-        cmd.pre_exec(move || {
-            mark_inherited_fds_cloexec(fd_limit);
-            nix::unistd::setsid().map_err(std::io::Error::from)?;
-            // `chdir("/")`. We call `libc` directly rather than
-            // `nix::unistd::chdir` because the latter is gated behind nix's `fs`
-            // feature, which we don't enable (and don't want to pull in just for
-            // one call). `c"/"` is a compile-time NUL-terminated C string, so no
-            // allocation happens inside this async-signal-safe context.
-            if libc::chdir(c"/".as_ptr()) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-
+    let mut cmd = detached_run_command(&exe, vault, Stdio::from(log), Stdio::from(log_err));
     let child = cmd.spawn().context("spawn detached daemon child")?;
     Ok(child.id())
 }
@@ -2255,40 +2332,27 @@ fn init_tracing(log_path: &Path) -> Result<()> {
 mod tests {
     /// #361: a descriptor the parent leaked without `FD_CLOEXEC` (as the
     /// macOS `pipe()`/`FD_CLOEXEC` race does) must not reach the detached
-    /// daemon. Same child spawned twice from one leaked pipe: without the
-    /// `pre_exec` hook it sees the fd (the bug), with it it does not.
+    /// daemon. Spawned through the PRODUCTION builder `detached_run_command`
+    /// (a probe script stands in for the exe); the control spawns the same
+    /// script with a plain `Command` and must see the fd.
     #[cfg(unix)]
     #[test]
     fn detached_child_does_not_inherit_a_leaked_descriptor() {
-        use std::os::unix::process::CommandExt;
-        let mut fds = [0 as libc::c_int; 2];
-        // SAFETY: plain pipe(2) into a local array; no FD_CLOEXEC on purpose.
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let w = fds[1];
-        let sees_fd = |hook: bool| {
-            let mut cmd = std::process::Command::new("/bin/sh");
-            cmd.arg("-c").arg(format!("[ -e /dev/fd/{w} ]"));
-            if hook {
-                let limit = super::inherited_fd_scan_limit();
-                // SAFETY: the hook only calls fcntl (async-signal-safe).
-                unsafe {
-                    cmd.pre_exec(move || {
-                        super::mark_inherited_fds_cloexec(limit);
-                        Ok(())
-                    });
-                }
-            }
-            cmd.status().unwrap().success()
-        };
-        let leaked = sees_fd(false);
-        let hygienic = sees_fd(true);
-        // SAFETY: closing the two descriptors this test opened.
-        unsafe {
-            libc::close(fds[0]);
-            libc::close(fds[1]);
-        }
-        assert!(leaked, "control: a non-CLOEXEC fd is inherited by default");
-        assert!(!hygienic, "the daemon pre_exec hook must drop it");
+        let control = super::probe_leaked_fd(|script| {
+            std::process::Command::new(script).status().unwrap();
+        });
+        assert_eq!(control, "leaked", "control: a non-CLOEXEC fd is inherited");
+        let detached = super::probe_leaked_fd(|script| {
+            super::detached_run_command(
+                script,
+                None,
+                std::process::Stdio::null(),
+                std::process::Stdio::null(),
+            )
+            .status()
+            .unwrap();
+        });
+        assert_eq!(detached, "clean", "the detached daemon must not inherit it");
     }
 
     use super::*;

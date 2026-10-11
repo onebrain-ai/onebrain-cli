@@ -265,16 +265,7 @@ fn emit_detached(mode: &OutputMode, vault_info: crate::output::VaultInfo) -> Res
 /// of detaching again.
 #[cfg(feature = "semantic")]
 fn spawn_detached_pending_embed(vault_flag: Option<&PathBuf>) -> std::io::Result<()> {
-    let exe = std::env::current_exe()?;
-    let mut cmd = std::process::Command::new(exe);
-    cmd.args(["search", "reindex", "--pending-only", "--json"]);
-    if let Some(vault) = vault_flag {
-        cmd.arg("--vault").arg(vault);
-    }
-    cmd.env("ONEBRAIN_EMBED_FOREGROUND", "1")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+    let mut cmd = pending_embed_command(&std::env::current_exe()?, vault_flag);
 
     // Windows detach hardening: nulling the child's OWN stdio isn't enough.
     // Rust spawns Windows children with `bInheritHandles=TRUE`, so the child
@@ -284,15 +275,16 @@ fn spawn_detached_pending_embed(vault_flag: Option<&PathBuf>) -> std::io::Result
     // the reader only sees EOF once EVERY writer handle closes: the inherited
     // copy in the long-lived child keeps that pipe open, so the caller blocks
     // on the CHILD's whole run (re-exec of the big semantic binary + engine
-    // open) instead of returning the instant we detach. Unix avoids this via
-    // `O_CLOEXEC` on pipe fds; Windows has no equivalent by default, so clear
+    // open) instead of returning the instant we detach. On Windows there is
+    // no per-handle default to rely on, so clear
     // the inherit flag on our std handles right before spawning. The child
     // explicitly nulls its own stdio, so it never needs to inherit ours; the
     // parent keeps using its handles normally (the flag only governs
     // inheritance by children spawned afterward). This is what makes the
     // `--pending-only` foreground return provably independent of the detached
     // embed's duration (fixes the Windows-only `pending_only_json_detaches`
-    // >5s timeout).
+    // >5s timeout). (Unix: see `pending_embed_command` — `O_CLOEXEC` alone
+    // is NOT enough on macOS.)
     #[cfg(windows)]
     {
         use std::os::windows::io::AsRawHandle;
@@ -325,6 +317,32 @@ fn spawn_detached_pending_embed(vault_flag: Option<&PathBuf>) -> std::io::Result
 
     cmd.spawn()?;
     Ok(())
+}
+
+/// The detached `<exe> search reindex --pending-only --json [--vault <v>]`
+/// command (stdio nulled, `ONEBRAIN_EMBED_FOREGROUND=1`). On unix every
+/// inherited descriptor above stderr is marked close-on-exec
+/// (`daemon::sanitize_inherited_fds`): std's pipes carry `O_CLOEXEC`, but on
+/// macOS it is set in a second call after `pipe()`, so a fork on another
+/// thread in between inherits the pipe (#361) — and this child outlives its
+/// parent. The ONLY builder of that command; tests spawn through it.
+#[cfg(feature = "semantic")]
+fn pending_embed_command(
+    exe: &std::path::Path,
+    vault_flag: Option<&PathBuf>,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["search", "reindex", "--pending-only", "--json"]);
+    if let Some(vault) = vault_flag {
+        cmd.arg("--vault").arg(vault);
+    }
+    cmd.env("ONEBRAIN_EMBED_FOREGROUND", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    crate::commands::daemon::sanitize_inherited_fds(&mut cmd);
+    cmd
 }
 
 /// Format a fail-open hook-path reindex error in contract style: what
@@ -1154,6 +1172,18 @@ fn render_text(env: &Envelope<ReindexData>) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// #361 sibling: the hook path's detached embed must not inherit a
+    /// descriptor leaked without `FD_CLOEXEC`. Spawned through the
+    /// production builder with a probe script as the exe.
+    #[cfg(all(unix, feature = "semantic"))]
+    #[test]
+    fn pending_embed_child_does_not_inherit_a_leaked_descriptor() {
+        let r = crate::commands::daemon::probe_leaked_fd(|script| {
+            super::pending_embed_command(script, None).status().unwrap();
+        });
+        assert_eq!(r, "clean");
+    }
+
     use super::*;
 
     /// `--force` wipe must remove every index artifact at BOTH candidate
