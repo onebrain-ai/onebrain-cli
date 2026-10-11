@@ -354,6 +354,7 @@ fn tunnel_spec(
     inputs: &InstallInputs,
     cloudflared: &Path,
     token_path: &Path,
+    origin: Option<&str>,
 ) -> anyhow::Result<service_plist::AgentSpec> {
     let auth = if inputs.token_file_supported {
         TunnelAuth::TokenFile(token_path.to_path_buf())
@@ -366,6 +367,7 @@ fn tunnel_spec(
         cloudflared,
         &auth,
         &paths.log_dir,
+        origin,
     ))
 }
 
@@ -393,7 +395,13 @@ pub(crate) fn agents_current(
         let Some(cloudflared) = inputs.cloudflared.as_deref() else {
             return false;
         };
-        match tunnel_spec(paths, inputs, cloudflared, &token_path) {
+        match tunnel_spec(
+            paths,
+            inputs,
+            cloudflared,
+            &token_path,
+            config.tunnel_origin().as_deref(),
+        ) {
             Ok(spec) => expected.push(spec),
             Err(_) => return false,
         }
@@ -463,7 +471,13 @@ pub(crate) fn install_service(
 
     if let (true, Some(cloudflared)) = (tunnel, inputs.cloudflared.as_deref()) {
         let mut tunnel_step = || -> anyhow::Result<()> {
-            let spec = tunnel_spec(paths, inputs, cloudflared, &token_path)?;
+            let spec = tunnel_spec(
+                paths,
+                inputs,
+                cloudflared,
+                &token_path,
+                config.tunnel_origin().as_deref(),
+            )?;
             let plist = write_agent(paths, &spec, launcher)?;
             writeln!(
                 out,
@@ -1333,6 +1347,36 @@ mod tests {
         let mut other = inputs(true, true);
         other.onebrain_exe = PathBuf::from("/elsewhere/onebrain");
         assert!(!agents_current(&paths, &other, &l));
+    }
+
+    /// v3.5.2 B1: a CLI-created tunnel (`tunnel_ingress: local`) gets its
+    /// origin in the tunnel agent; a dashboard tunnel (absent) does not.
+    #[test]
+    fn install_with_local_ingress_passes_the_loopback_origin_to_cloudflared() {
+        let yml = format!("{WITH_VAULT}port: 7801\ntunnel_ingress: local\n");
+        let (_r, paths, _l) = installed(&yml, true);
+        let tn = std::fs::read_to_string(paths.plist("gateway-tunnel")).unwrap();
+        assert!(
+            tn.contains("<string>--url</string>\n        <string>http://127.0.0.1:7801</string>"),
+            "{tn}"
+        );
+
+        let (_r, paths, _l) = installed(WITH_VAULT, true);
+        let tn = std::fs::read_to_string(paths.plist("gateway-tunnel")).unwrap();
+        assert!(!tn.contains("--url"), "{tn}");
+    }
+
+    /// The origin is in the plist, so switching the ingress is drift.
+    #[test]
+    fn agents_current_is_false_after_the_tunnel_ingress_changed() {
+        let (_r, paths, l) = installed(WITH_VAULT, true);
+        assert!(agents_current(&paths, &inputs(true, true), &l));
+        std::fs::write(
+            paths.onebrain_dir.join("gateway.yml"),
+            format!("{WITH_VAULT}tunnel_ingress: local\n"),
+        )
+        .unwrap();
+        assert!(!agents_current(&paths, &inputs(true, true), &l));
     }
 
     #[test]

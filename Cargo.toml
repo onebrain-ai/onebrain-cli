@@ -153,6 +153,10 @@ ratatui   = "0.29"
 # — already in the graph via ratatui, so this adds no new crate.
 unicode-width = "0.2"
 
+# v3.5.2 gateway setup — terminal QR of the connector URL (Unicode half-blocks).
+# No default features: the `image`/`svg` renderers are not needed.
+qrcode    = { version = "0.14", default-features = false }
+
 # Slice 13 — vault-sync (tarball extraction + progress UI + url encoding)
 tar         = "0.4"
 flate2      = "1"

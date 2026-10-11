@@ -30,12 +30,14 @@ pub mod approval_routes;
 pub mod approval_view;
 pub mod audit;
 pub mod auth;
+pub mod cloudflare;
 pub mod config;
 pub mod config_write;
 pub mod health;
 pub mod host_guard;
 pub mod oauth_routes;
 pub mod policy;
+pub mod qr;
 pub mod server;
 pub mod service;
 pub mod service_plist;
@@ -337,6 +339,35 @@ fn pairing_banner(code: &str, stdout_is_tty: bool) -> String {
     }
 }
 
+/// In-memory overrides for one `gateway run` (v3.5.2 `gateway setup` Quick
+/// Tunnel, design D4 / red-team I3): the trycloudflare URL and, on a fresh
+/// HOME, the vault the wizard picked. Never written to `gateway.yml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RunOverrides {
+    pub public_url: Option<String>,
+    pub default_vault: Option<std::path::PathBuf>,
+}
+
+/// The config `gateway run` actually serves: `config` with `overrides`
+/// applied, then the SAME [`validate_gateway_config`] a configured value
+/// gets — an override is never trusted more than `gateway.yml` (an
+/// `http://evil.com` override fails here exactly as it would in the file).
+/// The host guard's allowed-host list and the OAuth issuer are both derived
+/// from the returned `public_url`, so they cannot disagree.
+pub(crate) fn effective_config(
+    mut config: GatewayConfig,
+    overrides: &RunOverrides,
+) -> anyhow::Result<GatewayConfig> {
+    if let Some(url) = &overrides.public_url {
+        config.public_url = Some(url.clone());
+    }
+    if let Some(vault) = &overrides.default_vault {
+        config.default_vault = Some(vault.clone());
+    }
+    validate_gateway_config(&config)?;
+    Ok(config)
+}
+
 /// `onebrain gateway run [--port N]`.
 ///
 /// Loopback hard-coded (`127.0.0.1`) — no bind flag or config key, unlike
@@ -355,7 +386,16 @@ fn pairing_banner(code: &str, stdout_is_tty: bool) -> String {
 /// contract (`gateway listening on http://<bound-addr>/mcp`) that tests
 /// parse regardless of `--json`/`--yaml`. Accepted for signature parity with
 /// the other command handlers, mirroring `serve::run`'s own `_mode` param.
-pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
+pub fn run(mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
+    run_with(mode, port_flag, RunOverrides::default())
+}
+
+/// [`run`] with in-memory [`RunOverrides`] (see [`effective_config`]).
+pub(crate) fn run_with(
+    _mode: &OutputMode,
+    port_flag: Option<u16>,
+    overrides: RunOverrides,
+) -> anyhow::Result<()> {
     // FIRST, before anything that could want to say something: every
     // `tracing` call in the gateway is a no-op until a subscriber exists, and
     // the earliest diagnostics (config warnings, audit/auth store setup) are
@@ -363,11 +403,10 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
     // comment for the full list of decisions that depend on this.
     init_tracing();
 
-    let mut config = load_gateway_config()?;
+    let mut config = effective_config(load_gateway_config()?, &overrides)?;
     let port = port_flag.unwrap_or(config.port);
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let public_url = config.public_url.clone();
-    validate_gateway_config(&config)?;
     // `approval_wait_seconds` above the 270 s ceiling is lowered to it, with a warning.
     if let Some(warning) = config.policy.clamp_approval_wait() {
         tracing::warn!("gateway.yml: {warning}");
@@ -670,6 +709,133 @@ mod tests {
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
+    }
+
+    // ── run overrides (v3.5.2 Quick Tunnel, D4 / red-team I3) ────────────
+
+    const QUICK: &str = "https://ross-amanda-fisher-champion.trycloudflare.com";
+
+    fn configured() -> GatewayConfig {
+        GatewayConfig {
+            default_vault: Some(std::path::PathBuf::from("/configured/vault")),
+            public_url: Some("https://gw.example.com".to_string()),
+            ..GatewayConfig::default()
+        }
+    }
+
+    #[test]
+    fn effective_config_override_replaces_a_configured_public_url_and_vault() {
+        let cfg = effective_config(
+            configured(),
+            &RunOverrides {
+                public_url: Some(QUICK.to_string()),
+                default_vault: Some(std::path::PathBuf::from("/picked")),
+            },
+        )
+        .unwrap();
+        assert_eq!(cfg.public_url.as_deref(), Some(QUICK));
+        assert_eq!(
+            cfg.default_vault.as_deref(),
+            Some(std::path::Path::new("/picked"))
+        );
+    }
+
+    #[test]
+    fn effective_config_without_overrides_keeps_the_file_values() {
+        let cfg = effective_config(configured(), &RunOverrides::default()).unwrap();
+        assert_eq!(cfg.public_url.as_deref(), Some("https://gw.example.com"));
+        assert_eq!(
+            cfg.default_vault.as_deref(),
+            Some(std::path::Path::new("/configured/vault"))
+        );
+        // A fresh HOME: nothing configured, nothing overridden.
+        let cfg = effective_config(GatewayConfig::default(), &RunOverrides::default()).unwrap();
+        assert!(cfg.public_url.is_none() && cfg.default_vault.is_none());
+    }
+
+    /// Security: an override is validated exactly like `gateway.yml`'s
+    /// value — a non-loopback http:// or a header-injecting URL never
+    /// becomes the issuer / allowed host.
+    #[test]
+    fn effective_config_rejects_an_invalid_override() {
+        for bad in [
+            "http://evil.com",
+            "https://evil.example/mcp",
+            "https://a.example\r\nX: y",
+            "https://user@evil.example",
+        ] {
+            let err = effective_config(
+                GatewayConfig::default(),
+                &RunOverrides {
+                    public_url: Some(bad.to_string()),
+                    default_vault: None,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("public_url"), "{bad}: {err}");
+        }
+        // ...and a bad configured value is still caught with no override.
+        let mut cfg = configured();
+        cfg.public_url = Some("http://evil.com".into());
+        assert!(effective_config(cfg, &RunOverrides::default()).is_err());
+    }
+
+    async fn get_discovery(router: &axum::Router, host: &str) -> (u16, String) {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let req = axum::http::Request::builder()
+            .uri("/.well-known/oauth-authorization-server")
+            .header("host", host)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let res = router.clone().oneshot(req).await.unwrap();
+        let status = res.status().as_u16();
+        let body = res.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// The router `run_with` would build from an overridden config (same
+    /// `effective_config` → `GatewayState` → `build_gateway_router` chain,
+    /// issuer via the same `resolve_issuer` call `on_bind` makes): the
+    /// Quick Tunnel host is allowed and is the issuer; the `gateway.yml`
+    /// hostname it replaced is refused.
+    #[tokio::test]
+    async fn run_override_drives_both_the_host_guard_and_the_issuer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("onebrain.yml"), "folders: {}\n").unwrap();
+        let mut file_cfg = configured();
+        file_cfg.default_vault = Some(root.to_path_buf());
+        let cfg = effective_config(
+            file_cfg,
+            &RunOverrides {
+                public_url: Some(QUICK.to_string()),
+                default_vault: None,
+            },
+        )
+        .unwrap();
+        let auth_ctx = Arc::new(AuthCtx::new(
+            AuthStore::open_at(root.join("gateway-auth")).unwrap(),
+        ));
+        auth_ctx
+            .issuer
+            .set(resolve_issuer(cfg.public_url.as_deref(), addr(7717)))
+            .unwrap();
+        let audit = AuditLog::open_at(root.join("audit")).unwrap();
+        let router = build_gateway_router(Arc::new(GatewayState::new(cfg, audit)), auth_ctx);
+
+        let quick_host = QUICK.trim_start_matches("https://");
+        let (status, body) = get_discovery(&router, quick_host).await;
+        assert_eq!(status, 200, "{body}");
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(json["issuer"], QUICK, "{body}");
+
+        let (status, body) = get_discovery(&router, "gw.example.com").await;
+        assert_eq!(
+            status, 403,
+            "the replaced gateway.yml host must be refused: {body}"
+        );
     }
 
     #[test]
