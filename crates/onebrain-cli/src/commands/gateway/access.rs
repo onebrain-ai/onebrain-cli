@@ -82,7 +82,7 @@ pub fn clients_remove(mode: &OutputMode, client_id: &str) -> Result<()> {
     emit(&env, mode, std::io::stdout().lock(), render_clients_remove)
 }
 
-fn open_store() -> Result<AuthStore> {
+pub(crate) fn open_store() -> Result<AuthStore> {
     AuthStore::open().context(HintedError::new(
         "couldn't open the gateway auth store (~/.onebrain/gateway)",
         "check that your home directory is writable, then retry",
@@ -106,7 +106,7 @@ fn store_unwritable() -> HintedError {
 /// Context for a failed locked mutator: a busy `auth.lock` (#428) says so
 /// and names the holder when the sidecar allows; anything else is
 /// [`store_unwritable`]. The `StoreBusy` stays in the chain either way.
-fn store_write_failed(e: anyhow::Error) -> anyhow::Error {
+pub(crate) fn store_write_failed(e: anyhow::Error) -> anyhow::Error {
     let hinted = match store_busy(&e) {
         Some(busy) => HintedError::new(
             busy.to_string(),

@@ -426,7 +426,7 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
     // under an in-progress pairing.
     let pairing_code = auth_store
         .pairing_code()
-        .context("mint/read gateway pairing code")?;
+        .map_err(access::store_write_failed)?;
     {
         use std::io::IsTerminal;
         println!(
@@ -528,16 +528,16 @@ pub fn run(_mode: &OutputMode, port_flag: Option<u16>) -> anyhow::Result<()> {
 /// payload. Accepted for signature parity with `run` and every other verb
 /// handler `dispatch.rs` calls uniformly.
 pub fn pair(_mode: &OutputMode, rotate: bool) -> anyhow::Result<()> {
-    let auth_store = AuthStore::open().context("open gateway auth store")?;
+    let auth_store = access::open_store()?;
     if rotate {
         let code = auth_store
             .rotate_pairing_code()
-            .context("rotate gateway pairing code")?;
+            .map_err(access::store_write_failed)?;
         println!("pairing code rotated: {code}");
     } else {
         let code = auth_store
             .pairing_code()
-            .context("mint/read gateway pairing code")?;
+            .map_err(access::store_write_failed)?;
         println!("pairing code: {code}");
     }
     Ok(())

@@ -436,6 +436,7 @@ pub enum GatewayTokensVerb {
 pub struct GatewayTokensRevokeArgs {
     /// Token id from `onebrain gateway tokens list` (or a unique prefix of at
     /// least 4 characters).
+    #[arg(allow_hyphen_values = true)]
     pub id: Option<String>,
     /// Revoke every token issued to this client id.
     #[arg(long, value_name = "CLIENT_ID")]
@@ -461,6 +462,7 @@ pub enum GatewayClientsVerb {
     /// within about 5 s.
     Remove {
         /// The client id, exactly as shown by `onebrain gateway clients list`.
+        #[arg(allow_hyphen_values = true)]
         client_id: String,
     },
 }
@@ -1669,6 +1671,78 @@ mod tests {
             }) if client_id == "c1"
         ));
         assert!(Cli::try_parse_from(["onebrain", "gateway", "clients", "list"]).is_ok());
+    }
+
+    #[test]
+    fn gateway_ids_may_start_with_a_hyphen() {
+        // All four cases are guarded by `allow_hyphen_values` on the two
+        // positionals (`clients remove <client_id>`, `tokens revoke <id>`):
+        // `--client` / `--family` accept hyphen values only because the
+        // positional `id` in the same command allows them.
+        let parse =
+            |argv: &[&str]| Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        let revoke = |argv: &[&str]| match parse(argv).command {
+            Cmd::Gateway(GatewayCmd {
+                verb:
+                    GatewayVerb::Tokens(GatewayTokensCmd {
+                        verb: GatewayTokensVerb::Revoke(a),
+                    }),
+            }) => a,
+            _ => panic!("expected gateway tokens revoke"),
+        };
+        match parse(&["onebrain", "gateway", "clients", "remove", "-abc123"]).command {
+            Cmd::Gateway(GatewayCmd {
+                verb:
+                    GatewayVerb::Clients(GatewayClientsCmd {
+                        verb: GatewayClientsVerb::Remove { client_id },
+                    }),
+            }) => assert_eq!(client_id, "-abc123"),
+            _ => panic!("expected gateway clients remove"),
+        }
+        let a = revoke(&["onebrain", "gateway", "tokens", "revoke", "-abc1"]);
+        assert_eq!(a.id.as_deref(), Some("-abc1"));
+        let a = revoke(&[
+            "onebrain", "gateway", "tokens", "revoke", "--client", "-abc123",
+        ]);
+        assert_eq!(a.client.as_deref(), Some("-abc123"));
+        let a = revoke(&[
+            "onebrain", "gateway", "tokens", "revoke", "--family", "-fam1",
+        ]);
+        assert_eq!(a.family.as_deref(), Some("-fam1"));
+    }
+
+    #[test]
+    fn gateway_hyphen_ids_keep_help_flags_working() {
+        use clap::error::ErrorKind;
+        for flag in ["--help", "-h"] {
+            let err =
+                Cli::try_parse_from(["onebrain", "gateway", "tokens", "revoke", flag]).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::DisplayHelp, "revoke {flag}");
+            let err = Cli::try_parse_from(["onebrain", "gateway", "clients", "remove", flag])
+                .unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::DisplayHelp, "remove {flag}");
+        }
+    }
+
+    #[test]
+    fn gateway_revoke_client_without_a_value_is_a_clap_error() {
+        // `--client --family` must not parse as client = "--family".
+        let err = Cli::try_parse_from([
+            "onebrain", "gateway", "tokens", "revoke", "--client", "--family",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{err}");
+    }
+
+    #[test]
+    fn gateway_revoke_client_followed_by_a_flag_is_not_silently_a_client_id() {
+        // `--client --family x` must be a usage error, never
+        // "revoke every token of client `--family`".
+        let err = Cli::try_parse_from([
+            "onebrain", "gateway", "tokens", "revoke", "--client", "--family", "x",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{err}");
     }
 
     #[test]
