@@ -852,13 +852,10 @@ fn gateway_ask_once_approval_flow_completes_writes_and_reuses_the_grant() {
     let content1 = std::fs::read_to_string(vault.path().join(&path1))
         .unwrap_or_else(|e| panic!("read captured note {path1}: {e}"));
     assert!(content1.contains("tags: [capture]"), "{content1}");
-    // The note's `# ` heading is derived from the FILENAME slug
-    // (`derive_slug`'s sanitized, lowercased, hyphenated form), not the raw
-    // `title` argument verbatim — matching `server.rs`'s own
-    // `brain_capture_under_auto_policy_creates_a_note_with_frontmatter_and_body`
-    // unit test, which deliberately checks the body text and frontmatter
-    // rather than the heading's exact casing for the same reason.
-    assert!(content1.contains("approval-test-note"), "{content1}");
+    // The note's `# ` heading is the caller's `title` verbatim (#431); the
+    // sanitized slug only names the file.
+    assert!(content1.contains("\n# Approval Test Note\n"), "{content1}");
+    assert!(path1.contains("approval-test-note"), "{path1}");
     assert!(
         content1.contains("captured via the gateway approval e2e flow"),
         "{content1}"

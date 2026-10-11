@@ -29,7 +29,7 @@ pub use delete::{delete_note, DeleteResult};
 pub use find::{find_notes, FindEntry, FindOptions, FindResult, FindType};
 pub use folder::{create_folder, delete_folder, FolderResult};
 pub use list::{list_notes, ListOptions, ListResult, ListSort, NoteEntry};
-pub use new::{new_note, NewResult};
+pub use new::{new_note, new_note_titled, NewResult};
 pub use orphans::{orphans, OrphansData};
 pub use path_out::to_slash;
 pub use r#move::{move_note, MoveResult};
