@@ -54,7 +54,14 @@ fn tunnel_setup_over_piped_stdin_stores_the_token_and_public_url() {
     let bin = fake_cloudflared(root.path());
     // A vault is already configured: this test pins the token/public_url contract.
     std::fs::create_dir_all(home.join(".onebrain")).unwrap();
-    std::fs::write(home.join(".onebrain/gateway.yml"), "default_vault: /v\n").unwrap();
+    let preset = root.path().join("preset-vault");
+    std::fs::create_dir_all(&preset).unwrap();
+    std::fs::write(preset.join("onebrain.yml"), "").unwrap();
+    std::fs::write(
+        home.join(".onebrain/gateway.yml"),
+        format!("default_vault: {}\n", preset.display()),
+    )
+    .unwrap();
     let mut child = onebrain(&home, Some(&bin))
         .args(["gateway", "tunnel", "setup"])
         .stdin(Stdio::piped())

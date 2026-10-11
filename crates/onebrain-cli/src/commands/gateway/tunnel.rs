@@ -250,25 +250,84 @@ fn prompt_line(input: &mut dyn BufRead) -> anyhow::Result<String> {
     Ok(line.trim().to_string())
 }
 
+/// Turn what a user typed or drag-dropped into a path: surrounding quotes
+/// and `\ `-escaped spaces removed, a leading `~` / `~/` expanded against
+/// `home`, a relative result joined onto `cwd`.
+fn clean_vault_input(raw: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
+    let mut t = raw.trim();
+    for q in ['"', '\''] {
+        if t.len() >= 2 && t.starts_with(q) && t.ends_with(q) {
+            t = &t[1..t.len() - 1];
+            break;
+        }
+    }
+    let unescaped = t.replace("\\ ", " ");
+    let expanded = match (unescaped.as_str(), home) {
+        ("~", Some(h)) => h.to_path_buf(),
+        (u, Some(h)) if u.starts_with("~/") => h.join(&u[2..]),
+        (u, _) => PathBuf::from(u),
+    };
+    cwd.join(expanded)
+}
+
+/// Validate `path` is a vault root, then return its canonical, UTF-8 form.
+fn canonical_vault(path: &Path) -> anyhow::Result<PathBuf> {
+    onebrain_core::VaultRoot::from_path(path).map_err(|_| {
+        anyhow::anyhow!(
+            "no onebrain.yml (or vault.yml) in {} - that is not a vault root",
+            path.display()
+        )
+    })?;
+    let canon = std::fs::canonicalize(path)
+        .map_err(|e| anyhow::anyhow!("resolve {}: {e}", path.display()))?;
+    require_utf8(canon)
+}
+
+fn require_utf8(path: PathBuf) -> anyhow::Result<PathBuf> {
+    if path.to_str().is_none() {
+        anyhow::bail!(
+            "the vault path {} is not valid UTF-8 and cannot be stored in gateway.yml",
+            path.display()
+        );
+    }
+    Ok(path)
+}
+
 /// Read-only: choose the vault the gateway serves. The vault found by
-/// walking up from `cwd` is offered (`[Y/n]`, Enter = yes); otherwise (or on
-/// "n") a path is asked for. The path must be a vault root (`onebrain.yml`
-/// or legacy `vault.yml` directly inside). Writes nothing.
+/// walking up from `cwd` is offered (`[Y/n]`, Enter = yes; anything else
+/// than y/yes/n/no re-asks, 3 tries); otherwise (or on "n") a path is asked
+/// for. The path must be a vault root (`onebrain.yml` or legacy `vault.yml`
+/// directly inside); the canonical path is returned. Writes nothing.
 pub(crate) fn pick_vault(
     cwd: &Path,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> anyhow::Result<PathBuf> {
     if let Some(found) = onebrain_core::find_vault_root(cwd) {
-        write!(
-            out,
-            "The gateway needs a vault. Use {}? [Y/n] ",
-            found.as_path().display()
-        )?;
-        out.flush()?;
-        let answer = prompt_line(input)?.to_ascii_lowercase();
-        if answer.is_empty() || answer == "y" || answer == "yes" {
-            return Ok(found.as_path().to_path_buf());
+        let mut accepted = None;
+        for _ in 0..3 {
+            write!(
+                out,
+                "The gateway needs a vault. Use {}? [Y/n] ",
+                found.as_path().display()
+            )?;
+            out.flush()?;
+            match prompt_line(input)?.to_ascii_lowercase().as_str() {
+                "" | "y" | "yes" => {
+                    accepted = Some(true);
+                    break;
+                }
+                "n" | "no" => {
+                    accepted = Some(false);
+                    break;
+                }
+                _ => writeln!(out, "Please answer y or n.")?,
+            }
+        }
+        match accepted {
+            Some(true) => return canonical_vault(found.as_path()),
+            Some(false) => {}
+            None => anyhow::bail!("no valid answer (y or n) after 3 tries"),
         }
     }
     write!(out, "Path to your vault (the folder with onebrain.yml): ")?;
@@ -277,19 +336,13 @@ pub(crate) fn pick_vault(
     if raw.is_empty() {
         anyhow::bail!("no vault path entered");
     }
-    let path = cwd.join(raw);
-    onebrain_core::VaultRoot::from_path(&path)
-        .map(|v| v.as_path().to_path_buf())
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "no onebrain.yml (or vault.yml) in {} - that is not a vault root",
-                path.display()
-            )
-        })
+    let home = crate::home::home_dir().ok();
+    canonical_vault(&clean_vault_input(&raw, cwd, home.as_deref()))
 }
 
-/// The `default_vault` already in `gateway_yml` (returned untouched, no
-/// prompt), else [`pick_vault`] and write it. A service starts in `/`, so a
+/// The `default_vault` already in `gateway_yml` when it is a real vault root
+/// (returned untouched, no prompt); an empty, missing or non-vault value is
+/// reported and replaced via [`pick_vault`]. A service starts in `/`, so a
 /// gateway with no vault answers no tool call.
 pub(crate) fn ensure_default_vault(
     gateway_yml: &Path,
@@ -299,10 +352,24 @@ pub(crate) fn ensure_default_vault(
 ) -> anyhow::Result<PathBuf> {
     let config = super::config::load_gateway_config_at(gateway_yml)?;
     if let Some(existing) = config.default_vault {
-        return Ok(existing);
+        if !existing.as_os_str().is_empty()
+            && onebrain_core::VaultRoot::from_path(&existing).is_ok()
+        {
+            return Ok(existing);
+        }
+        writeln!(
+            out,
+            "default_vault {} is not a vault — choosing again",
+            existing.display()
+        )?;
     }
     let vault = pick_vault(cwd, input, out)?;
-    let value = serde_yaml::Value::String(vault.to_string_lossy().into_owned());
+    let value = serde_yaml::Value::String(
+        vault
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("vault path is not valid UTF-8"))?
+            .to_string(),
+    );
     let mut one = serde_yaml::Mapping::new();
     one.insert("default_vault".into(), value.clone());
     let rendered = serde_yaml::to_string(&serde_yaml::Value::Mapping(one))?;
@@ -810,16 +877,23 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join(".onebrain");
         std::fs::create_dir_all(&dir).unwrap();
+        let v = std::fs::canonicalize(vault_dir(root.path(), "v")).unwrap();
         std::fs::write(
             dir.join("gateway.yml"),
-            "# my notes\ndefault_vault: /v\npublic_url: 'https://old.example.com'\n",
+            format!(
+                "# my notes\ndefault_vault: {}\npublic_url: 'https://old.example.com'\n",
+                v.display()
+            ),
         )
         .unwrap();
         let (r, _) = run(&format!("new.example.com\n{FAKE_TOKEN}\n"), &host(), &dir);
         r.unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.join("gateway.yml")).unwrap(),
-            "# my notes\ndefault_vault: /v\npublic_url: 'https://new.example.com'\n"
+            format!(
+                "# my notes\ndefault_vault: {}\npublic_url: 'https://new.example.com'\n",
+                v.display()
+            )
         );
     }
 
@@ -873,10 +947,11 @@ mod tests {
     fn keeps_an_existing_default_vault_without_prompting() {
         let root = tempfile::tempdir().unwrap();
         let yml = root.path().join("gateway.yml");
-        std::fs::write(&yml, "# c\ndefault_vault: /x\n").unwrap();
+        let v = vault_dir(root.path(), "x");
+        std::fs::write(&yml, format!("# c\ndefault_vault: {}\n", v.display())).unwrap();
         let before = std::fs::read(&yml).unwrap();
         let (r, out) = ensure(&yml, root.path(), "");
-        assert_eq!(r.unwrap(), PathBuf::from("/x"));
+        assert_eq!(r.unwrap(), v);
         assert_eq!(std::fs::read(&yml).unwrap(), before);
         assert!(out.is_empty(), "{out}");
     }
@@ -889,6 +964,7 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         let yml = root.path().join("gateway.yml");
         let (r, _) = ensure(&yml, &sub, "\n");
+        let vault = std::fs::canonicalize(vault).unwrap();
         assert_eq!(r.unwrap(), vault);
         let cfg = super::super::config::load_gateway_config_at(&yml).unwrap();
         assert_eq!(cfg.default_vault, Some(vault));
@@ -902,10 +978,13 @@ mod tests {
         std::fs::create_dir_all(&plain).unwrap();
         let yml = root.path().join("gateway.yml");
         let (r, out) = ensure(&yml, &plain, &format!("{}\n", vault.display()));
-        assert_eq!(r.unwrap(), vault);
+        assert_eq!(r.unwrap(), std::fs::canonicalize(&vault).unwrap());
         assert!(out.contains("Path to your vault"), "{out}");
         let cfg = super::super::config::load_gateway_config_at(&yml).unwrap();
-        assert_eq!(cfg.default_vault, Some(vault));
+        assert_eq!(
+            cfg.default_vault,
+            Some(std::fs::canonicalize(vault).unwrap())
+        );
     }
 
     #[test]
@@ -918,7 +997,7 @@ mod tests {
             &detected,
             &format!("n\n{}\n", other.display()),
         );
-        assert_eq!(r.unwrap(), other);
+        assert_eq!(r.unwrap(), std::fs::canonicalize(other).unwrap());
     }
 
     #[test]
@@ -948,7 +1027,10 @@ mod tests {
         let vault = vault_dir(root.path(), "v");
         let mut input = std::io::Cursor::new(b"\n".to_vec());
         let mut out = Vec::new();
-        assert_eq!(pick_vault(&vault, &mut input, &mut out).unwrap(), vault);
+        assert_eq!(
+            pick_vault(&vault, &mut input, &mut out).unwrap(),
+            std::fs::canonicalize(&vault).unwrap()
+        );
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 
@@ -960,7 +1042,10 @@ mod tests {
         let (r, _) = ensure(&yml, &vault, "\n");
         r.unwrap();
         let cfg = super::super::config::load_gateway_config_at(&yml).unwrap();
-        assert_eq!(cfg.default_vault, Some(vault));
+        assert_eq!(
+            cfg.default_vault,
+            Some(std::fs::canonicalize(vault).unwrap())
+        );
     }
 
     #[test]
@@ -988,5 +1073,98 @@ mod tests {
         assert!(r.is_err());
         assert!(!tunnel_token_path(&dir).exists());
         assert!(!dir.join("gateway.yml").exists());
+    }
+
+    #[test]
+    fn clean_vault_input_strips_quotes_unescapes_spaces_and_expands_tilde() {
+        let cwd = Path::new("/cwd");
+        let home = Some(Path::new("/h"));
+        let c = |raw: &str| clean_vault_input(raw, cwd, home);
+        assert_eq!(c("'/a/my vault'"), PathBuf::from("/a/my vault"));
+        assert_eq!(c("\"/a/my vault\""), PathBuf::from("/a/my vault"));
+        assert_eq!(c("/a/my\\ vault"), PathBuf::from("/a/my vault"));
+        assert_eq!(c("~/notes"), PathBuf::from("/h/notes"));
+        assert_eq!(c("~"), PathBuf::from("/h"));
+        assert_eq!(c("rel/v"), PathBuf::from("/cwd/rel/v"));
+        assert_eq!(
+            clean_vault_input("~/n", cwd, None),
+            PathBuf::from("/cwd/~/n")
+        );
+    }
+
+    #[test]
+    fn a_quoted_drag_dropped_path_is_accepted_and_canonicalised() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = vault_dir(root.path(), "my vault");
+        let plain = root.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        let (r, _) = ensure(
+            &root.path().join("gateway.yml"),
+            &plain,
+            &format!("'{}'\n", vault.display()),
+        );
+        assert_eq!(r.unwrap(), std::fs::canonicalize(&vault).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_stored_vault_path_is_canonical_through_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = vault_dir(root.path(), "real");
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&vault, &link).unwrap();
+        let (r, _) = ensure(&root.path().join("gateway.yml"), root.path(), "link\n");
+        assert_eq!(r.unwrap(), std::fs::canonicalize(&vault).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_vault_path_is_rejected_with_a_clear_error() {
+        use std::os::unix::ffi::OsStrExt;
+        // APFS refuses non-UTF-8 names, so test the check on a bare path.
+        let bad = PathBuf::from(std::ffi::OsStr::from_bytes(b"/v\xff"));
+        let err = require_utf8(bad).unwrap_err().to_string();
+        assert!(err.contains("not valid UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn an_unrecognised_yes_no_answer_reasks_then_accepts() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = vault_dir(root.path(), "v");
+        let (r, out) = ensure(&root.path().join("gateway.yml"), &vault, "maybe\nyes\n");
+        assert_eq!(r.unwrap(), std::fs::canonicalize(&vault).unwrap());
+        assert!(out.contains("Please answer y or n."), "{out}");
+    }
+
+    #[test]
+    fn three_unrecognised_answers_is_an_error_and_writes_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = vault_dir(root.path(), "v");
+        let yml = root.path().join("gateway.yml");
+        let (r, _) = ensure(&yml, &vault, "a\nb\nc\n/tmp\n");
+        assert!(format!("{:#}", r.unwrap_err()).contains("3 tries"));
+        assert!(!yml.exists());
+    }
+
+    #[test]
+    fn an_invalid_existing_default_vault_is_reported_and_replaced() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = vault_dir(root.path(), "v");
+        let not_vault = root.path().join("plain");
+        std::fs::create_dir_all(&not_vault).unwrap();
+        for bad in [
+            "''".to_string(),
+            "/definitely/missing".to_string(),
+            format!("'{}'", not_vault.display()),
+        ] {
+            let yml = root.path().join("gateway.yml");
+            std::fs::write(&yml, format!("default_vault: {bad}\n")).unwrap();
+            let (r, out) = ensure(&yml, &vault, "\n");
+            let want = std::fs::canonicalize(&vault).unwrap();
+            assert_eq!(r.unwrap(), want, "{bad}");
+            assert!(out.contains("is not a vault — choosing again"), "{out}");
+            let cfg = super::super::config::load_gateway_config_at(&yml).unwrap();
+            assert_eq!(cfg.default_vault, Some(want));
+        }
     }
 }

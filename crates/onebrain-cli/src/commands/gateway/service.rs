@@ -128,26 +128,74 @@ pub(crate) struct InstallInputs {
     /// Print the finish block (connector URL, pairing code, log path).
     /// The setup wizard prints its own and passes `false`.
     pub print_finish: bool,
+    /// Set by [`system_install_inputs`] when the chosen exe path is fragile
+    /// (a versioned Homebrew path). Informational; `install_service` ignores it.
+    pub exe_warning: Option<String>,
 }
 
+/// Printed in place of the pairing code when `auth.lock` stayed held.
+pub(crate) const PAIRING_BUSY_LINE: &str =
+    "Pairing code: the auth store is busy — run `onebrain gateway pair` in a moment";
+
 /// The finish block: connector URL, then the pairing code (or where to get
-/// it). `public_url` `None` = local-only, so the loopback URL.
+/// it). With a `public_url` the URL is the one for the Claude app; without
+/// one only the loopback URL exists, which the app cannot reach, so it is
+/// labelled local and a tunnel is suggested.
 pub(crate) fn finish_lines(
     public_url: Option<&str>,
     port: u16,
     pairing_code: Option<&str>,
 ) -> Vec<String> {
-    let url = match public_url {
-        Some(u) => format!("{}/mcp", u.trim_end_matches('/')),
-        None => format!("http://127.0.0.1:{port}/mcp"),
+    let pairing = match pairing_code {
+        Some(code) => format!("Pairing code: {code}  (rotate: onebrain gateway pair --rotate)"),
+        None => "Pairing code: run `onebrain gateway pair`".to_string(),
     };
-    vec![
-        format!("Connector URL for the Claude app: {url}"),
-        match pairing_code {
-            Some(code) => format!("Pairing code: {code}  (rotate: onebrain gateway pair --rotate)"),
-            None => "Pairing code: run `onebrain gateway pair`".to_string(),
-        },
-    ]
+    match public_url {
+        Some(u) => vec![
+            format!(
+                "Connector URL for the Claude app: {}/mcp",
+                u.trim_end_matches('/')
+            ),
+            pairing,
+        ],
+        None => vec![
+            format!("Local MCP URL (this Mac only): http://127.0.0.1:{port}/mcp"),
+            "For the Claude app on your phone, set up a tunnel: onebrain gateway tunnel setup"
+                .to_string(),
+            pairing,
+        ],
+    }
+}
+
+/// What the pairing-code lookup found.
+#[derive(Debug, PartialEq)]
+pub(crate) enum PairingLookup {
+    Code(String),
+    Busy,
+    Unavailable,
+}
+
+pub(crate) fn lookup_pairing(store: &super::auth::AuthStore) -> PairingLookup {
+    match store.pairing_code() {
+        Ok(code) => PairingLookup::Code(code),
+        Err(e) if super::auth::store::is_store_busy(&e) => PairingLookup::Busy,
+        Err(_) => PairingLookup::Unavailable,
+    }
+}
+
+/// [`finish_lines`] for a lookup result; a busy store says why.
+fn finish_block(public_url: Option<&str>, port: u16, pairing: &PairingLookup) -> Vec<String> {
+    let code = match pairing {
+        PairingLookup::Code(c) => Some(c.as_str()),
+        _ => None,
+    };
+    let mut lines = finish_lines(public_url, port, code);
+    if *pairing == PairingLookup::Busy {
+        if let Some(l) = lines.iter_mut().find(|l| l.starts_with("Pairing code:")) {
+            *l = PAIRING_BUSY_LINE.to_string();
+        }
+    }
+    lines
 }
 
 fn hinted(plain: impl Into<String>, hint: impl Into<String>) -> anyhow::Error {
@@ -321,9 +369,11 @@ fn tunnel_spec(
     ))
 }
 
-/// True when every agent `install_service` would write is loaded and its
-/// plist on disk is byte-identical to a fresh render, and no unwanted tunnel
-/// agent lingers. Any doubt (unreadable config, render error) is `false`.
+/// True = both agents are loaded and their plists match a fresh render (and
+/// no unwanted tunnel agent lingers; any doubt such as an unreadable config
+/// is `false`). It does NOT mean the running gateway has the current
+/// gateway.yml / tunnel token (those are not in the plist) and it does not
+/// probe health - callers that wrote config must reinstall.
 #[allow(dead_code)] // consumed by the gateway setup wizard (v3.5.2 T4)
 pub(crate) fn agents_current(
     paths: &ServicePaths,
@@ -374,7 +424,10 @@ pub(crate) fn install_service(
     if config.default_vault.is_none() && config.vaults.is_empty() {
         return Err(hinted(
             "gateway.yml names no vault — as a service the gateway starts in `/`, so no tool call could find one",
-            format!("add `default_vault: /path/to/your/vault` to {}", gateway_yml.display()),
+            format!(
+                "run `onebrain gateway tunnel setup` (it asks for the vault and writes it), or add `default_vault: /path/to/your/vault` to {}",
+                gateway_yml.display()
+            ),
         ));
     }
 
@@ -487,16 +540,14 @@ pub(crate) fn install_service(
         writeln!(out, "✓ gateway answering on 127.0.0.1:{}", config.port)?;
     }
     if inputs.print_finish {
-        // A busy or unreadable store degrades to the "run pair" line.
-        let code = inputs
-            .show_pairing_code
-            .then(|| {
-                super::auth::AuthStore::open_at(paths.onebrain_dir.join("gateway"))
-                    .and_then(|s| s.pairing_code())
-                    .ok()
-            })
-            .flatten();
-        for line in finish_lines(config.public_url.as_deref(), config.port, code.as_deref()) {
+        // A busy or unreadable store degrades to a "run pair" line.
+        let pairing = if inputs.show_pairing_code {
+            super::auth::AuthStore::open_at(paths.onebrain_dir.join("gateway"))
+                .map_or(PairingLookup::Unavailable, |s| lookup_pairing(&s))
+        } else {
+            PairingLookup::Unavailable
+        };
+        for line in finish_block(config.public_url.as_deref(), config.port, &pairing) {
             writeln!(out, "{line}")?;
         }
         writeln!(out, "Logs: {}", paths.log_dir.join("gateway.log").display())?;
@@ -525,7 +576,8 @@ fn home() -> anyhow::Result<PathBuf> {
 }
 
 /// The machine-derived [`InstallInputs`] for a real install (cloudflared on
-/// PATH, token-file probe, exe choice). Prints the exe line / warning.
+/// PATH, token-file probe, exe choice). Silent: the caller prints
+/// `exe_warning` (and the chosen exe) if it wants to.
 pub(crate) fn system_install_inputs() -> anyhow::Result<InstallInputs> {
     use std::io::IsTerminal;
     let cloudflared = which::which("cloudflared").ok();
@@ -537,10 +589,6 @@ pub(crate) fn system_install_inputs() -> anyhow::Result<InstallInputs> {
     let current = std::env::current_exe().context("resolve the onebrain binary path")?;
     let (onebrain_exe, exe_warning) =
         choose_onebrain_exe(&current, which::which("onebrain").ok().as_deref());
-    if let Some(w) = exe_warning {
-        eprintln!("⚠ {w}");
-    }
-    println!("gateway agent program: {}", onebrain_exe.display());
     Ok(InstallInputs {
         onebrain_exe,
         cloudflared,
@@ -548,6 +596,7 @@ pub(crate) fn system_install_inputs() -> anyhow::Result<InstallInputs> {
         wait_for_up: activate.then_some(Duration::from_secs(10)),
         show_pairing_code: std::io::stdout().is_terminal(),
         print_finish: true,
+        exe_warning,
     })
 }
 
@@ -558,6 +607,10 @@ pub fn service_install(_mode: &crate::output::OutputMode) -> anyhow::Result<()> 
     }
     let paths = ServicePaths::for_home(&home()?);
     let inputs = system_install_inputs()?;
+    if let Some(w) = &inputs.exe_warning {
+        eprintln!("⚠ {w}");
+    }
+    println!("gateway agent program: {}", inputs.onebrain_exe.display());
     install_service(
         &paths,
         &inputs,
@@ -668,6 +721,7 @@ mod tests {
             wait_for_up: Some(Duration::from_millis(200)),
             show_pairing_code: false,
             print_finish: true,
+            exe_warning: None,
         }
     }
 
@@ -1150,9 +1204,17 @@ mod tests {
         let without = finish_lines(None, 7717, None);
         assert_eq!(
             without[0],
-            "Connector URL for the Claude app: http://127.0.0.1:7717/mcp"
+            "Local MCP URL (this Mac only): http://127.0.0.1:7717/mcp"
         );
-        assert_eq!(without[1], "Pairing code: run `onebrain gateway pair`");
+        assert!(
+            without[1].contains("onebrain gateway tunnel setup"),
+            "{without:?}"
+        );
+        assert_eq!(without[2], "Pairing code: run `onebrain gateway pair`");
+        assert!(
+            !without.iter().any(|l| l.contains("for the Claude app:")),
+            "{without:?}"
+        );
     }
 
     #[test]
@@ -1171,7 +1233,67 @@ mod tests {
         assert!(code.len() >= 8, "{code}");
         let hidden = install_text(false, true);
         assert!(hidden.contains("run `onebrain gateway pair`"), "{hidden}");
-        assert!(!hidden.contains(code), "{hidden}");
+    }
+
+    #[test]
+    fn a_code_minted_in_the_same_store_is_shown_only_when_asked() {
+        let (_r, paths) = home_with("default_vault: /v\nport: 7799\n", false);
+        let minted =
+            crate::commands::gateway::auth::AuthStore::open_at(paths.onebrain_dir.join("gateway"))
+                .unwrap()
+                .pairing_code()
+                .unwrap();
+        let run = |show: bool| {
+            let l = FakeLauncher::default();
+            let mut i = inputs(false, false);
+            i.show_pairing_code = show;
+            let mut out = Vec::new();
+            install_service(&paths, &i, &l, &UpAfterBootstrap(&l), &mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        assert!(run(true).contains(&minted));
+        let hidden = run(false);
+        assert!(!hidden.contains(&minted), "{hidden}");
+        assert!(hidden.contains("run `onebrain gateway pair`"), "{hidden}");
+    }
+
+    #[test]
+    fn a_busy_auth_store_gets_a_line_that_says_why() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::commands::gateway::auth::AuthStore::open_at(root.path().join("g"))
+            .unwrap()
+            .with_lock_wait(Duration::from_millis(50));
+        let held = store.lock_exclusive().unwrap();
+        let found = lookup_pairing(&store);
+        assert_eq!(found, PairingLookup::Busy);
+        let lines = finish_block(Some("https://b.example.com"), 7717, &found);
+        assert!(lines.contains(&PAIRING_BUSY_LINE.to_string()), "{lines:?}");
+        assert!(PAIRING_BUSY_LINE.contains("busy"));
+        drop(held);
+        assert!(matches!(lookup_pairing(&store), PairingLookup::Code(_)));
+    }
+
+    #[test]
+    fn no_vault_hint_points_at_tunnel_setup() {
+        let (_r, paths) = home_with("port: 7799\n", false);
+        let l = FakeLauncher::default();
+        let err = install_service(
+            &paths,
+            &inputs(false, false),
+            &l,
+            &FakeHttp { up: false },
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        let h = err
+            .downcast_ref::<crate::output::HintedError>()
+            .expect("HintedError");
+        assert!(
+            h.hint.contains("onebrain gateway tunnel setup"),
+            "{}",
+            h.hint
+        );
+        assert!(h.hint.contains("default_vault:"), "{}", h.hint);
     }
 
     #[test]
