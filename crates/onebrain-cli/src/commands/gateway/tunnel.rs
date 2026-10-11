@@ -270,17 +270,43 @@ fn clean_vault_input(raw: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
     cwd.join(expanded)
 }
 
-/// Validate `path` is a vault root, then return its canonical, UTF-8 form.
-fn canonical_vault(path: &Path) -> anyhow::Result<PathBuf> {
+/// Fold `.` and `..` components without touching the filesystem (no symlink
+/// resolution, no Windows `\\?\` verbatim prefix). `..` at the root stays at
+/// the root.
+fn normalize_lexically(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !matches!(
+                    out.components().next_back(),
+                    Some(Component::RootDir | Component::Prefix(_))
+                ) {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Lexically normalise `path`, validate it is a vault root, and return that
+/// exact UTF-8 path (symlinks are kept as given).
+fn normalized_vault(path: &Path) -> anyhow::Result<PathBuf> {
+    let path = normalize_lexically(path);
+    let path = path.as_path();
     onebrain_core::VaultRoot::from_path(path).map_err(|_| {
         anyhow::anyhow!(
             "no onebrain.yml (or vault.yml) in {} - that is not a vault root",
             path.display()
         )
     })?;
-    let canon = std::fs::canonicalize(path)
-        .map_err(|e| anyhow::anyhow!("resolve {}: {e}", path.display()))?;
-    require_utf8(canon)
+    require_utf8(path.to_path_buf())
 }
 
 fn require_utf8(path: PathBuf) -> anyhow::Result<PathBuf> {
@@ -297,7 +323,7 @@ fn require_utf8(path: PathBuf) -> anyhow::Result<PathBuf> {
 /// walking up from `cwd` is offered (`[Y/n]`, Enter = yes; anything else
 /// than y/yes/n/no re-asks, 3 tries); otherwise (or on "n") a path is asked
 /// for. The path must be a vault root (`onebrain.yml` or legacy `vault.yml`
-/// directly inside); the canonical path is returned. Writes nothing.
+/// directly inside); the lexically normalised path is returned. Writes nothing.
 pub(crate) fn pick_vault(
     cwd: &Path,
     input: &mut dyn BufRead,
@@ -325,7 +351,7 @@ pub(crate) fn pick_vault(
             }
         }
         match accepted {
-            Some(true) => return canonical_vault(found.as_path()),
+            Some(true) => return normalized_vault(found.as_path()),
             Some(false) => {}
             None => anyhow::bail!("no valid answer (y or n) after 3 tries"),
         }
@@ -337,7 +363,7 @@ pub(crate) fn pick_vault(
         anyhow::bail!("no vault path entered");
     }
     let home = crate::home::home_dir().ok();
-    canonical_vault(&clean_vault_input(&raw, cwd, home.as_deref()))
+    normalized_vault(&clean_vault_input(&raw, cwd, home.as_deref()))
 }
 
 /// The `default_vault` already in `gateway_yml` when it is a real vault root
@@ -877,7 +903,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join(".onebrain");
         std::fs::create_dir_all(&dir).unwrap();
-        let v = std::fs::canonicalize(vault_dir(root.path(), "v")).unwrap();
+        let v = vault_dir(root.path(), "v");
         std::fs::write(
             dir.join("gateway.yml"),
             format!(
@@ -964,7 +990,6 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
         let yml = root.path().join("gateway.yml");
         let (r, _) = ensure(&yml, &sub, "\n");
-        let vault = std::fs::canonicalize(vault).unwrap();
         assert_eq!(r.unwrap(), vault);
         let cfg = super::super::config::load_gateway_config_at(&yml).unwrap();
         assert_eq!(cfg.default_vault, Some(vault));
@@ -978,13 +1003,10 @@ mod tests {
         std::fs::create_dir_all(&plain).unwrap();
         let yml = root.path().join("gateway.yml");
         let (r, out) = ensure(&yml, &plain, &format!("{}\n", vault.display()));
-        assert_eq!(r.unwrap(), std::fs::canonicalize(&vault).unwrap());
+        assert_eq!(r.unwrap(), vault.clone());
         assert!(out.contains("Path to your vault"), "{out}");
         let cfg = super::super::config::load_gateway_config_at(&yml).unwrap();
-        assert_eq!(
-            cfg.default_vault,
-            Some(std::fs::canonicalize(vault).unwrap())
-        );
+        assert_eq!(cfg.default_vault, Some(vault.clone()));
     }
 
     #[test]
@@ -997,7 +1019,7 @@ mod tests {
             &detected,
             &format!("n\n{}\n", other.display()),
         );
-        assert_eq!(r.unwrap(), std::fs::canonicalize(other).unwrap());
+        assert_eq!(r.unwrap(), other.clone());
     }
 
     #[test]
@@ -1029,7 +1051,7 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(
             pick_vault(&vault, &mut input, &mut out).unwrap(),
-            std::fs::canonicalize(&vault).unwrap()
+            vault.clone()
         );
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
@@ -1042,10 +1064,7 @@ mod tests {
         let (r, _) = ensure(&yml, &vault, "\n");
         r.unwrap();
         let cfg = super::super::config::load_gateway_config_at(&yml).unwrap();
-        assert_eq!(
-            cfg.default_vault,
-            Some(std::fs::canonicalize(vault).unwrap())
-        );
+        assert_eq!(cfg.default_vault, Some(vault.clone()));
     }
 
     #[test]
@@ -1103,18 +1122,47 @@ mod tests {
             &plain,
             &format!("'{}'\n", vault.display()),
         );
-        assert_eq!(r.unwrap(), std::fs::canonicalize(&vault).unwrap());
+        assert_eq!(r.unwrap(), vault.clone());
+    }
+
+    #[test]
+    fn a_dotdot_input_is_stored_normalised() {
+        let root = tempfile::tempdir().unwrap();
+        let vault = vault_dir(root.path(), "v");
+        std::fs::create_dir_all(root.path().join("x")).unwrap();
+        let (r, _) = ensure(&root.path().join("gateway.yml"), root.path(), "x/../v/./\n");
+        assert_eq!(r.unwrap(), vault);
     }
 
     #[cfg(unix)]
     #[test]
-    fn the_stored_vault_path_is_canonical_through_a_symlink() {
+    fn a_symlinked_vault_path_is_stored_as_given() {
         let root = tempfile::tempdir().unwrap();
         let vault = vault_dir(root.path(), "real");
         let link = root.path().join("link");
         std::os::unix::fs::symlink(&vault, &link).unwrap();
         let (r, _) = ensure(&root.path().join("gateway.yml"), root.path(), "link\n");
-        assert_eq!(r.unwrap(), std::fs::canonicalize(&vault).unwrap());
+        assert_eq!(r.unwrap(), link);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normalize_lexically_folds_dots_without_the_filesystem() {
+        let n = |s: &str| normalize_lexically(Path::new(s));
+        assert_eq!(n("/a/b/../c"), PathBuf::from("/a/c"));
+        assert_eq!(n("/a/./b"), PathBuf::from("/a/b"));
+        assert_eq!(n("/.."), PathBuf::from("/"));
+        assert_eq!(n("/a/../../b"), PathBuf::from("/b"));
+        assert_eq!(n("/nonexistent/x/.."), PathBuf::from("/nonexistent"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalize_lexically_keeps_the_windows_prefix() {
+        assert_eq!(
+            normalize_lexically(Path::new(r"C:\a\..\b")),
+            PathBuf::from(r"C:\b")
+        );
     }
 
     #[cfg(unix)]
@@ -1132,7 +1180,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let vault = vault_dir(root.path(), "v");
         let (r, out) = ensure(&root.path().join("gateway.yml"), &vault, "maybe\nyes\n");
-        assert_eq!(r.unwrap(), std::fs::canonicalize(&vault).unwrap());
+        assert_eq!(r.unwrap(), vault.clone());
         assert!(out.contains("Please answer y or n."), "{out}");
     }
 
@@ -1160,7 +1208,7 @@ mod tests {
             let yml = root.path().join("gateway.yml");
             std::fs::write(&yml, format!("default_vault: {bad}\n")).unwrap();
             let (r, out) = ensure(&yml, &vault, "\n");
-            let want = std::fs::canonicalize(&vault).unwrap();
+            let want = vault.clone();
             assert_eq!(r.unwrap(), want, "{bad}");
             assert!(out.contains("is not a vault — choosing again"), "{out}");
             let cfg = super::super::config::load_gateway_config_at(&yml).unwrap();
