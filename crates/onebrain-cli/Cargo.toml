@@ -92,6 +92,8 @@ schemars           = "1.2.1"
 # (pulled by `onebrain-fs` — pure Rust, no `-sys` crates), so this only
 # promotes an existing transitive dep to direct rather than adding a new one.
 globset            = { workspace = true }
+# v3.5.2 `gateway setup` — terminal QR of the connector URL (D10).
+qrcode             = { workspace = true }
 # The session token (server::token) sources its bytes from `getrandom` (above)
 # and hex-encodes them with a hand-rolled 1-liner rather than pulling the `hex`
 # crate — a 32-char encode isn't worth a new dependency.

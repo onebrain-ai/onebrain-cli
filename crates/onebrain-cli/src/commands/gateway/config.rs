@@ -76,6 +76,18 @@ impl std::fmt::Debug for TelegramConfig {
     }
 }
 
+/// Where the tunnel's ingress (hostname → origin mapping) lives (v3.5.2,
+/// red-team B1). Absent = the tunnel was made in the Cloudflare dashboard,
+/// which holds the ingress remotely: `cloudflared tunnel run` needs only the
+/// token. `local` = a CLI-created (locally managed) tunnel with no remote
+/// ingress: `cloudflared` must be told the origin with
+/// `--url http://127.0.0.1:<port>` or every request answers 503.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TunnelIngress {
+    Local,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayConfig {
     /// Loopback port to serve on. 0 = OS-assigned ephemeral port.
@@ -115,6 +127,21 @@ pub struct GatewayConfig {
     /// deserialize.
     #[serde(default)]
     pub telegram: TelegramConfig,
+    /// See [`TunnelIngress`]. `None` (absent) keeps every tunnel command
+    /// byte-identical to the dashboard-tunnel shape of v3.5.0/3.5.1.
+    #[serde(default)]
+    pub tunnel_ingress: Option<TunnelIngress>,
+}
+
+impl GatewayConfig {
+    /// The loopback origin `cloudflared` must be given with `--url`, or
+    /// `None` when the tunnel's ingress lives in the dashboard. Always
+    /// `127.0.0.1`, never `localhost` (red-team item 9: the gateway binds
+    /// only IPv4 loopback; a resolver trying `::1` first would 502).
+    pub(crate) fn tunnel_origin(&self) -> Option<String> {
+        self.tunnel_ingress
+            .map(|TunnelIngress::Local| format!("http://127.0.0.1:{}", self.port))
+    }
 }
 
 fn default_gateway_port() -> u16 {
@@ -130,6 +157,7 @@ impl Default for GatewayConfig {
             public_url: None,
             policy: PolicyConfig::default(),
             telegram: TelegramConfig::default(),
+            tunnel_ingress: None,
         }
     }
 }
@@ -352,6 +380,24 @@ mod tests {
             gateway_config_path().unwrap(),
             d.path().join(".onebrain").join("gateway.yml"),
         );
+    }
+
+    #[test]
+    fn tunnel_ingress_parses_local_defaults_to_none_and_rejects_other_values() {
+        let local: GatewayConfig =
+            serde_yaml::from_str("port: 8123\ntunnel_ingress: local\n").unwrap();
+        assert_eq!(local.tunnel_ingress, Some(TunnelIngress::Local));
+        assert_eq!(
+            local.tunnel_origin().as_deref(),
+            Some("http://127.0.0.1:8123")
+        );
+
+        let absent: GatewayConfig = serde_yaml::from_str("port: 8123\n").unwrap();
+        assert_eq!(absent.tunnel_ingress, None);
+        assert_eq!(absent.tunnel_origin(), None);
+        assert_eq!(GatewayConfig::default().tunnel_origin(), None);
+
+        assert!(serde_yaml::from_str::<GatewayConfig>("tunnel_ingress: remote\n").is_err());
     }
 
     #[test]

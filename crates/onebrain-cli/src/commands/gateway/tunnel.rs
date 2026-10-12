@@ -519,35 +519,57 @@ pub(crate) fn run_tunnel_setup(
             "Next: onebrain gateway service install   (starts - or restarts - the gateway and the tunnel)"
         )?;
     } else {
-        writeln!(
-            out,
-            "Next, keep these two running (restart a running `gateway run` so it picks up public_url):"
-        )?;
-        writeln!(out, "  onebrain gateway run")?;
-        if token_file_supported {
-            writeln!(
-                out,
-                "  {} tunnel --no-autoupdate --protocol http2 run --token-file {}",
-                cloudflared.display(),
-                token_path.display()
-            )?;
-        } else {
-            writeln!(
-                out,
-                "  (this cloudflared has no --token-file; `brew upgrade cloudflared` or the system package manager adds it)"
-            )?;
-            writeln!(
-                out,
-                "  TUNNEL_TOKEN=$(cat {}) {} tunnel --no-autoupdate --protocol http2 run",
-                token_path.display(),
-                cloudflared.display()
-            )?;
+        for line in manual_run_lines(
+            &cloudflared,
+            &token_path,
+            token_file_supported,
+            config.tunnel_origin().as_deref(),
+        ) {
+            writeln!(out, "{line}")?;
         }
     }
     Ok(TunnelSetupOutcome {
         public_url,
         token_file_supported,
     })
+}
+
+/// Where no service manager is supported (Linux / Windows today, design
+/// D9): the two commands the operator keeps running instead. Never contains
+/// the token itself — the env-token variant reads it from the file at run
+/// time. `origin` (`GatewayConfig::tunnel_origin`, red-team B1) appends
+/// `--url <origin>` for a CLI-created tunnel; `None` (a dashboard tunnel)
+/// prints exactly the v3.5.0 lines.
+pub(crate) fn manual_run_lines(
+    cloudflared: &Path,
+    token_path: &Path,
+    token_file_supported: bool,
+    origin: Option<&str>,
+) -> Vec<String> {
+    let url = origin.map(|o| format!(" --url {o}")).unwrap_or_default();
+    let mut lines = vec![
+        "Next, keep these two running (restart a running `gateway run` so it picks up public_url):"
+            .to_string(),
+        "  onebrain gateway run".to_string(),
+    ];
+    if token_file_supported {
+        lines.push(format!(
+            "  {} tunnel --no-autoupdate --protocol http2 run --token-file {}{url}",
+            cloudflared.display(),
+            token_path.display()
+        ));
+    } else {
+        lines.push(
+            "  (this cloudflared has no --token-file; `brew upgrade cloudflared` or the system package manager adds it)"
+                .to_string(),
+        );
+        lines.push(format!(
+            "  TUNNEL_TOKEN=$(cat {}) {} tunnel --no-autoupdate --protocol http2 run{url}",
+            token_path.display(),
+            cloudflared.display()
+        ));
+    }
+    lines
 }
 
 /// `onebrain gateway tunnel setup`.
@@ -1214,5 +1236,70 @@ mod tests {
             let cfg = super::super::config::load_gateway_config_at(&yml).unwrap();
             assert_eq!(cfg.default_vault, Some(want));
         }
+    }
+
+    /// Golden: the dashboard-tunnel lines are exactly the v3.5.0 text; a
+    /// CLI-created tunnel (B1) appends `--url <origin>` to the cloudflared
+    /// line in both auth shapes. The token never appears (only its path).
+    #[test]
+    fn manual_run_lines_golden_dashboard_and_local_ingress() {
+        let cf = Path::new("/usr/bin/cloudflared");
+        let tok = Path::new("/h/.onebrain/gateway/tunnel.token");
+        let head = [
+            "Next, keep these two running (restart a running `gateway run` so it picks up public_url):",
+            "  onebrain gateway run",
+        ];
+        let file_line = format!(
+            "  {} tunnel --no-autoupdate --protocol http2 run --token-file {}",
+            cf.display(),
+            tok.display()
+        );
+        let env_line = format!(
+            "  TUNNEL_TOKEN=$(cat {}) {} tunnel --no-autoupdate --protocol http2 run",
+            tok.display(),
+            cf.display()
+        );
+        assert_eq!(
+            manual_run_lines(cf, tok, true, None),
+            [head[0], head[1], file_line.as_str()]
+        );
+        assert_eq!(
+            manual_run_lines(cf, tok, true, Some("http://127.0.0.1:7717")),
+            [
+                head[0].to_string(),
+                head[1].to_string(),
+                format!("{file_line} --url http://127.0.0.1:7717"),
+            ]
+        );
+        let env = manual_run_lines(cf, tok, false, Some("http://127.0.0.1:9"));
+        assert_eq!(env.len(), 4);
+        assert!(env[2].contains("no --token-file"), "{env:?}");
+        assert_eq!(env[3], format!("{env_line} --url http://127.0.0.1:9"));
+        assert_eq!(manual_run_lines(cf, tok, false, None)[3], env_line);
+    }
+
+    /// `run_tunnel_setup` passes gateway.yml's ingress through to the
+    /// manual lines (the same origin the service plist would carry).
+    #[test]
+    fn setup_without_service_support_includes_the_origin_for_local_ingress() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join(".onebrain");
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = vault_dir(root.path(), "v");
+        std::fs::write(
+            dir.join("gateway.yml"),
+            format!(
+                "default_vault: {}\nport: 7802\ntunnel_ingress: local\n",
+                v.display()
+            ),
+        )
+        .unwrap();
+        let h = FakeHost {
+            service: false,
+            ..host()
+        };
+        let (r, out) = run(&format!("brain.example.com\n{FAKE_TOKEN}\n"), &h, &dir);
+        r.unwrap();
+        assert!(out.contains(" --url http://127.0.0.1:7802\n"), "{out}");
     }
 }

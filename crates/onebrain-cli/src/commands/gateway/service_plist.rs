@@ -70,7 +70,17 @@ pub(crate) fn gateway_agent(onebrain_exe: &Path, log_dir: &Path) -> AgentSpec {
 /// `--protocol http2`: smoke V (2026-10-09) - on a phone hotspot QUIC/7844 failed
 /// and cloudflared's `auto` did not fall back to HTTP/2 for > 2 min (tunnel 530).
 /// HTTP/2 over 443 works wherever HTTPS works; the gateway's traffic is tiny.
-pub(crate) fn tunnel_agent(cloudflared: &Path, auth: &TunnelAuth, log_dir: &Path) -> AgentSpec {
+///
+/// `origin` (`GatewayConfig::tunnel_origin`, v3.5.2 red-team B1) is `Some`
+/// only for a CLI-created tunnel (`tunnel_ingress: local`): it has no remote
+/// ingress, so `--url <origin>` is appended or Cloudflare answers 503.
+/// `None` (a dashboard tunnel) renders exactly the v3.5.0 program.
+pub(crate) fn tunnel_agent(
+    cloudflared: &Path,
+    auth: &TunnelAuth,
+    log_dir: &Path,
+    origin: Option<&str>,
+) -> AgentSpec {
     let mut program = vec![
         cloudflared.display().to_string(),
         "tunnel".into(),
@@ -86,6 +96,10 @@ pub(crate) fn tunnel_agent(cloudflared: &Path, auth: &TunnelAuth, log_dir: &Path
             program.push(p.display().to_string());
         }
         TunnelAuth::EnvToken(t) => env.push(("TUNNEL_TOKEN".to_string(), t.clone())),
+    }
+    if let Some(origin) = origin {
+        program.push("--url".into());
+        program.push(origin.to_string());
     }
     AgentSpec {
         label: TUNNEL_LABEL,
@@ -171,6 +185,7 @@ mod tests {
             Path::new("/opt/homebrew/bin/cloudflared"),
             &TunnelAuth::TokenFile(PathBuf::from("/Users/test/.onebrain/gateway/tunnel.token")),
             Path::new(LOGS),
+            None,
         );
         let log = Path::new(LOGS)
             .join("gateway-tunnel.log")
@@ -182,11 +197,43 @@ mod tests {
         assert_eq!(render_keepalive_plist(&spec).unwrap(), expected);
     }
 
+    /// v3.5.2 B1: a CLI-created tunnel (`tunnel_ingress: local`) gets
+    /// `--url http://127.0.0.1:<port>` after the token flag — both auth
+    /// shapes. The rest of the plist is the dashboard golden above.
+    #[test]
+    fn tunnel_plist_golden_with_local_ingress_appends_the_origin_url() {
+        let spec = tunnel_agent(
+            Path::new("/opt/homebrew/bin/cloudflared"),
+            &TunnelAuth::TokenFile(PathBuf::from("/Users/test/.onebrain/gateway/tunnel.token")),
+            Path::new(LOGS),
+            Some("http://127.0.0.1:7717"),
+        );
+        let log = Path::new(LOGS)
+            .join("gateway-tunnel.log")
+            .display()
+            .to_string();
+        let expected = format!(
+            "{HEAD}    <key>Label</key>\n    <string>com.onebrain.gateway-tunnel</string>\n    <key>ProgramArguments</key>\n    <array>\n        <string>/opt/homebrew/bin/cloudflared</string>\n        <string>tunnel</string>\n        <string>--no-autoupdate</string>\n        <string>--protocol</string>\n        <string>http2</string>\n        <string>run</string>\n        <string>--token-file</string>\n        <string>/Users/test/.onebrain/gateway/tunnel.token</string>\n        <string>--url</string>\n        <string>http://127.0.0.1:7717</string>\n    </array>\n    <key>KeepAlive</key>\n    <true/>\n    <key>RunAtLoad</key>\n    <true/>\n    <key>StandardOutPath</key>\n    <string>{log}</string>\n    <key>StandardErrorPath</key>\n    <string>{log}</string>\n</dict>\n</plist>\n"
+        );
+        assert_eq!(render_keepalive_plist(&spec).unwrap(), expected);
+
+        let env = tunnel_agent(
+            Path::new("/c"),
+            &TunnelAuth::EnvToken("t".into()),
+            Path::new(LOGS),
+            Some("http://127.0.0.1:9000"),
+        );
+        assert_eq!(
+            env.program[5..],
+            ["run", "--url", "http://127.0.0.1:9000"].map(String::from)
+        );
+    }
+
     /// Design open question 2 fallback: token in `EnvironmentVariables`.
     #[test]
     fn tunnel_plist_with_env_token_passes_it_as_tunnel_token_and_debug_redacts_it() {
         let auth = TunnelAuth::EnvToken("fake-token-value".into());
-        let spec = tunnel_agent(Path::new("/c"), &auth, Path::new(LOGS));
+        let spec = tunnel_agent(Path::new("/c"), &auth, Path::new(LOGS), None);
         let xml = render_keepalive_plist(&spec).unwrap();
         assert!(
             xml.contains(
@@ -225,6 +272,7 @@ mod tests {
                 Path::new("/c"),
                 &TunnelAuth::EnvToken("x".into()),
                 Path::new(LOGS),
+                Some("http://127.0.0.1:7717"),
             ),
         ] {
             let p = dir.path().join(format!("{}.plist", spec.label));
