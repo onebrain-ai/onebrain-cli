@@ -69,10 +69,11 @@ ADRs are immutable once accepted — if a decision changes, write a new ADR that
 | [0039](0039-gateway-approval-keepalive-and-wait-clamp.md) | Approval keep-alive over SSE, wait clamp (240 s / 270 s), SIGTERM handling | accepted · revisited by [0046](0046-approvals-honour-revocation-and-shutdown-edits.md) |
 | [0040](0040-gateway-pre-tunnel-exposure-hardening.md) | Pre-tunnel exposure hardening: Host/Origin guard, loopback-only `/approvals`, registration caps, CSRF consent | accepted |
 | [0041](0041-gateway-auth-store-lock-and-toctou-recheck.md) | Cross-process auth-store lock, post-mint registration re-check, `rust-version 1.89` | accepted · revisited by [0044](0044-gateway-auth-store-bounded-lock-and-atomic-exchange.md), [0046](0046-approvals-honour-revocation-and-shutdown-edits.md) |
-| [0042](0042-gateway-tunnel-and-launchagent-service.md) | Tunnel + service: Cloudflare token file, KeepAlive LaunchAgents, macOS-only for now | accepted |
+| [0042](0042-gateway-tunnel-and-launchagent-service.md) | Tunnel + service: Cloudflare token file, KeepAlive LaunchAgents, macOS-only for now | accepted · provisioning partially superseded by [0047](0047-gateway-setup-cli-provisioning.md) |
 | [0043](0043-gateway-plain-english-approval-prompts.md) | Plain-English approval prompts built from structured fields | accepted |
 | [0044](0044-gateway-auth-store-bounded-lock-and-atomic-exchange.md) | Gateway auth store: bounded fair lock wait, no in-process mutex, atomic code exchange, durable writes | accepted |
 | [0045](0045-name-the-search-index-lock-holder.md) | Name the search-index lock holder (`.collection.lock.holder`) | accepted |
 | [0046](0046-approvals-honour-revocation-and-shutdown-edits.md) | Waiting approvals honour revocation (poll + Allow-time check, per-family grants); shutdown lets the Telegram edit land | accepted |
+| [0047](0047-gateway-setup-cli-provisioning.md) | Guided `gateway setup`: CLI-provisioned Cloudflare tunnel (`tunnel_ingress: local` → `--url`), foreground in-memory Quick Tunnel, restart only on change | accepted |
 
 > These ADRs distill the public-facing rationale; the full design notes live in the project tracker. Numbers are stable IDs assigned at authoring time — see each ADR's **Date** for chronology.

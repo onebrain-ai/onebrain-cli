@@ -184,6 +184,7 @@ Implements `skill run` (and the `run-skill` alias). The skill name is positional
 | `approval_native.rs`, `approval_routes.rs`, `telegram*.rs` | The three approval channels: macOS dialog, loopback `/approvals`, Telegram bot and its setup wizard. |
 | `approval_view.rs` | Plain-English prompt wording ([ADR 0043](../decisions/0043-gateway-plain-english-approval-prompts.md)). |
 | `access.rs` | `gateway tokens list\|revoke`, `gateway clients list\|remove`. |
+| `setup.rs`, `cloudflare.rs`, `qr.rs` | `gateway setup`: the guided wizard over an injected host; the `cloudflared` driver (CLI tunnel provisioning, Quick Tunnel) with its output parsers; the terminal QR code ([ADR 0047](../decisions/0047-gateway-setup-cli-provisioning.md)). |
 | `tunnel.rs`, `service.rs`, `service_plist.rs`, `health.rs` | `tunnel setup\|status`; LaunchAgent install/uninstall/status; plist rendering; the checks shared by `doctor`, `service status` and `tunnel status` ([ADR 0042](../decisions/0042-gateway-tunnel-and-launchagent-service.md)). |
 
 ## `v31/` — command-tree migration & v3.1 verbs
@@ -240,6 +241,7 @@ Turns the forward-declared command surface into clean exits.
 | `update` | `commands/update.rs` | onebrain-fs (`update::run_update`) |
 | `doctor` | `commands/doctor.rs` | onebrain-fs (`doctor::run_all_checks`) · onebrain-core (config) |
 | `gateway run` · `gateway pair` | `commands/gateway/mod.rs` | onebrain-core (config) · rmcp (streamable HTTP server) · the warm daemon for `brain_search` |
+| `gateway setup` | `commands/gateway/setup.rs` | none (`cloudflared` on `PATH`; reuses the tunnel, service and Telegram modules) |
 | `gateway telegram setup` | `commands/gateway/telegram_setup.rs` | none (Telegram Bot API over HTTPS) |
 | `gateway tunnel setup\|status` | `commands/gateway/tunnel.rs` | none (`cloudflared` on `PATH`) |
 | `gateway service install\|uninstall\|status` | `commands/gateway/service.rs` | onebrain-core (scheduler backend `launchctl` seam) |

@@ -1,6 +1,6 @@
 # 0042 — Tunnel and service: Cloudflare token file, KeepAlive LaunchAgents, macOS-only for now
 
-- **Status:** accepted
+- **Status:** accepted — provisioning partially superseded by [0047](0047-gateway-setup-cli-provisioning.md)
 - **Date:** 2026-10
 - **Follows:** [0036](0036-remote-mcp-gateway-separate-process.md), [0039](0039-gateway-approval-keepalive-and-wait-clamp.md), [0040](0040-gateway-pre-tunnel-exposure-hardening.md).
 - **PRs:** [#419](https://github.com/onebrain-ai/onebrain-cli/pull/419); tracking issue #412.

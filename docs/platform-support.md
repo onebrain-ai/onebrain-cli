@@ -47,12 +47,13 @@ The remote MCP gateway ([`gateway.md`](gateway.md), [ADR 0036](decisions/0036-re
 | Piece | macOS | Linux | Windows |
 |---|---|---|---|
 | `gateway run`, `pair`, `tokens`, `clients`, `telegram setup`, `tunnel setup` / `status` | yes | yes | yes |
+| `gateway setup` (tunnel + `gateway.yml`; the service step prints manual commands where there is no service) | yes | yes | yes |
 | Approval by Telegram and by the loopback `/approvals` page | yes | yes | yes |
 | Approval by a native dialog | yes (`osascript`) | no | no |
 | `gateway service install` / `uninstall` / `status` (LaunchAgents) | yes | not supported yet | not supported yet |
 | Graceful stop on SIGTERM | yes | yes | Ctrl-C only |
 
-Off macOS, `gateway service` exits with "not supported yet". Run `onebrain gateway run` and `cloudflared tunnel --no-autoupdate --protocol http2 run --token-file ~/.onebrain/gateway/tunnel.token` under your own supervisor (systemd, a terminal multiplexer) and restart `gateway run` after changing `public_url`. Running the gateway needs `cloudflared` only for remote access. `brain_search` also needs the per-vault daemon, so it follows the [search tiers](#search--semantic-vs-keyword) above.
+Off macOS, `gateway service` exits with "not supported yet". Run `onebrain gateway run` and `cloudflared tunnel --no-autoupdate --protocol http2 run --token-file ~/.onebrain/gateway/tunnel.token` (plus `--url http://127.0.0.1:<port>` for a tunnel `gateway setup` created; it prints the exact line) under your own supervisor (systemd, a terminal multiplexer) and restart `gateway run` after changing `public_url`. Running the gateway needs `cloudflared` only for remote access. `brain_search` also needs the per-vault daemon, so it follows the [search tiers](#search--semantic-vs-keyword) above.
 
 ## OS scheduler backends (v3.4.20+)
 
