@@ -1582,23 +1582,21 @@ fn detached_run_command(
 /// `"leaked"` or `"clean"`.
 #[cfg(all(test, unix))]
 pub(crate) fn probe_leaked_fd(spawn: impl FnOnce(&Path)) -> String {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let mut fds = [0 as libc::c_int; 2];
     // SAFETY: plain pipe(2) into a local array; no FD_CLOEXEC on purpose.
     assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
     let out = dir.path().join("out");
     let script = dir.path().join("probe.sh");
-    std::fs::write(
+    // ETXTBSY-safe install (see `install_test_script`).
+    crate::commands::gateway::cloudflare::install_test_script(
         &script,
-        format!(
+        &format!(
             "#!/bin/sh\nif [ -e /dev/fd/{w} ]; then r=leaked; else r=clean; fi\necho $r > '{o}.tmp' && mv '{o}.tmp' '{o}'\n",
             w = fds[1],
             o = out.display()
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     spawn(&script);
     // SAFETY: closing the two descriptors opened above.
     unsafe {

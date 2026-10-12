@@ -591,6 +591,29 @@ impl Cloudflared for SystemCloudflared {
     }
 }
 
+/// Install an executable test script at `path` without this process ever
+/// holding a WRITE descriptor on it. Writing it in-process races every
+/// other test thread's fork: a child forked while our write fd is open
+/// holds it until its own exec, and exec'ing the script meanwhile fails
+/// with ETXTBSY ("Text file busy", seen on Linux CI). Here the body goes to
+/// a sibling `.src` file (never executed) and a child `/bin/sh` copies it
+/// into place (`cp` + `chmod` + atomic `mv`) — the only write fd on the
+/// executable lives in that child, which has exited before we return.
+#[cfg(all(test, unix))]
+pub(crate) fn install_test_script(path: &Path, body: &str) {
+    let src = path.with_extension("src");
+    std::fs::write(&src, body).unwrap();
+    let status = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#"cp "$1" "$2.tmp" && chmod 755 "$2.tmp" && mv "$2.tmp" "$2""#)
+        .arg("sh")
+        .arg(&src)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "install {}", path.display());
+}
+
 /// `cloudflared` output samples the parsers are tested against. Shared with
 /// the wizard's tests (T4) so a corrected sample fixes both.
 ///
@@ -907,16 +930,13 @@ mod system_tests {
     /// A `cloudflared` that appends its argv to `<dir>/argv.log`, then runs
     /// `body`. Returns the fake and the dir.
     fn fake(body: &str) -> (tempfile::TempDir, SystemCloudflared) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("cloudflared");
         let log = dir.path().join("argv.log");
-        std::fs::write(
+        install_test_script(
             &bin,
-            format!("#!/bin/sh\necho \"$*\" >> '{}'\n{body}\n", log.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            &format!("#!/bin/sh\necho \"$*\" >> '{}'\n{body}\n", log.display()),
+        );
         let home = dir.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
         (
@@ -1048,15 +1068,14 @@ mod system_tests {
 
         let (d, mut cf) = fake("");
         let cert = d.path().join("home/.cloudflared/cert.pem");
-        std::fs::write(
+        install_test_script(
             &cf.bin,
-            format!(
+            &format!(
                 "#!/bin/sh\nmkdir -p {} && touch {}\n",
                 sh_quote(&cert.parent().unwrap().display().to_string()),
                 sh_quote(&cert.display().to_string())
             ),
-        )
-        .unwrap();
+        );
         cf.home = d.path().join("home");
         assert!(!cf.has_login());
         cf.login().unwrap();
