@@ -61,20 +61,35 @@ fn sh_quote(s: &str) -> String {
 /// `<dir>/bin/cloudflared` logging its argv to `<dir>/argv.log`, then
 /// running `body`. Returns the bin dir.
 fn fake_cloudflared(dir: &Path, body: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
-    let p = bin.join("cloudflared");
-    std::fs::write(
-        &p,
-        format!(
+    install_script(
+        &bin.join("cloudflared"),
+        &format!(
             "#!/bin/sh\necho \"$*\" >> {}\n{body}\n",
             sh_quote(&dir.join("argv.log").display().to_string())
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     bin
+}
+
+/// The integration-test copy of `cloudflare::install_test_script` (a
+/// `cfg(test)` item this crate can't import): never hold a write fd on an
+/// executable in this multi-threaded process — a sibling test's fork would
+/// inherit it and exec'ing the script would fail with ETXTBSY. The body
+/// goes to a `.src` file; a child `/bin/sh` copies it into place.
+fn install_script(path: &Path, body: &str) {
+    let src = path.with_extension("src");
+    std::fs::write(&src, body).unwrap();
+    let status = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(r#"cp "$1" "$2.tmp" && chmod 755 "$2.tmp" && mv "$2.tmp" "$2""#)
+        .arg("sh")
+        .arg(&src)
+        .arg(path)
+        .status()
+        .unwrap();
+    assert!(status.success(), "install {}", path.display());
 }
 
 fn argv(dir: &Path) -> Vec<String> {
