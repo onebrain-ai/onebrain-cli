@@ -74,6 +74,7 @@ onebrain init --yes
 - **Embedded web UI** — `onebrain serve` hosts a local, token-gated file explorer + reading view + search panel + agent chat, with nothing extra to install. See [`docs/serve.md`](docs/serve.md).
 - **Interactive model picker** — a TUI over 6 embedding models (see [Choosing an embedding model](docs/reference/onebrain-search.md#choosing-an-embedding-model)) to trade off speed, accuracy, and Thai support.
 - **Vault doctor + config migration** — twelve health checks with `--fix` recipes (out-of-range config values reset to their documented defaults, comments preserved), plus automatic `onebrain.yml` schema migration.
+- **📱 Your vault on your phone** — `onebrain gateway setup` connects the Claude app on your phone to your vaults in one guided command: a Cloudflare tunnel on your own domain (created for you), a background service on macOS, optional Telegram approvals for writes, and a QR code of the connector URL to finish. See [`docs/gateway.md`](docs/gateway.md#use-it-from-your-phone).
 - **Local scheduler** — cron-style recurring skills (daily briefing, weekly review, reindex) via the OS scheduler, no cloud runner needed.
 
 ## Commands

@@ -4,9 +4,6 @@
 //! that must not end up in a scrollback screenshot). The caller shows it only
 //! on a TTY.
 
-// Consumed by `gateway setup` (v3.5.2 T4), which lands next and drops this.
-#![allow(dead_code)]
-
 /// Render `text` as a QR code in Unicode half-blocks (`█▀▄ `), two modules
 /// per character row, with the standard 4-module quiet zone (`qrcode`'s
 /// quiet zone is a bool; its width is fixed by the spec). Colours are

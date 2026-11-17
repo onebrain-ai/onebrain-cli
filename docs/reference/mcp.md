@@ -275,7 +275,7 @@ A common question for tools like a future `reindex`: can an agent kick off long 
 onebrain gateway run [--port N]
 ```
 
-- **Remote**: `onebrain gateway tunnel setup` + `onebrain gateway service install` publish it at `https://<your-host>/mcp` through a Cloudflare tunnel — see [`docs/gateway.md#use-it-from-your-phone`](../gateway.md#use-it-from-your-phone).
+- **Remote**: `onebrain gateway setup` (or `onebrain gateway tunnel setup` + `onebrain gateway service install`) publishes it at `https://<your-host>/mcp` through a Cloudflare tunnel — see [`docs/gateway.md#use-it-from-your-phone`](../gateway.md#use-it-from-your-phone).
 
 - An approval-gated call replies as an SSE stream (a wait notice, then 15 s keep-alives, then the result); every other call is plain JSON. The server declares the `logging` capability for that notice; `logging/setLevel` is accepted but the level is ignored (stateless: the info notice is what opens the SSE stream, so it is never filtered).
 

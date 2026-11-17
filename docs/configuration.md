@@ -129,7 +129,8 @@ from the binary you're running.
 | `port` | Loopback port `gateway run` binds when `--port` is not given | `7717` | 0-65535 (0 = OS-assigned) |
 | `default_vault` | Vault served when a tool call omits `vault` | *unset* (falls back to `$ONEBRAIN_VAULT`, then walk-up from the process's working directory) | path |
 | `vaults` | Named vaults a tool call may select with its `vault` argument | `{}` | map of name to path |
-| `public_url` | Public origin of the tunnel, used as the OAuth issuer and added to the allowed `Host` list. Written by `gateway tunnel setup` | *unset* (issuer is `http://127.0.0.1:<port>`) | bare origin `https://host[:port]`; `http://` only for a loopback host; no path, query, fragment or userinfo. An invalid value stops `gateway run` from starting |
+| `public_url` | Public origin of the tunnel, used as the OAuth issuer and added to the allowed `Host` list. Written by `gateway setup` or `gateway tunnel setup` | *unset* (issuer is `http://127.0.0.1:<port>`) | bare origin `https://host[:port]`; `http://` only for a loopback host; no path, query, fragment or userinfo. An invalid value stops `gateway run` from starting |
+| `tunnel_ingress` | Set to `local` by `gateway setup` for a tunnel it created from the CLI (no routing in the Cloudflare dashboard): the tunnel agent then runs `cloudflared … --url http://127.0.0.1:<port>`. Cleared by `gateway tunnel setup` | *unset* (dashboard tunnel) | `local`; needs a fixed `port` (not `0`) |
 | `policy.read_only` | Mode for read-only tools (`capabilities`, `brain_tasks`, `brain_get`, `brain_search`) | `auto` | `auto`, `ask_once`, `ask_always`, `deny` |
 | `policy.mutating` | Mode for write tools (`brain_capture`) | `ask_once` | `auto`, `ask_once`, `ask_always`, `deny` |
 | `policy.destructive` | Mode for destructive tools (none ship yet) | `ask_always` | `auto`, `ask_once`, `ask_always`, `deny` |

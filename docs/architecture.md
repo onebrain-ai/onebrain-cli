@@ -90,7 +90,7 @@ Request path for a gated write such as `brain_capture`: `host_guard` → bearer 
 | `auth.lock` | Advisory lock held across every read-modify-write of the four files, with a 5 s bounded wait ([ADR 0041](decisions/0041-gateway-auth-store-lock-and-toctou-recheck.md), [ADR 0044](decisions/0044-gateway-auth-store-bounded-lock-and-atomic-exchange.md)). |
 | `auth.lock.holder` | `{pid, version}` of the process holding `auth.lock`; exists only while it is held, so a busy CLI or gateway can name the holder. |
 | `audit/YYYY-MM.jsonl` | Append-only audit log, one redacted JSON line per tool call. |
-| `tunnel.token` | The Cloudflare tunnel token, written by `gateway tunnel setup`. |
+| `tunnel.token` | The Cloudflare tunnel token, written by `gateway setup` or `gateway tunnel setup`. |
 | `telegram-<hash>.offset` | Telegram `getUpdates` cursor, keyed by a hash of the bot token. |
 
 On macOS, `gateway service install` also writes `~/Library/LaunchAgents/com.onebrain.gateway.plist` and `com.onebrain.gateway-tunnel.plist`, with logs in `~/Library/Logs/onebrain/` ([ADR 0042](decisions/0042-gateway-tunnel-and-launchagent-service.md)).

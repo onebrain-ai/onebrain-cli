@@ -22,7 +22,7 @@ onebrain
 ├── token       gain · check · discover
 ├── skill       run
 ├── harness     detect
-└── gateway     run · pair · telegram setup · tunnel setup|status
+└── gateway     setup · run · pair · telegram setup · tunnel setup|status
                 · service install|uninstall|status
                 · tokens list|revoke · clients list|remove
 ```
@@ -38,7 +38,7 @@ onebrain
 | **Token optimization** | `token gain · check · discover` | Report/administer the token-optimization ladder + cache (v3.4.10): `gain` reports byte-exact savings (summary, `--by` pivot, `--history`, `--reset`, `--rebuild`); `check` is the read-hook's 0/2 allow/deny verdict over the already-sent ledger; `discover` estimates missed savings from direct `Read`/`Grep` bypass traffic in Claude Code session transcripts. See [`token-optimization.md`](token-optimization.md). |
 | **Web UI** | `serve` | Host the binary-embedded web UI + token-gated vault JSON API on `127.0.0.1` (routes to this vault's daemon on its ephemeral port; a standalone `serve --port` defaults to 6789) — file explorer, reading view, search panel, agent chat; `--open` launches the browser. See [`serve.md`](serve.md). |
 | **Maintenance** | `doctor [--fix]`, `plugin update · migrate`, `schedule register` | Read-only health checks + `--fix` recipes (incl. per-key config-value validation with comment-preserving reset-to-default), self-update the binary + rewrite hooks + rebind OS scheduler artifacts, compile the `onebrain.yml schedule:` block into OS scheduler artifacts. |
-| **Gateway** | `gateway run · pair · telegram setup · tunnel setup · tunnel status · service install · service uninstall · service status · tokens list · tokens revoke · clients list · clients remove` | The remote MCP gateway ([`gateway.md`](gateway.md), [ADR 0036](decisions/0036-remote-mcp-gateway-separate-process.md)). See [Gateway commands](#gateway-commands) below. |
+| **Gateway** | `gateway setup · run · pair · telegram setup · tunnel setup · tunnel status · service install · service uninstall · service status · tokens list · tokens revoke · clients list · clients remove` | The remote MCP gateway ([`gateway.md`](gateway.md), [ADR 0036](decisions/0036-remote-mcp-gateway-separate-process.md)). See [Gateway commands](#gateway-commands) below. |
 | **Diagnostics** | `vault current`, `harness detect` | Report which mechanism resolved the active vault, and which AI harness is running. |
 
 > The tree shape was **locked for v3.2+** — verbs beyond the working set above were stubbed with a stable `E_NOT_IMPLEMENTED` (exit 72) so the grammar couldn't drift while features landed. **v3.4.24 (#334) reversed that**: the 63 verbs that only ever returned 72 were removed from the parser and now fail as unknown commands, because a shipped binary that accepts verbs it cannot perform is a trap for scripts and docs. See ADR 0006 (superseded). Hidden v3.0 flat aliases (`session-init`, `qmd-reindex`, `register-hooks`, …) still dispatch, printing a one-time migration notice (silence with `ONEBRAIN_QUIET_MIGRATION=1`); they're removed no earlier than v4.
@@ -53,10 +53,11 @@ Not every target ships every search capability — see the [platform-support mat
 
 | Command | Flags / arguments | What it does |
 |---|---|---|
+| `gateway setup` | none | Interactive guided setup: vault, connection (Cloudflare with your own domain — provisioned from the CLI with `cloudflared`, no dashboard · an existing tunnel token · a Quick Tunnel for testing, foreground and saved nowhere · local only), Telegram (optional), the macOS service, then the connector URL, and on a terminal the pairing code and a QR code of the URL. Re-runnable: Enter keeps each step, and a run that changed nothing does not restart the gateway. See [Use it from your phone](gateway.md#use-it-from-your-phone). |
 | `gateway run` | `--port <PORT>` (0 = OS-assigned; overrides `port:` in `gateway.yml`, default 7717) | Run the gateway in the foreground until Ctrl-C or SIGTERM. Binds `127.0.0.1` only (no bind flag). Prints the pairing code only when stdout is a terminal. |
 | `gateway pair` | `--rotate` | Print the current device-pairing code (minting one on first use), or with `--rotate` mint a new one and invalidate the old. |
 | `gateway telegram setup` | none | Interactive wizard: paste a `@BotFather` token, send the one-time code back to the bot, and write the `telegram:` block of `gateway.yml`. Restart a running gateway afterwards. |
-| `gateway tunnel setup` | none | Interactive: paste the Cloudflare tunnel token and hostname; stores the token (mode 0600) and sets `public_url`. |
+| `gateway tunnel setup` | none | Interactive: paste the token and hostname of a tunnel made in the Cloudflare dashboard; stores the token (mode 0600), sets `public_url` and clears `tunnel_ingress`. `gateway setup` covers this as one of its connections. |
 | `gateway tunnel status` | none | Token present (0600), `public_url` set, `cloudflared` agent running, and the public hostname reaching this gateway. |
 | `gateway service install` | none | Install (or refresh and restart) the `com.onebrain.gateway` LaunchAgent and, when a tunnel is configured, `com.onebrain.gateway-tunnel`. macOS only. |
 | `gateway service uninstall` | none | Unload and remove both LaunchAgents; never touches tokens or config. macOS only. |

@@ -4,7 +4,7 @@
 //! - **CLI provisioning** of a locally managed tunnel on the user's own
 //!   domain (`tunnel login` → `tunnel list`/`create` → `route dns` →
 //!   `tunnel token`). Partially supersedes ADR 0042 D3 (which avoided
-//!   `cert.pem`) — ADR 0043.
+//!   `cert.pem`) — ADR 0047.
 //! - **Quick Tunnel** (`cloudflared tunnel --url …`): a foreground,
 //!   testing-only `*.trycloudflare.com` URL. Nothing is written to disk.
 //!
@@ -14,9 +14,6 @@
 //! against the fixtures in [`fixtures`]; [`SystemCloudflared`] is a thin
 //! process shell over them. A tunnel token is never printed, logged, or put
 //! in an error message: `token`'s stdout is only ever parsed.
-
-// Consumed by `gateway setup` (v3.5.2 T4), which lands next and drops this.
-#![allow(dead_code)]
 
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};

@@ -355,6 +355,7 @@ pub fn dispatch(cli: Cli) -> Result<()> {
             DaemonVerb::Run { vault } => commands::daemon::run_internal(vault.as_deref()),
         },
         Cmd::Gateway(GatewayCmd { verb }) => match verb {
+            GatewayVerb::Setup => commands::gateway::gateway_setup(&mode, vault_flag.as_deref()),
             GatewayVerb::Run { port } => commands::gateway::run(&mode, port),
             GatewayVerb::Pair { rotate } => commands::gateway::pair(&mode, rotate),
             GatewayVerb::Telegram(TelegramCmd { verb }) => match verb {
