@@ -663,10 +663,21 @@ mod tests {
         assert!(!hint.contains("dashboard"), "{hint}");
     }
 
-    fn drift_inputs() -> super::super::service::InstallInputs {
+    /// Inputs whose programs are real files in `dir` (the test's own
+    /// tempdir) — never host paths: `service_row` errors on a plist program
+    /// that does not exist, and `/opt/homebrew/bin/*` exists only on some
+    /// machines (CI failed on every leg with them).
+    fn drift_inputs(dir: &Path) -> super::super::service::InstallInputs {
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = |name: &str| {
+            let p = bin.join(name);
+            std::fs::write(&p, "").unwrap();
+            p
+        };
         super::super::service::InstallInputs {
-            onebrain_exe: PathBuf::from("/opt/homebrew/bin/onebrain"),
-            cloudflared: Some(PathBuf::from("/opt/homebrew/bin/cloudflared")),
+            onebrain_exe: exe("onebrain"),
+            cloudflared: Some(exe("cloudflared")),
             token_file_supported: true,
             wait_for_up: None,
             show_pairing_code: false,
@@ -679,9 +690,9 @@ mod tests {
     /// would write now → a warning naming `gateway setup`.
     #[test]
     fn running_agents_with_out_of_date_plists_are_a_drift_warning() {
-        let (_r, paths) = healthy_home();
+        let (r, paths) = healthy_home();
         let f = green_fakes();
-        let inputs = drift_inputs();
+        let inputs = drift_inputs(r.path());
         // Real plists, as `service install` renders them.
         super::super::service::install_service(
             &paths,
